@@ -26,6 +26,8 @@ enum Step {
     /// simulate an infinite reasoning loop (watchdog demo)
     Loop { ms: u64 },
     Sleep { ms: u64 },
+    /// journal an observation into the ledger (kernel `agent_note` event)
+    Note { msg: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +53,11 @@ fn main() {
     )
     .expect("task schema");
 
+    // §2: the agent jails ITSELF before doing any work — no_new_privs +
+    // seccomp denylist (mount/ptrace/module-load/bpf/… return EPERM)
+    if let Err(e) = ama_core::seccomp::apply_seccomp_self() {
+        eprintln!("[agentd {}] seccomp jail unavailable: {e}", task.name);
+    }
     let stream = UnixStream::connect(&socket).expect("connect to kernel");
     let writer = stream.try_clone().expect("clone");
 
@@ -227,6 +234,14 @@ fn main() {
                 while std::time::Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(50));
                 }
+            }
+            Step::Note { msg } => {
+                w.write_all(
+                    format!("{}\n", json!({"kind": "note", "uin": uin, "text": msg})).as_bytes(),
+                )
+                .expect("note");
+                w.flush().expect("flush");
+                drain_acks(&inbox);
             }
             Step::Sleep { ms } => {
                 phase.store(1, Ordering::SeqCst);

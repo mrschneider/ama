@@ -4,6 +4,12 @@
   "steps": [
     {"op": "checkpoint", "state": {}},
     {"op": "send", "to": "c", "body": {"attack": 1}},
-    {"op": "checkpoint", "state": {"done": true}}
+    {"op": "checkpoint", "state": {"attempt": 1}},
+    {"op": "sleep", "ms": 1500},
+    {"op": "send", "to": "c", "body": {"granted_attempt": 2}},
+    {"op": "checkpoint", "state": {"attempt": 2}},
+    {"op": "sleep", "ms": 1500},
+    {"op": "send", "to": "c", "body": {"revoked_attempt": 3}},
+    {"op": "note", "msg": "m finished its capability lifecycle"}
   ]
 }
