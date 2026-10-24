@@ -1,0 +1,76 @@
+//! `ama` — the operator CLI.
+//!
+//!   ama serve --manifest m.json --agentd <path> [--cgroups]   run the kernel
+//!   ama ps --socket <path>                                    process table dump
+//!   ama inspect --socket <path> --name <agent>                one entry
+//!
+//! `ps`/`inspect` use a CONTROL connection (kind "ctl_*" envelopes). The
+//! kernel enforces that control verbs are only accepted on connections
+//! that never registered as agents — agents cannot control the kernel.
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::process::exit;
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let cmd = args.next().unwrap_or_default();
+    let mut socket = String::new();
+    let mut manifest = String::new();
+    let mut agentd = String::new();
+    let mut cgroups = false;
+    let mut name = String::new();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--socket" => socket = args.next().unwrap_or_default(),
+            "--manifest" => manifest = args.next().unwrap_or_default(),
+            "--agentd" => agentd = args.next().unwrap_or_default(),
+            "--cgroups" => cgroups = true,
+            "--name" => name = args.next().unwrap_or_default(),
+            _ => {}
+        }
+    }
+    match cmd.as_str() {
+        "serve" => serve(&socket, &manifest, &agentd, cgroups),
+        "ps" => ps(&socket),
+        _ => {
+            eprintln!("usage: ama serve|ps");
+            exit(2);
+        }
+    }
+}
+
+fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
+    if manifest.is_empty() || agentd.is_empty() {
+        eprintln!("serve requires --manifest <file> --agentd <path>");
+        exit(2);
+    }
+    let m: ama_core::Manifest = serde_json::from_slice(&std::fs::read(manifest).expect("manifest")).expect("manifest schema");
+    let socket = if socket.is_empty() { m.kernel.socket.clone() } else { socket.to_string() };
+    let kernel = ama_core::Kernel::new(
+        std::path::Path::new(&socket),
+        std::path::Path::new(&m.kernel.ledger),
+        agentd,
+        m.kernel.hb_interval_ms,
+        m.kernel.hb_timeout_ms,
+        m.kernel.max_respawns,
+    )
+    .expect("kernel");
+    let mut kernel = kernel; // shadow for mutation
+    kernel.apply_cgroups = cgroups; // opt-in, best-effort (see sandbox.rs)
+    let agents: Vec<(String, String)> = m.agents.iter().map(|a| (a.name.clone(), a.task.clone())).collect();
+    // BIND FIRST, spawn after: agent processes connect at startup — spawning
+    // before the socket exists kills them (this exact failure appeared in
+    // experiment 001 and is now part of the router's contract)
+    let handle = ama_core::Router::serve(kernel, &agents).expect("router");
+    eprintln!("[ama] kernel up on {socket}");
+    handle.join().ok();
+}
+
+fn ps(socket: &str) {
+    let mut s = UnixStream::connect(socket).expect("connect");
+    s.write_all(b"{\"kind\": \"ctl_ps\"}\n").expect("ctl");
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).expect("reply");
+    println!("{}", line.trim());
+}

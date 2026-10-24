@@ -1,0 +1,11 @@
+{
+  "name": "b",
+  "caps": ["send:a"],
+  "steps": [
+    {"op": "checkpoint", "state": {"n": 0}},
+    {"op": "sleep", "ms": 500},
+    {"op": "send", "to": "a", "body": {"ping": 1}},
+    {"op": "wait"},
+    {"op": "checkpoint", "state": {"done": true}}
+  ]
+}
