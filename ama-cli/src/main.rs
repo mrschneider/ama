@@ -19,25 +19,68 @@ fn main() {
     let mut manifest = String::new();
     let mut agentd = String::new();
     let mut cgroups = false;
+    let mut rest: Vec<String> = Vec::new();
     let mut name = String::new();
+    let mut caps = String::new();
+    let mut rest: Vec<String> = Vec::new();
+    let mut collecting_rest = false; // after `--`: the jailed command
     while let Some(a) = args.next() {
+        if a == "--" {
+            collecting_rest = true;
+            continue;
+        }
+        if collecting_rest {
+            rest.push(a);
+            continue;
+        }
         match a.as_str() {
             "--socket" => socket = args.next().unwrap_or_default(),
             "--manifest" => manifest = args.next().unwrap_or_default(),
             "--agentd" => agentd = args.next().unwrap_or_default(),
             "--cgroups" => cgroups = true,
             "--name" => name = args.next().unwrap_or_default(),
-            _ => {}
+            "--caps" => caps = args.next().unwrap_or_default(),
+            other => {
+                rest.push(other.to_string());
+                rest.extend(args);
+                break;
+            }
         }
     }
     match cmd.as_str() {
         "serve" => serve(&socket, &manifest, &agentd, cgroups),
         "ps" => ps(&socket),
+        "grant" => ctl_caps(&socket, "ctl_grant", &name, &caps),
+        "revoke" => ctl_caps(&socket, "ctl_revoke", &name, &caps),
+        "jail" => {
+            // Tool Execution Jail: run a command inside the seccomp filter
+            if rest.is_empty() {
+                eprintln!("jail requires: ama jail -- <cmd> [args...]");
+                exit(2);
+            }
+            if let Err(e) = ama_core::seccomp::jail_exec(&rest) {
+                eprintln!("{e}");
+                exit(126);
+            }
+        }
         _ => {
-            eprintln!("usage: ama serve|ps");
+            eprintln!("usage: ama serve|ps|grant|revoke|jail");
             exit(2);
         }
     }
+}
+
+fn ctl_caps(socket: &str, verb: &str, name: &str, caps: &str) {
+    let list: Vec<&str> = caps.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let msg = format!(
+        "{}\n",
+        serde_json::json!({"kind": verb, "name": name, "caps": list})
+    );
+    let mut s = UnixStream::connect(socket).expect("connect");
+    s.write_all(msg.as_bytes()).expect("ctl");
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).expect("reply");
+    println!("{}", line.trim());
 }
 
 fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {

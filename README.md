@@ -52,7 +52,28 @@ forever.
 dies with the process. cgroup v2 memory/CPU limits are applied
 best-effort when `/sys/fs/cgroup/ama` is writable.
 
-## Verified results
+**Tool Execution Jail (§2)** — `ama-agentd` jails ITSELF with
+seccomp-bpf (raw BPF, no libseccomp): a denylist of host-dangerous
+syscalls — `ptrace`, `mount`, module loading, `bpf`, `userfaultfd`,
+`setns`, `unshare`… — returns EPERM to the jailed process, with
+`PR_SET_NO_NEW_PRIVS` set so privileges can never be regained. Tools
+run inside the same filter via `ama jail -- <cmd>` (PATH-resolved).
+Differential probe: unjailed `ptrace(TRACEME)` returns 0; the identical
+call inside the jail returns EPERM.
+
+**Hot capability renegotiation (§3)** — the operator grants and revokes
+capabilities AT RUNTIME over a control connection (`ama grant --name m
+--caps send:c` / `ama revoke`); agents can never reach the control
+channel. Every grant and revocation is journaled; a send attempt after
+revocation is refused again, even for a capability that previously
+worked.
+
+**Agent observability** — agents journal notes into the ledger
+(`note`/`agent_note` events), so agent-visible failures (a seccomp
+refusal, a capability denial) appear in the same auditable stream as
+kernel events.
+
+## Verified results (experiments 001 + 002)
 
 `experiments/experiment_001_isolation.sh` (14 s end-to-end, 5 real
 processes):
@@ -74,6 +95,19 @@ PASS: isolation: parallel agents unaffected by c's crash and d's loop
 EXPERIMENT_001: PASS
 ```
 
+`experiments/experiment_002_caps_seccomp.sh` (12 s end-to-end):
+```
+PASS: seccomp control: unjailed ptrace succeeds (0)
+PASS: seccomp: ptrace refused (EPERM=1) INSIDE the jail
+PASS: hot caps: initial send denied (before the grant)
+PASS: hot caps: operator GRANTED send:c at runtime
+PASS: hot caps: the previously denied send was DELIVERED after the grant
+PASS: hot caps: operator REVOKED send:c at runtime
+PASS: hot caps: send AFTER the revoke was refused again (zero deliveries of attempt 3)
+PASS: observability: agent notes are journaled into the ledger
+EXPERIMENT_002: PASS  (40 ledger events)
+```
+
 Scenario: `b` pings `a` (typed envelope, capability-checked, journaled);
 `a` pongs back and both complete. `c` checkpoints, is killed externally
 (`kill -9`, the OOM/operator path), resumes from its ledger checkpoint
@@ -83,18 +117,22 @@ reasoning loop — the progress watchdog detects the stuck step in
 attempts to reach an agent it has no capability for — refused and
 journaled. All five ran as distinct OS processes.
 
-## Deliberately not implemented (v0.1)
+## Deliberately not implemented (v0.2)
 
-- **MicroVM tool-jails**: the brief's "Tool Execution Jails" — agents
-  that execute LLM-generated code inside nested ephemeral VMs. The
-  process boundary is the v0.1 isolation unit; cgroup pinning is
-  best-effort.
-- **seccomp-bpf syscall filters**: same frontier.
-- **Network-distributed message passing**: v0.1 is single-host UDS by
-  design (the brief rejects network brokers for the local case).
+- **MicroVM per agent**: the deepest isolation tier of the brief.
+  The isolation unit today is the OS process + seccomp denylist +
+  best-effort cgroup v2 — a real MicroVM (Firecracker-class) is the
+  remaining frontier for hostile tool code.
+- **Network-distributed message passing**: single-host UDS by design
+  (the brief rejects network brokers for the local case).
 - **FlatBuffers/protobuf wire format**: strict per-kind JSON schema
   validation in the kernel — the enforcement point is the kernel.
-- **Hot capability renegotiation**: grants are fixed at registration.
+- **Allow-list seccomp profile**: the current filter is a denylist of
+  host-dangerous syscalls; a full allowlist (default-deny + explicitly
+  permitted set) is the next security tier.
+
+Git history: `3dd35d8` v0.1.0 (kernel MVP), v0.2.0 (seccomp jails +
+hot capabilities).
 
 ## Layout
 
@@ -111,7 +149,8 @@ journaled. All five ran as distinct OS processes.
 ```bash
 cargo build            # ama-core (lib) + ama-agentd + ama
 cargo test             # unit tests
-bash experiments/experiment_001_isolation.sh   # the E2E proof
+bash experiments/experiment_001_isolation.sh   # isolation + watchdog + recovery
+bash experiments/experiment_002_caps_seccomp.sh # seccomp jail + hot capabilities
 ```
 
 ## License

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod sandbox;
+pub mod seccomp;
 
 // ---------------------------------------------------------------------------
 // Envelope: the typed message contract. The kernel validates EVERY incoming
@@ -33,6 +34,7 @@ pub enum Envelope {
     Checkpoint { uin: u64, state: Value },
     Recovered { uin: u64 },
     Done { uin: u64 },
+    Note { uin: u64, text: String },
 }
 
 impl Envelope {
@@ -96,6 +98,14 @@ impl Envelope {
             }),
             "recovered" => Ok(Envelope::Recovered { uin: take_u64("uin")? }),
             "done" => Ok(Envelope::Done { uin: take_u64("uin")? }),
+            "note" => Ok(Envelope::Note {
+                uin: take_u64("uin")?,
+                text: v
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or("note: missing 'text'")?
+                    .to_string(),
+            }),
             other => Err(format!("unknown envelope kind '{other}'")),
         }
     }
@@ -110,6 +120,7 @@ impl Envelope {
             Envelope::Checkpoint { uin, state } => json!({"kind": "checkpoint", "uin": uin, "state": state}),
             Envelope::Recovered { uin } => json!({"kind": "recovered", "uin": uin}),
             Envelope::Done { uin } => json!({"kind": "done", "uin": uin}),
+            Envelope::Note { uin, text } => json!({"kind": "note", "uin": uin, "text": text}),
         };
         format!("{v}\n")
     }
@@ -518,6 +529,62 @@ impl Router {
                 Ok(_) => {}
                 Err(_) => break,
             }
+            // control channel verbs (grant/revoke) — operators may
+            // renegotiate capabilities AT RUNTIME; agents can never reach
+            // this: their first envelope registers them
+            if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
+                match v.get("kind").and_then(Value::as_str) {
+                    Some("ctl_grant") if my_uin.is_none() => {
+                        let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+                        let caps: Vec<String> = v
+                            .get("caps")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .unwrap_or_default();
+                        let uin = kernel.by_name.lock().unwrap().get(name).copied();
+                        if let Some(uin) = uin {
+                            {
+                                let agents = kernel.agents.lock().unwrap();
+                                if let Some(entry) = agents.get(&uin) {
+                                    let mut e = entry.lock().unwrap();
+                                    for c in &caps {
+                                        if !e.caps.contains(c) {
+                                            e.caps.push(c.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            kernel.ledger.append("cap_granted", json!({"uin": uin, "name": name, "caps": caps})).ok();
+                            let _ = write!(writer, "{}\n", json!({"kind": "granted", "name": name}));
+                            let _ = writer.flush();
+                            continue;
+                        }
+                    }
+                    Some("ctl_revoke") if my_uin.is_none() => {
+                        let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+                        let caps: Vec<String> = v
+                            .get("caps")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .unwrap_or_default();
+                        let uin = kernel.by_name.lock().unwrap().get(name).copied();
+                        if let Some(uin) = uin {
+                            {
+                                let agents = kernel.agents.lock().unwrap();
+                                if let Some(entry) = agents.get(&uin) {
+                                    let mut e = entry.lock().unwrap();
+                                    e.caps.retain(|c| !caps.contains(c));
+                                }
+                            }
+                            kernel.ledger.append("cap_revoked", json!({"uin": uin, "name": name, "caps": caps})).ok();
+                            let _ = write!(writer, "{}\n", json!({"kind": "revoked", "name": name}));
+                            let _ = writer.flush();
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             // control channel: an UNREGISTERED connection may dump the
             // process table (the operator's `ama ps`). Agents can never
             // reach this: their first envelope registers them.
@@ -683,6 +750,10 @@ impl Router {
                     .ledger
                     .append("completed", json!({"uin": uin}))
                     .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Envelope::Note { uin, text } => {
+                kernel.ledger.append("agent_note", json!({"uin": uin, "text": text})).map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Recovered { uin: _ } => {
