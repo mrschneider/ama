@@ -22,6 +22,8 @@ fn main() {
     let mut rest: Vec<String> = Vec::new();
     let mut name = String::new();
     let mut caps = String::new();
+    let mut strict = false;
+    let mut userns = false;
     let mut rest: Vec<String> = Vec::new();
     let mut collecting_rest = false; // after `--`: the jailed command
     while let Some(a) = args.next() {
@@ -40,6 +42,8 @@ fn main() {
             "--cgroups" => cgroups = true,
             "--name" => name = args.next().unwrap_or_default(),
             "--caps" => caps = args.next().unwrap_or_default(),
+            "--strict" => strict = true,
+            "--userns" => userns = true,
             other => {
                 rest.push(other.to_string());
                 rest.extend(args);
@@ -54,11 +58,21 @@ fn main() {
         "revoke" => ctl_caps(&socket, "ctl_revoke", &name, &caps),
         "jail" => {
             // Tool Execution Jail: run a command inside the seccomp filter
+            // (--strict upgrades to the allowlist profile: default-DENY,
+            // socket() only for AF_UNIX — the kernel is the only channel)
             if rest.is_empty() {
-                eprintln!("jail requires: ama jail -- <cmd> [args...]");
+                eprintln!("jail requires: ama jail [--strict] -- <cmd> [args...]");
                 exit(2);
             }
-            if let Err(e) = ama_core::seccomp::jail_exec(&rest) {
+            if userns {
+                ama_core::seccomp::request_userns();
+            }
+            let profile = if strict {
+                ama_core::seccomp::Profile::Allowlist
+            } else {
+                ama_core::seccomp::Profile::Denylist
+            };
+            if let Err(e) = ama_core::seccomp::jail_exec(&rest, profile) {
                 eprintln!("{e}");
                 exit(126);
             }
@@ -101,11 +115,23 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
     .expect("kernel");
     let mut kernel = kernel; // shadow for mutation
     kernel.apply_cgroups = cgroups; // opt-in, best-effort (see sandbox.rs)
-    let agents: Vec<(String, String)> = m.agents.iter().map(|a| (a.name.clone(), a.task.clone())).collect();
+    kernel.tcp_addr = m.kernel.tcp_port.map(|p| format!("127.0.0.1:{p}"));
+    let agents: Vec<(String, String, Option<String>, bool)> = m
+        .agents
+        .iter()
+        .map(|a| {
+            (
+                a.name.clone(),
+                a.task.clone(),
+                a.transport.clone().map(|t| format!("127.0.0.1:{}", m.kernel.tcp_port.unwrap_or(0))),
+                a.wire.as_deref() == Some("msgpack"),
+            )
+        })
+        .collect();
     // BIND FIRST, spawn after: agent processes connect at startup — spawning
     // before the socket exists kills them (this exact failure appeared in
     // experiment 001 and is now part of the router's contract)
-    let handle = ama_core::Router::serve(kernel, &agents).expect("router");
+    let handle = ama_core::Router::serve_full(kernel, &agents).expect("router");
     eprintln!("[ama] kernel up on {socket}");
     handle.join().ok();
 }

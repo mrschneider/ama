@@ -19,6 +19,55 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub mod sandbox;
 pub mod seccomp;
 
+use std::io::{self, Write as IoWrite};
+
+/// §3: the wire format is per-connection. JSON (newline-delimited) was the
+/// v0.1 contract; msgpack (§6.2 wire encoding, length-prefixed with the
+/// 0xFF magic) is the binary alternative — the kernel speaks BOTH and
+/// answers each connection in ITS format.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Wire {
+    Json,
+    Msgpack,
+}
+
+/// Serialize + frame an envelope in the connection's wire format.
+pub fn write_envelope(w: &mut dyn IoWrite, wire: Wire, v: &Value) -> io::Result<()> {
+    match wire {
+        Wire::Json => {
+            // ONE write() syscall: `writeln!(w, "{v}")` fragments the
+            // Display output byte-by-byte, and two threads sharing one
+            // stream can interleave fragments MID-LINE (seen in the
+            // experiment 003 ledger: heartbeats corrupting checkpoints)
+            w.write_all(format!("{v}\n").as_bytes())?;
+            w.flush()
+        }
+        Wire::Msgpack => {
+            let bytes = rmp_serde::to_vec_named(v)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            w.write_all(&[0xFF])?;
+            w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            w.write_all(&bytes)?;
+            w.flush()
+        }
+    }
+}
+
+/// Read one msgpack frame (0xFF magic + u32 LE length + payload).
+pub fn read_msgpack_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
+    let mut magic = [0u8; 1];
+    r.read_exact(&mut magic)?;
+    if magic[0] != 0xFF {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing 0xFF magic"));
+    }
+    let mut lenb = [0u8; 4];
+    r.read_exact(&mut lenb)?;
+    let len = u32::from_le_bytes(lenb) as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    rmp_serde::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 // ---------------------------------------------------------------------------
 // Envelope: the typed message contract. The kernel validates EVERY incoming
 // envelope against this schema and refuses unknown kinds (QNX: "the kernel
@@ -42,6 +91,13 @@ impl Envelope {
     /// unexpected field — the kernel never "best-effort" parses.
     pub fn parse(line: &str) -> Result<Envelope, String> {
         let v: Value = serde_json::from_str(line).map_err(|e| format!("invalid json: {e}"))?;
+        Envelope::from_value(&v)
+    }
+
+    /// The typed contract over ANY wire format (JSON lines or msgpack —
+    /// the SAME validation, the kernel never best-effort parses).
+    pub fn from_value(v: &Value) -> Result<Envelope, String> {
+        let v = v;
         let kind = v
             .get("kind")
             .and_then(Value::as_str)
@@ -141,6 +197,9 @@ pub struct LedgerEvent {
 pub struct Ledger {
     path: std::path::PathBuf,
     seq: AtomicU64,
+    /// append is called from multiple connection threads — a torn line
+    /// poisons the whole ledger (experiment 003 caught this)
+    write_lock: Mutex<()>,
 }
 
 impl Ledger {
@@ -157,16 +216,18 @@ impl Ledger {
             }
             AtomicU64::new(n)
         };
-        Ok(Ledger { path: path.to_path_buf(), seq })
+        Ok(Ledger { path: path.to_path_buf(), seq, write_lock: Mutex::new(()) })
     }
 
     pub fn append(&self, ev: &str, detail: Value) -> std::io::Result<LedgerEvent> {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let e = LedgerEvent { seq, ts_ms, ev: ev.into(), detail };
+        let _guard = self.write_lock.lock().unwrap();
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
         writeln!(f, "{}", serde_json::to_string(&e).unwrap())?;
         f.flush()?;
+        drop(_guard);
         Ok(e)
     }
 
@@ -206,7 +267,6 @@ pub enum ProcState {
     Dead,
 }
 
-#[derive(Debug)]
 pub struct ProcEntry {
     pub uin: u64,
     pub name: String,
@@ -220,7 +280,9 @@ pub struct ProcEntry {
     pub respawns: u32,
     pub last_checkpoint: Option<Value>,
     pub task_path: String,
-    pub out: Option<UnixStream>,
+    /// the agent's connection in ANY transport (UDS or TCP — §3)
+    pub out: Option<Peer>,
+    pub wire: Wire,
 }
 
 pub struct Kernel {
@@ -234,6 +296,9 @@ pub struct Kernel {
     pub max_respawns: u32,
     pub agentd_path: String,
     pub apply_cgroups: bool,
+    /// network-remote IPC (§3): agents may connect over TCP from other
+    /// hosts; the envelope contract and capability checks are identical
+    pub tcp_addr: Option<String>,
 }
 
 impl Kernel {
@@ -256,16 +321,30 @@ impl Kernel {
             max_respawns,
             agentd_path: agentd_path.to_string(),
             apply_cgroups: false,
+            tcp_addr: None,
         })
     }
 
     /// Spawn an agent process from a manifest entry. The process is the
     /// isolation unit: its own PID, its own ephemeral memory.
     pub fn spawn_agent(&self, name: &str, task_path: &str) -> std::io::Result<()> {
+        self.spawn_agent_opts(name, task_path, None, false)
+    }
+
+    /// `tcp`: connect over the network-remote transport; `msgpack`: speak
+    /// the binary wire format (v0.2: both are per-agent options)
+    pub fn spawn_agent_opts(&self, name: &str, task_path: &str, tcp: Option<&str>, msgpack: bool) -> std::io::Result<()> {
         let uin = self.next_uin.fetch_add(1, Ordering::SeqCst);
         let mut cmd = Command::new(&self.agentd_path);
-        cmd.args(["--socket", self.socket_path.to_str().unwrap_or("/tmp/ama.sock"), "--task", task_path])
-            .env("AMA_UIN", uin.to_string())
+        cmd.args(["--socket", self.socket_path.to_str().unwrap_or("/tmp/ama.sock"), "--task", task_path]);
+        let tcp_addr = tcp.map(String::from).or_else(|| self.tcp_addr.clone());
+        if let Some(addr) = tcp_addr {
+            cmd.arg("--tcp").arg(addr);
+        }
+        if msgpack {
+            cmd.arg("--wire").arg("msgpack");
+        }
+        cmd.env("AMA_UIN", uin.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let child = cmd.spawn()?;
@@ -284,6 +363,7 @@ impl Kernel {
             last_checkpoint: None,
             task_path: task_path.into(),
             out: None,
+            wire: Wire::Json,
         }));
         if self.apply_cgroups {
             let _ = sandbox::apply_cgroup(pid, name);
@@ -319,33 +399,58 @@ impl Kernel {
             .get(to)
             .copied()
             .ok_or_else(|| format!("unknown agent '{to}'"))?;
-        let conn = {
+        let (wire, mut w): (Wire, Box<dyn IoWrite + Send>) = {
             let agents = self.agents.lock().unwrap();
             let entry = agents.get(&uin).ok_or("no process table entry")?;
             let mut e = entry.lock().unwrap();
             match e.state {
-                ProcState::Dead | ProcState::Completed => {
-                    return Err(if e.state == ProcState::Dead {
-                        format!("agent '{to}' is dead (respawn budget exhausted)")
-                    } else {
-                        format!("agent '{to}' has completed its task")
-                    })
+                ProcState::Dead => {
+                    Err(format!("agent '{to}' is dead (respawn budget exhausted)"))
                 }
-                ProcState::Registered | ProcState::Running | ProcState::Killed(_) => e
-                    .out
-                    .as_mut()
-                    .map(|s| s.try_clone().map_err(|e| e.to_string()))
-                    .transpose()?,
+                ProcState::Completed => Err(format!("agent '{to}' has completed its task")),
+                _ => {
+                    let wire = e.wire;
+                    let w: Box<dyn IoWrite + Send> = match e.out.as_mut() {
+                        Some(p) => Box::new(p.try_clone().map_err(|e| e.to_string())?),
+                        None => return Err(format!("agent '{to}' has no connection")),
+                    };
+                    Ok((wire, w))
+                }
             }
-        };
-        let mut w = conn.ok_or_else(|| format!("agent '{to}' has no connection"))?;
-        let msg = format!("{}\n", json!({"kind": "msg", "from": from, "body": body}));
-        w.write_all(msg.as_bytes()).map_err(|e| e.to_string())?;
-        w.flush().map_err(|e| e.to_string())?;
+        }?;
+        let msg = json!({"kind": "msg", "from": from, "body": body});
+        let w_ref: &mut dyn IoWrite = w.as_mut();
+        write_envelope(w_ref, wire, &msg).map_err(|e| e.to_string())?;
         self.ledger
             .append("delivered", json!({"from": from, "to": uin, "body": body}))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// The process-table dump for the operator's `ama ps`.
+    pub fn ps_dump(&self) -> Vec<Value> {
+        let agents = self.agents.lock().unwrap();
+        agents
+            .values()
+            .map(|e| {
+                let e = e.lock().unwrap();
+                json!({
+                    "uin": e.uin, "name": e.name, "pid": e.pid,
+                    "state": match &e.state {
+                        ProcState::Registered => "registered",
+                        ProcState::Running => "running",
+                        ProcState::Completed => "completed",
+                        ProcState::Killed(r) => "killed",
+                        ProcState::Dead => "dead",
+                    },
+                    "killed_reason": if let ProcState::Killed(r) = &e.state { json!(r) } else { Value::Null },
+                    "respawns": e.respawns,
+                    "last_step": e.last_step,
+                    "caps": e.caps,
+                    "wire": match e.wire { Wire::Json => "json", Wire::Msgpack => "msgpack" },
+                })
+            })
+            .collect()
     }
 
     /// Kill + journal. The process disappears; its ephemeral memory
@@ -360,6 +465,7 @@ impl Kernel {
                         return; // already judged — fail-fast is idempotent
                     }
                     e.state = ProcState::Killed(reason.into());
+                    e.out = None;
                     e.pid
                 }
                 None => return,
@@ -416,7 +522,9 @@ impl Kernel {
             let mut e = e.lock().unwrap();
             e.pid = pid;
             e.respawns += 1;
-            e.state = ProcState::Registered;
+            // KEEP the state (Killed) until the fresh instance registers —
+            // resetting to Registered here let the OLD process's EOF race
+            // in and trigger a SECOND respawn (seen in the 003 ledger)
             e.last_hb = Instant::now();
             e.last_step = String::new();
             e.stuck_sweeps = 0;
@@ -481,7 +589,21 @@ impl Router {
     /// BIND FIRST, spawn agents after — the listener must exist before any
     /// agent process starts connecting (experiment 001 regression, now the
     /// router's own contract).
-    pub fn serve(kernel: Kernel, agents: &[(String, String)]) -> std::io::Result<std::thread::JoinHandle<()>> {
+    pub fn serve(
+        kernel: Kernel,
+        agents: &[(String, String)],
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        let a: Vec<(String, String, Option<String>, bool)> = agents
+            .iter()
+            .map(|(n, t)| (n.clone(), t.clone(), None, false))
+            .collect();
+        Router::serve_full(kernel, &a)
+    }
+
+    pub fn serve_full(
+        kernel: Kernel,
+        agents: &[(String, String, Option<String>, bool)],
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
         let kernel = Arc::new(kernel);
         let _ = std::fs::remove_file(&kernel.socket_path);
         let listener = std::os::unix::net::UnixListener::bind(&kernel.socket_path)?;
@@ -491,9 +613,27 @@ impl Router {
             std::thread::sleep(Duration::from_millis(200));
         });
         std::mem::forget(watchdog);
+        // network-remote listener: SAME envelope contract over TCP (§3)
+        if let Some(addr) = kernel.tcp_addr.clone() {
+            let k = kernel.clone();
+            std::thread::spawn(move || match std::net::TcpListener::bind(&addr) {
+                Ok(tcp) => {
+                    eprintln!("[ama] tcp listener up on {addr}");
+                    for conn in tcp.incoming() {
+                        if let Ok(stream) = conn {
+                            let k = k.clone();
+                            let _ = stream.set_nodelay(true);
+                            let _ = stream.set_read_timeout(None);
+                            std::thread::spawn(move || Router::connection(k, Peer::Tcp(stream)));
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[ama] tcp listener {addr}: {e}"),
+            });
+        }
         // bind is live now — spawn the manifest's agents
-        for (name, task) in agents {
-            if let Err(e) = kernel.spawn_agent(name, task) {
+        for (name, task, tcp, msgpack) in agents {
+            if let Err(e) = kernel.spawn_agent_opts(name, task, tcp.as_deref(), *msgpack) {
                 eprintln!("[ama] spawn {name}: {e}");
             }
         }
@@ -504,7 +644,7 @@ impl Router {
                         let k = kernel.clone();
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(None);
-                        std::thread::spawn(move || Router::connection(k, stream));
+                        std::thread::spawn(move || Router::connection(k, Peer::Unix(stream)));
                     }
                     Err(_) => continue,
                 }
@@ -513,130 +653,28 @@ impl Router {
         Ok(handle)
     }
 
-    fn connection(kernel: Arc<Kernel>, stream: UnixStream) {
-        let mut writer = match stream.try_clone() {
-            Ok(w) => w,
-            Err(_) => return,
-        };
-        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-        let mut my_uin: Option<u64> = None;
-        let mut writer = stream;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break, // EOF: the process died or exited
-                Ok(_) => {}
-                Err(_) => break,
-            }
-            // control channel verbs (grant/revoke) — operators may
-            // renegotiate capabilities AT RUNTIME; agents can never reach
-            // this: their first envelope registers them
-            if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
-                match v.get("kind").and_then(Value::as_str) {
-                    Some("ctl_grant") if my_uin.is_none() => {
-                        let name = v.get("name").and_then(Value::as_str).unwrap_or("");
-                        let caps: Vec<String> = v
-                            .get("caps")
-                            .and_then(Value::as_array)
-                            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-                            .unwrap_or_default();
-                        let uin = kernel.by_name.lock().unwrap().get(name).copied();
-                        if let Some(uin) = uin {
-                            {
-                                let agents = kernel.agents.lock().unwrap();
-                                if let Some(entry) = agents.get(&uin) {
-                                    let mut e = entry.lock().unwrap();
-                                    for c in &caps {
-                                        if !e.caps.contains(c) {
-                                            e.caps.push(c.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            kernel.ledger.append("cap_granted", json!({"uin": uin, "name": name, "caps": caps})).ok();
-                            let _ = write!(writer, "{}\n", json!({"kind": "granted", "name": name}));
-                            let _ = writer.flush();
-                            continue;
-                        }
-                    }
-                    Some("ctl_revoke") if my_uin.is_none() => {
-                        let name = v.get("name").and_then(Value::as_str).unwrap_or("");
-                        let caps: Vec<String> = v
-                            .get("caps")
-                            .and_then(Value::as_array)
-                            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-                            .unwrap_or_default();
-                        let uin = kernel.by_name.lock().unwrap().get(name).copied();
-                        if let Some(uin) = uin {
-                            {
-                                let agents = kernel.agents.lock().unwrap();
-                                if let Some(entry) = agents.get(&uin) {
-                                    let mut e = entry.lock().unwrap();
-                                    e.caps.retain(|c| !caps.contains(c));
-                                }
-                            }
-                            kernel.ledger.append("cap_revoked", json!({"uin": uin, "name": name, "caps": caps})).ok();
-                            let _ = write!(writer, "{}\n", json!({"kind": "revoked", "name": name}));
-                            let _ = writer.flush();
-                            continue;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // control channel: an UNREGISTERED connection may dump the
-            // process table (the operator's `ama ps`). Agents can never
-            // reach this: their first envelope registers them.
-            if line.trim_end() == "{\"kind\": \"ctl_ps\"}" && my_uin.is_none() {
-                let dump: Vec<Value> = {
-                    let agents = kernel.agents.lock().unwrap();
-                    agents
-                        .values()
-                        .map(|e| {
-                            let e = e.lock().unwrap();
-                            json!({
-                                "uin": e.uin, "name": e.name, "pid": e.pid,
-                                "state": match &e.state {
-                                    ProcState::Registered => "registered",
-                                    ProcState::Running => "running",
-                                    ProcState::Completed => "completed",
-                                    ProcState::Killed(r) => "killed",
-                                    ProcState::Dead => "dead",
-                                },
-                                "killed_reason": if let ProcState::Killed(r) = &e.state { json!(r) } else { Value::Null },
-                                "respawns": e.respawns,
-                                "last_step": e.last_step,
-                                "caps": e.caps,
-                            })
-                        })
-                        .collect()
-                };
-                let _ = write!(writer, "{}\n", json!({"kind": "ps", "agents": dump}));
-                let _ = writer.flush();
-                continue;
-            }
-            let env = match Envelope::parse(line.trim_end()) {
-                Ok(e) => e,
-                Err(reason) => {
-                    kernel.ledger.append("malformed", json!({"reason": reason, "line": line.trim_end()})).ok();
-                    let _ = write!(
-                        writer,
-                        "{}\n",
-                        json!({"kind": "error", "reason": format!("rejected: {reason}")})
-                    );
-                    let _ = writer.flush();
-                    continue;
-                }
-            };
-            match Router::handle(&kernel, &mut writer, env, &mut my_uin) {
-                Ok(()) => {}
-                Err(e) => {
-                    let _ = write!(writer, "{}\n", json!({"kind": "error", "reason": e}));
-                    let _ = writer.flush();
-                }
-            }
+    /// One connection, any transport, both wire formats. The FIRST byte
+    /// decides the format: `{` = JSON lines (v0.1 contract), 0xFF = the
+    /// length-prefixed msgpack frames (§6.2 wire encoding).
+    fn connection(kernel: Arc<Kernel>, mut peer: Peer) {
+        let mut first = [0u8; 1];
+        if peer.read(&mut first).unwrap_or(0) == 0 {
+            return;
         }
+        let my_uin = match first[0] {
+            b'{' => Router::json_loop(kernel.clone(), &mut JsonPeer::new(peer, first[0])),
+            0xFF => Router::msgpack_loop(kernel.clone(), peer, true),
+            _ => {
+                // a payload that does not even carry the schema magic is a
+                // violation — journal it (never silently drop a rejected
+                // connection)
+                kernel
+                    .ledger
+                    .append("malformed", json!({"reason": "invalid json: first byte is not '{' or 0xFF (schema violation)", "seen": first[0]}))
+                    .ok();
+                None
+            }
+        };
         // EOF: if this connection belonged to a live agent, the process is
         // gone — fail fast, respawn from the ledger.
         if let Some(uin) = my_uin {
@@ -664,7 +702,154 @@ impl Router {
         }
     }
 
-    fn handle(kernel: &Kernel, writer: &mut UnixStream, env: Envelope, my_uin: &mut Option<u64>) -> Result<(), String> {
+    fn msgpack_loop(kernel: Arc<Kernel>, mut peer: Peer, first_magic_seen: bool) -> Option<u64> {
+        let mut my_uin: Option<u64> = None;
+        // first frame: the magic byte was already consumed
+        let mut v = {
+            let mut lenb = [0u8; 4];
+            if peer.read_exact(&mut lenb).is_err() {
+                return None;
+            }
+            let len = u32::from_le_bytes(lenb) as usize;
+            let mut buf = vec![0u8; len];
+            if peer.read_exact(&mut buf).is_err() {
+                return None;
+            }
+            match rmp_serde::from_slice::<Value>(&buf) {
+                Ok(v) => v,
+                Err(e) => {
+                    kernel.ledger.append("malformed", json!({"reason": format!("msgpack: {e}")})).ok();
+                    return None;
+                }
+            }
+        };
+        let mut last_wire = Wire::Msgpack;
+        loop {
+            match Router::handle_value(&kernel, &mut peer, &v, &mut my_uin, last_wire) {
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = write_envelope(&mut peer, Wire::Msgpack, &json!({"kind": "error", "reason": e}));
+                }
+            }
+            match read_msgpack_frame(&mut peer) {
+                Ok(v2) => v = v2,
+                Err(_) => break,
+            }
+        }
+        let _ = last_wire;
+        my_uin
+    }
+
+    fn json_loop(kernel: Arc<Kernel>, reader: &mut JsonPeer) -> Option<u64> {
+        let mut my_uin: Option<u64> = None;
+        let mut line = String::new();
+        // the first '{' was already consumed by the mode detector
+        match reader.read_line_after(&mut line) {
+            Ok(true) => {}
+            _ => return None,
+        }
+        // the first '{' is ALREADY in `line` (pushed by the JsonPeer) —
+        // prepending a second brace produced `{{kind` → "key must be a
+        // string" (caught by experiment 003)
+        let first = line.trim_end().to_string();
+        if std::env::var("AMA_DEBUG_JSON").is_ok() {
+            eprintln!("[json_loop] first line = {first:?}");
+        }
+        let mut v = match serde_json::from_str::<Value>(&first) {
+            Ok(v) => v,
+            Err(e) => {
+                kernel.ledger.append("malformed", json!({"reason": format!("invalid json: {e}"), "line": first})).ok();
+                return None;
+            }
+        };
+        loop {
+            match Router::handle_value(&kernel, reader.peer_mut(), &v, &mut my_uin, Wire::Json) {
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = write_envelope(reader.peer_mut(), Wire::Json, &json!({"kind": "error", "reason": format!("rejected: {e}")}));
+                }
+            }
+            line.clear();
+            match reader.read_line_after(&mut line) {
+                Ok(true) => {}
+                _ => break, // EOF: process gone
+            }
+            if std::env::var("AMA_DEBUG_JSON").is_ok() {
+                eprintln!("[json_loop] line = {:?}", line.trim_end());
+            }
+            match serde_json::from_str::<Value>(line.trim_end()) {
+                Ok(v2) => v = v2,
+                Err(e) => {
+                    kernel.ledger.append("malformed", json!({"reason": format!("invalid json: {e}"), "line": line.trim_end()})).ok();
+                    let _ = write_envelope(reader.peer_mut(), Wire::Json, &json!({"kind": "error", "reason": format!("rejected: invalid json: {e}")}));
+                    continue;
+                }
+            }
+        }
+        my_uin
+    }
+
+    /// Handle ONE decoded envelope (transport- and format-agnostic).
+    fn handle_value(kernel: &Kernel, writer: &mut Peer, v: &Value, my_uin: &mut Option<u64>, wire: Wire) -> Result<(), String> {
+        // control channel verbs — operators may dump the table and
+        // renegotiate capabilities AT RUNTIME; agents can never reach
+        // this: their first envelope registers them
+        if my_uin.is_none() {
+            if let Some(kind) = v.get("kind").and_then(Value::as_str) {
+                match kind {
+                    "ctl_ps" => {
+                        let dump = kernel.ps_dump();
+                        let reply = json!({"kind": "ps", "agents": dump});
+                        if std::env::var("AMA_DEBUG_JSON").is_ok() {
+                            eprintln!("[ctl_ps] reply = {reply}");
+                        }
+                        write_envelope(writer, wire, &reply).map_err(|e| e.to_string())?;
+                        return Ok(());
+                    }
+                    "ctl_grant" | "ctl_revoke" => {
+                        let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+                        let caps: Vec<String> = v
+                            .get("caps")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .unwrap_or_default();
+                        let uin = kernel.by_name.lock().unwrap().get(name).copied();
+                        if let Some(uin) = uin {
+                            {
+                                let agents = kernel.agents.lock().unwrap();
+                                if let Some(entry) = agents.get(&uin) {
+                                    let mut e = entry.lock().unwrap();
+                                    if kind == "ctl_grant" {
+                                        for c in &caps {
+                                            if !e.caps.contains(c) {
+                                                e.caps.push(c.clone());
+                                            }
+                                        }
+                                    } else {
+                                        e.caps.retain(|c| !caps.contains(c));
+                                    }
+                                }
+                            }
+                            let ev = if kind == "ctl_grant" { "cap_granted" } else { "cap_revoked" };
+                            kernel.ledger.append(ev, json!({"uin": uin, "name": name, "caps": caps})).ok();
+                            let ack = if kind == "ctl_grant" { "granted" } else { "revoked" };
+                            write_envelope(writer, wire, &json!({"kind": ack, "name": name}))
+                                .map_err(|e| e.to_string())?;
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // agent envelopes
+        let env = match Envelope::from_value(v) {
+            Ok(e) => e,
+            Err(reason) => {
+                kernel.ledger.append("malformed", json!({"reason": reason, "line": v})).ok();
+                return Err(reason);
+            }
+        };
         match env {
             Envelope::Register { name, caps } => {
                 let uin = kernel
@@ -681,6 +866,7 @@ impl Router {
                     e.caps = caps;
                     e.state = ProcState::Running;
                     e.out = Some(writer.try_clone().map_err(|e| e.to_string())?);
+                    e.wire = wire;
                     e.last_hb = Instant::now();
                     e.stuck_sweeps = 0;
                     e.last_step = String::new();
@@ -688,15 +874,8 @@ impl Router {
                 *my_uin = Some(uin);
                 kernel.ledger.append("registered", json!({"uin": uin, "name": name})).map_err(|e| e.to_string())?;
                 let recover = kernel.ledger.last_checkpoint(uin);
-                writer.write_all(
-                    format!(
-                        "{}\n",
-                        json!({"kind": "welcome", "uin": uin, "recover": recover})
-                    )
-                    .as_bytes(),
-                )
-                .map_err(|e| e.to_string())?;
-                writer.flush().map_err(|e| e.to_string())?;
+                write_envelope(writer, wire, &json!({"kind": "welcome", "uin": uin, "recover": recover}))
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Heartbeat { uin, step, phase } => {
@@ -717,10 +896,7 @@ impl Router {
             Envelope::Send { uin, to, body } => {
                 kernel.check_cap(uin, "send", &to)?;
                 kernel.route_send(uin, &to, &body)?;
-                writer
-                    .write_all(format!("{}\n", json!({"kind": "sent", "to": to})).as_bytes())
-                    .map_err(|e| e.to_string())?;
-                writer.flush().map_err(|e| e.to_string())?;
+                write_envelope(writer, wire, &json!({"kind": "sent", "to": to})).map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Checkpoint { uin, state } => {
@@ -733,27 +909,23 @@ impl Router {
                     entry.lock().unwrap().last_checkpoint = Some(state.clone());
                 }
                 drop(agents);
-                writer
-                    .write_all(format!("{}\n", json!({"kind": "acked", "seq": e.seq})).as_bytes())
-                    .map_err(|e| e.to_string())?;
-                writer.flush().map_err(|e| e.to_string())?;
+                write_envelope(writer, wire, &json!({"kind": "acked", "seq": e.seq})).map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Done { uin } => {
                 let agents = kernel.agents.lock().unwrap();
                 if let Some(entry) = agents.get(&uin) {
-                    let mut e = entry.lock().unwrap();
-                    e.state = ProcState::Completed;
+                    entry.lock().unwrap().state = ProcState::Completed;
                 }
                 drop(agents);
-                kernel
-                    .ledger
-                    .append("completed", json!({"uin": uin}))
-                    .map_err(|e| e.to_string())?;
+                kernel.ledger.append("completed", json!({"uin": uin})).map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Note { uin, text } => {
                 kernel.ledger.append("agent_note", json!({"uin": uin, "text": text})).map_err(|e| e.to_string())?;
+                // ACK: the agent's drain_acks blocks until one arrives — an
+                // unacked note looked like a stalled process to the watchdog
+                write_envelope(writer, wire, &json!({"kind": "acked", "note": true})).map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Recovered { uin: _ } => {
@@ -761,6 +933,91 @@ impl Router {
                 Ok(())
             }
         }
+    }
+}
+
+/// Peer: one agent connection over ANY transport (UDS or TCP — the
+/// envelope contract and capability checks are identical).
+pub enum Peer {
+    Unix(UnixStream),
+    Tcp(std::net::TcpStream),
+}
+
+impl std::io::Read for Peer {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Peer::Unix(s) => s.read(buf),
+            Peer::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for Peer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Peer::Unix(s) => s.write(buf),
+            Peer::Tcp(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Peer::Unix(s) => s.flush(),
+            Peer::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+impl Peer {
+    pub fn try_clone(&self) -> std::io::Result<Peer> {
+        match self {
+            Peer::Unix(s) => Ok(Peer::Unix(s.try_clone()?)),
+            Peer::Tcp(s) => Ok(Peer::Tcp(s.try_clone()?)),
+        }
+    }
+}
+
+/// A JSON peer whose first byte was consumed by the mode detector.
+struct JsonPeer {
+    peer: Peer,
+    first: Option<u8>,
+    done: bool,
+}
+
+impl JsonPeer {
+    fn new(peer: Peer, first: u8) -> JsonPeer {
+        JsonPeer { peer, first: Some(first), done: false }
+    }
+    /// read one JSON line; the stored first byte is prepended on the
+    /// first call; returns Ok(false) on EOF
+    fn read_line_after(&mut self, line: &mut String) -> std::io::Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        if let Some(b) = self.first.take() {
+            line.push(b as char);
+        }
+        let mut buf = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            match self.peer.read(&mut b) {
+                Ok(0) => {
+                    self.done = true;
+                    line.push_str(&String::from_utf8_lossy(&buf));
+                    return Ok(!line.is_empty());
+                }
+                Ok(_) => {
+                    if b[0] == b'\n' {
+                        line.push_str(&String::from_utf8_lossy(&buf));
+                        return Ok(true);
+                    }
+                    buf.push(b[0]);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    fn peer_mut(&mut self) -> &mut Peer {
+        &mut self.peer
     }
 }
 
@@ -780,6 +1037,9 @@ pub struct KernelConfig {
     pub hb_timeout_ms: u64,
     #[serde(default)]
     pub max_respawns: u32,
+    /// network-remote listener (kernel accepts agents over TCP too)
+    #[serde(default)]
+    pub tcp_port: Option<u16>,
 }
 
 fn default_hb() -> u64 {
@@ -793,4 +1053,29 @@ fn default_timeout() -> u64 {
 pub struct AgentSpec {
     pub name: String,
     pub task: String,
+    /// "tcp" = connect over the network-remote transport (default: UDS)
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// "msgpack" = binary wire format (default: JSON lines)
+    #[serde(default)]
+    pub wire: Option<String>,
+}
+
+#[cfg(test)]
+mod json_peer_tests {
+    use super::*;
+
+    #[test]
+    fn json_peer_reads_two_lines() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut writer = b;
+        let mut peer = JsonPeer::new(Peer::Unix(a), b'{');
+        writer.write_all(b"\"x\": 1}\n{\"y\": 2}\n").unwrap();
+        let mut line = String::new();
+        assert!(peer.read_line_after(&mut line).unwrap());
+        assert_eq!(line, "{\"x\": 1}");
+        line.clear();
+        assert!(peer.read_line_after(&mut line).unwrap());
+        assert_eq!(line, "{\"y\": 2}");
+    }
 }
