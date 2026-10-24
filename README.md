@@ -61,6 +61,29 @@ run inside the same filter via `ama jail -- <cmd>` (PATH-resolved).
 Differential probe: unjailed `ptrace(TRACEME)` returns 0; the identical
 call inside the jail returns EPERM.
 
+**Strict allowlist seccomp (§3)** — `ama jail --strict` flips the
+filter to default-DENY with an explicit x86_64 allowlist, and
+`socket()` is allowed ONLY for `AF_UNIX`: the differential probe shows
+`socket(AF_INET)` returning EPERM while `socket(AF_UNIX)` works — the
+kernel is the agent's ONLY channel.
+
+**Network-remote IPC (§3)** — the kernel accepts agents over TCP
+(`tcp_port` in the manifest) with the IDENTICAL envelope contract and
+capability checks; an agent list `transport: "tcp"` in its spec. The
+round trip crosses transports AND wire formats transparently
+(experiment 003).
+
+**Binary wire format (§3)** — every connection speaks either JSON
+lines (v0.1) or length-prefixed msgpack (`0xFF` magic), decided by the
+first byte; the kernel answers each connection in ITS format and
+delivers cross-format messages by translating at the target's wire.
+
+**User-namespace tier (§2, MicroVM frontier)** — `ama jail --userns`
+runs the tool in a fresh user+mount namespace before the seccomp filter
+(uid 0 inside, host ownership unchanged). Gated by host policy: hosts
+that forbid unprivileged user namespaces get an explicit SKIP, not a
+fake pass.
+
 **Hot capability renegotiation (§3)** — the operator grants and revokes
 capabilities AT RUNTIME over a control connection (`ama grant --name m
 --caps send:c` / `ama revoke`); agents can never reach the control
@@ -117,22 +140,20 @@ reasoning loop — the progress watchdog detects the stuck step in
 attempts to reach an agent it has no capability for — refused and
 journaled. All five ran as distinct OS processes.
 
-## Deliberately not implemented (v0.2)
+## Deliberately not implemented (v0.3)
 
-- **MicroVM per agent**: the deepest isolation tier of the brief.
-  The isolation unit today is the OS process + seccomp denylist +
-  best-effort cgroup v2 — a real MicroVM (Firecracker-class) is the
-  remaining frontier for hostile tool code.
-- **Network-distributed message passing**: single-host UDS by design
-  (the brief rejects network brokers for the local case).
-- **FlatBuffers/protobuf wire format**: strict per-kind JSON schema
-  validation in the kernel — the enforcement point is the kernel.
-- **Allow-list seccomp profile**: the current filter is a denylist of
-  host-dangerous syscalls; a full allowlist (default-deny + explicitly
-  permitted set) is the next security tier.
+- **Full MicroVM (Firecracker-class)**: the deepest isolation tier.
+  Today: OS process + seccomp (denylist AND strict allowlist) + user
+  namespace + best-effort cgroup v2. The remaining frontier is a real
+  VM per agent for fully hostile tool code — the user-namespace tier
+  above is its unprivileged first step.
+- **FlatBuffers/protobuf**: msgpack (length-prefixed frames) shipped as
+  the binary wire; protobuf remains an option, not a requirement — the
+  enforcement point is the kernel's schema check, not the encoder.
 
 Git history: `3dd35d8` v0.1.0 (kernel MVP), v0.2.0 (seccomp jails +
-hot capabilities).
+hot capabilities), v0.3.0 (strict allowlist, TCP transports, msgpack
+wire, user-namespace tier).
 
 ## Layout
 
@@ -151,6 +172,7 @@ cargo build            # ama-core (lib) + ama-agentd + ama
 cargo test             # unit tests
 bash experiments/experiment_001_isolation.sh   # isolation + watchdog + recovery
 bash experiments/experiment_002_caps_seccomp.sh # seccomp jail + hot capabilities
+bash experiments/experiment_003_transports.sh  # TCP + msgpack + allowlist + userns
 ```
 
 ## License
