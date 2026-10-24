@@ -1,0 +1,9 @@
+{
+  "name": "c",
+  "caps": [],
+  "steps": [
+    {"op": "checkpoint", "state": {"n": 0}},
+    {"op": "sleep", "ms": 2500},
+    {"op": "checkpoint", "state": {"n": 1}}
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "m",
+  "caps": ["send:b"],
+  "steps": [
+    {"op": "checkpoint", "state": {}},
+    {"op": "send", "to": "c", "body": {"attack": 1}},
+    {"op": "checkpoint", "state": {"done": true}}
+  ]
+}
