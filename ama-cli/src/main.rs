@@ -116,7 +116,7 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
     let mut kernel = kernel; // shadow for mutation
     kernel.apply_cgroups = cgroups; // opt-in, best-effort (see sandbox.rs)
     kernel.tcp_addr = m.kernel.tcp_port.map(|p| format!("127.0.0.1:{p}"));
-    let agents: Vec<(String, String, Option<String>, bool)> = m
+    let agents: Vec<(String, String, Option<String>, Option<ama_core::Wire>)> = m
         .agents
         .iter()
         .map(|a| {
@@ -124,7 +124,12 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
                 a.name.clone(),
                 a.task.clone(),
                 a.transport.clone().map(|t| format!("127.0.0.1:{}", m.kernel.tcp_port.unwrap_or(0))),
-                a.wire.as_deref() == Some("msgpack"),
+                a.wire.as_deref().and_then(|w| match w {
+                "json" => Some(ama_core::Wire::Json),
+                "msgpack" => Some(ama_core::Wire::Msgpack),
+                "proto" => Some(ama_core::Wire::Proto),
+                _ => None,
+            }),
             )
         })
         .collect();

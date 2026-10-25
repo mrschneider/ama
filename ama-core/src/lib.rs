@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod proto;
 pub mod sandbox;
 pub mod seccomp;
 
@@ -29,6 +30,8 @@ use std::io::{self, Write as IoWrite};
 pub enum Wire {
     Json,
     Msgpack,
+    /// protobuf (hand-rolled encoder, §6.2 "protobuf remains an option")
+    Proto,
 }
 
 /// Serialize + frame an envelope in the connection's wire format.
@@ -50,7 +53,37 @@ pub fn write_envelope(w: &mut dyn IoWrite, wire: Wire, v: &Value) -> io::Result<
             w.write_all(&bytes)?;
             w.flush()
         }
+        Wire::Proto => {
+            let bytes = proto::encode_value(v)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            w.write_all(&[0x0A])?;
+            w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            w.write_all(&bytes)?;
+            w.flush()
+        }
     }
+}
+
+/// Read one PROTOBUF frame (0x0A magic + u32 LE length + proto message).
+pub fn read_proto_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
+    let mut magic = [0u8; 1];
+    r.read_exact(&mut magic)?;
+    if magic[0] != 0x0A {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing 0x0A magic"));
+    }
+    let mut lenb = [0u8; 4];
+    r.read_exact(&mut lenb)?;
+    let len = u32::from_le_bytes(lenb) as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    // raw decode — NO Envelope schema check here: this frame may be a
+    // kernel→agent REPLY (welcome/sent/acked/msg/error), which is outside
+    // the agent→kernel Envelope vocabulary. The kernel's handle_value
+    // re-validates agent envelopes; the agent's reader accepts replies
+    // verbatim, exactly like the JSON/msgpack readers.
+    proto::decode_raw(&buf).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, e)
+    })
 }
 
 /// Read one msgpack frame (0xFF magic + u32 LE length + payload).
@@ -79,6 +112,13 @@ pub fn read_msgpack_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
 pub enum Envelope {
     Register { name: String, caps: Vec<String> },
     Heartbeat { uin: u64, step: String, phase: String },
+    /// Kernel → agent: registration accepted. `recover` carries the last
+    /// ledger checkpoint (None when the agent is fresh). The proto reader
+    /// enforces this schema — a missing Welcome variant made the agentd
+    /// drop the connection on the very first frame (experiment 004:
+    /// proto agents died of heartbeat timeout because welcome never
+    /// reached the inbox).
+    Welcome { uin: u64, recover: Option<Value> },
     Send { uin: u64, to: String, body: Value },
     Checkpoint { uin: u64, state: Value },
     Recovered { uin: u64 },
@@ -139,6 +179,12 @@ impl Envelope {
                     .ok_or("heartbeat: missing 'phase' (executing|blocked)")?
                     .to_string(),
             }),
+            "welcome" => Ok(Envelope::Welcome {
+                uin: take_u64("uin")?,
+                recover: v
+                    .get("recover")
+                    .and_then(|r| if r.is_null() { None } else { Some(r.clone()) }),
+            }),
             "send" => Ok(Envelope::Send {
                 uin: take_u64("uin")?,
                 to: v
@@ -171,6 +217,9 @@ impl Envelope {
             Envelope::Register { name, caps } => json!({"kind": "register", "name": name, "caps": caps}),
             Envelope::Heartbeat { uin, step, phase } => {
                 json!({"kind": "heartbeat", "uin": uin, "step": step, "phase": phase})
+            }
+            Envelope::Welcome { uin, recover } => {
+                json!({"kind": "welcome", "uin": uin, "recover": recover})
             }
             Envelope::Send { uin, to, body } => json!({"kind": "send", "uin": uin, "to": to, "body": body}),
             Envelope::Checkpoint { uin, state } => json!({"kind": "checkpoint", "uin": uin, "state": state}),
@@ -224,6 +273,10 @@ impl Ledger {
         let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let e = LedgerEvent { seq, ts_ms, ev: ev.into(), detail };
         let _guard = self.write_lock.lock().unwrap();
+        // the ledger must survive its parent dir being removed mid-flight
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
         writeln!(f, "{}", serde_json::to_string(&e).unwrap())?;
         f.flush()?;
@@ -280,8 +333,11 @@ pub struct ProcEntry {
     pub respawns: u32,
     pub last_checkpoint: Option<Value>,
     pub task_path: String,
-    /// the agent's connection in ANY transport (UDS or TCP — §3)
-    pub out: Option<Peer>,
+    /// the agent's connection in ANY transport (UDS or TCP — §3);
+    /// Mutex-serialized: route_send (sender's thread) and this agent's
+    /// own ack replies write the SAME fd concurrently — unsynchronized
+    /// writes interleave msgpack frames mid-payload
+    pub out: Option<Arc<Mutex<Peer>>>,
     pub wire: Wire,
 }
 
@@ -328,12 +384,18 @@ impl Kernel {
     /// Spawn an agent process from a manifest entry. The process is the
     /// isolation unit: its own PID, its own ephemeral memory.
     pub fn spawn_agent(&self, name: &str, task_path: &str) -> std::io::Result<()> {
-        self.spawn_agent_opts(name, task_path, None, false)
+        self.spawn_agent_opts(name, task_path, None, Some(Wire::Json))
     }
 
-    /// `tcp`: connect over the network-remote transport; `msgpack`: speak
-    /// the binary wire format (v0.2: both are per-agent options)
-    pub fn spawn_agent_opts(&self, name: &str, task_path: &str, tcp: Option<&str>, msgpack: bool) -> std::io::Result<()> {
+    /// `tcp`: connect over the network-remote transport; `wire`: speak
+    /// JSON, msgpack, or protobuf (per-agent options)
+    pub fn spawn_agent_opts(
+        &self,
+        name: &str,
+        task_path: &str,
+        tcp: Option<&str>,
+        wire_opt: Option<Wire>,
+    ) -> std::io::Result<()> {
         let uin = self.next_uin.fetch_add(1, Ordering::SeqCst);
         let mut cmd = Command::new(&self.agentd_path);
         cmd.args(["--socket", self.socket_path.to_str().unwrap_or("/tmp/ama.sock"), "--task", task_path]);
@@ -341,12 +403,31 @@ impl Kernel {
         if let Some(addr) = tcp_addr {
             cmd.arg("--tcp").arg(addr);
         }
-        if msgpack {
-            cmd.arg("--wire").arg("msgpack");
+        if let Some(w) = wire_opt {
+            let s = match w {
+                Wire::Json => "json",
+                Wire::Msgpack => "msgpack",
+                Wire::Proto => "proto",
+            };
+            cmd.arg("--wire").arg(s);
         }
-        cmd.env("AMA_UIN", uin.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        cmd.env("AMA_UIN", uin.to_string()).stdout(Stdio::null());
+        // debug mode: keep agent stderr in a per-agent file (watchdog
+        // forensics) instead of dropping it
+        if std::env::var("AMA_DEBUG").is_ok() {
+            let p = std::path::PathBuf::from(format!(
+                "/tmp/ama_dbg_agent_{}.stderr",
+                self.next_uin.load(Ordering::SeqCst)
+            ));
+            let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&p);
+            if let Ok(f) = f {
+                cmd.stderr(Stdio::from(f));
+            } else {
+                cmd.stderr(Stdio::null());
+            }
+        } else {
+            cmd.stderr(Stdio::null());
+        }
         let child = cmd.spawn()?;
         let pid = child.id();
         let entry = Arc::new(Mutex::new(ProcEntry {
@@ -410,8 +491,11 @@ impl Kernel {
                 ProcState::Completed => Err(format!("agent '{to}' has completed its task")),
                 _ => {
                     let wire = e.wire;
-                    let w: Box<dyn IoWrite + Send> = match e.out.as_mut() {
-                        Some(p) => Box::new(p.try_clone().map_err(|e| e.to_string())?),
+                    let w: Box<dyn IoWrite + Send> = match e.out.as_ref() {
+                        Some(p) => {
+                            let guard = p.lock().unwrap();
+                            Box::new(guard.try_clone().map_err(|e| e.to_string())?)
+                        }
                         None => return Err(format!("agent '{to}' has no connection")),
                     };
                     Ok((wire, w))
@@ -447,7 +531,11 @@ impl Kernel {
                     "respawns": e.respawns,
                     "last_step": e.last_step,
                     "caps": e.caps,
-                    "wire": match e.wire { Wire::Json => "json", Wire::Msgpack => "msgpack" },
+                    "wire": match e.wire {
+                        Wire::Json => "json",
+                        Wire::Msgpack => "msgpack",
+                        Wire::Proto => "proto",
+                    },
                 })
             })
             .collect()
@@ -482,8 +570,11 @@ impl Kernel {
     }
 
     /// Atomic respawn: fresh process from the last ledger checkpoint.
+    /// The respawn MUST carry the agent's wire: the fresh agentd otherwise
+    /// defaults to json and re-registers under a different wire than the
+    /// manifest asked for (experiment 004: proto agent reborn as json).
     pub fn respawn(&self, uin: u64) {
-        let (name, task, respawns, checkpoint) = {
+        let (name, task, respawns, checkpoint, wire) = {
             let agents = self.agents.lock().unwrap();
             let e = match agents.get(&uin) {
                 Some(e) => e.lock().unwrap(),
@@ -493,7 +584,8 @@ impl Kernel {
             let t = e.task_path.clone();
             let r = e.respawns;
             let c = e.last_checkpoint.clone();
-            (n, t, r, c)
+            let w = e.wire;
+            (n, t, r, c, w)
         };
         if respawns >= self.max_respawns {
             let agents = self.agents.lock().unwrap();
@@ -509,6 +601,14 @@ impl Kernel {
             .env("AMA_UIN", uin.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        {
+            let s = match wire {
+                Wire::Json => "json",
+                Wire::Msgpack => "msgpack",
+                Wire::Proto => "proto",
+            };
+            cmd.arg("--wire").arg(s);
+        }
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -593,16 +693,16 @@ impl Router {
         kernel: Kernel,
         agents: &[(String, String)],
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
-        let a: Vec<(String, String, Option<String>, bool)> = agents
+        let a: Vec<(String, String, Option<String>, Option<Wire>)> = agents
             .iter()
-            .map(|(n, t)| (n.clone(), t.clone(), None, false))
+            .map(|(n, t)| (n.clone(), t.clone(), None, Some(Wire::Json)))
             .collect();
         Router::serve_full(kernel, &a)
     }
 
     pub fn serve_full(
         kernel: Kernel,
-        agents: &[(String, String, Option<String>, bool)],
+        agents: &[(String, String, Option<String>, Option<Wire>)],
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
         let kernel = Arc::new(kernel);
         let _ = std::fs::remove_file(&kernel.socket_path);
@@ -632,8 +732,8 @@ impl Router {
             });
         }
         // bind is live now — spawn the manifest's agents
-        for (name, task, tcp, msgpack) in agents {
-            if let Err(e) = kernel.spawn_agent_opts(name, task, tcp.as_deref(), *msgpack) {
+        for (name, task, tcp, wire) in agents {
+            if let Err(e) = kernel.spawn_agent_opts(name, task, tcp.as_deref(), *wire) {
                 eprintln!("[ama] spawn {name}: {e}");
             }
         }
@@ -664,6 +764,7 @@ impl Router {
         let my_uin = match first[0] {
             b'{' => Router::json_loop(kernel.clone(), &mut JsonPeer::new(peer, first[0])),
             0xFF => Router::msgpack_loop(kernel.clone(), peer, true),
+            0x0A => Router::proto_loop(kernel.clone(), peer),
             _ => {
                 // a payload that does not even carry the schema magic is a
                 // violation — journal it (never silently drop a rejected
@@ -702,8 +803,55 @@ impl Router {
         }
     }
 
-    fn msgpack_loop(kernel: Arc<Kernel>, mut peer: Peer, first_magic_seen: bool) -> Option<u64> {
+    fn proto_loop(kernel: Arc<Kernel>, mut peer: Peer) -> Option<u64> {
         let mut my_uin: Option<u64> = None;
+        // first frame: the 0x0A magic byte was already consumed
+        let mut v = {
+            let mut lenb = [0u8; 4];
+            if peer.read_exact(&mut lenb).is_err() {
+                return None;
+            }
+            let len = u32::from_le_bytes(lenb) as usize;
+            let mut buf = vec![0u8; len];
+            if peer.read_exact(&mut buf).is_err() {
+                return None;
+            }
+            match proto::decode_raw(&buf) {
+                Ok(val) => val,
+                Err(e) => {
+                    kernel.ledger.append("malformed", json!({"reason": format!("proto: first frame decode failed: {e}")})).ok();
+                    return None;
+                }
+            }
+        };
+        if std::env::var("AMA_DEBUG").is_ok() {
+            eprintln!("[proto_loop] first frame: {v}");
+        }
+        loop {
+            match Router::handle_value(&kernel, &mut peer, &v, &mut my_uin, Wire::Proto) {
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = write_envelope(&mut peer, Wire::Proto, &json!({"kind": "error", "reason": e}));
+                }
+            }
+            match read_proto_frame(&mut peer) {
+                Ok(v2) => {
+                    if std::env::var("AMA_DEBUG").is_ok() {
+                        eprintln!("[proto_loop] next frame: {v2}");
+                    }
+                    v = v2;
+                }
+                Err(_) => break,
+            }
+        }
+        my_uin
+    }
+
+    fn msgpack_loop(kernel: Arc<Kernel>, mut peer: Peer, _first_magic_seen: bool) -> Option<u64> {
+        let mut my_uin: Option<u64> = None;
+        if std::env::var("AMA_DEBUG").is_ok() {
+            eprintln!("[msgpack_loop] entered");
+        }
         // first frame: the magic byte was already consumed
         let mut v = {
             let mut lenb = [0u8; 4];
@@ -732,7 +880,12 @@ impl Router {
                 }
             }
             match read_msgpack_frame(&mut peer) {
-                Ok(v2) => v = v2,
+                Ok(v2) => {
+                    if std::env::var("AMA_DEBUG").is_ok() {
+                        eprintln!("[msgpack_loop] next frame: {v2}");
+                    }
+                    v = v2;
+                }
                 Err(_) => break,
             }
         }
@@ -756,7 +909,12 @@ impl Router {
             eprintln!("[json_loop] first line = {first:?}");
         }
         let mut v = match serde_json::from_str::<Value>(&first) {
-            Ok(v) => v,
+            Ok(v) => {
+                if std::env::var("AMA_DEBUG").is_ok() {
+                    eprintln!("[json_loop] first frame: {v}");
+                }
+                v
+            }
             Err(e) => {
                 kernel.ledger.append("malformed", json!({"reason": format!("invalid json: {e}"), "line": first})).ok();
                 return None;
@@ -778,7 +936,12 @@ impl Router {
                 eprintln!("[json_loop] line = {:?}", line.trim_end());
             }
             match serde_json::from_str::<Value>(line.trim_end()) {
-                Ok(v2) => v = v2,
+                Ok(v2) => {
+                    if std::env::var("AMA_DEBUG").is_ok() {
+                        eprintln!("[json_loop] frame: {v2}");
+                    }
+                    v = v2;
+                }
                 Err(e) => {
                     kernel.ledger.append("malformed", json!({"reason": format!("invalid json: {e}"), "line": line.trim_end()})).ok();
                     let _ = write_envelope(reader.peer_mut(), Wire::Json, &json!({"kind": "error", "reason": format!("rejected: invalid json: {e}")}));
@@ -862,17 +1025,33 @@ impl Router {
                 {
                     let agents = kernel.agents.lock().unwrap();
                     let entry = agents.get(&uin).ok_or("no entry")?;
+                    let e = entry.lock().unwrap();
+                    // one live instance per UIN: a second register (stale
+                    // process that didn't get the kill, or a duplicate)
+                    // is refused — the respawning pid is the authority
+                    if let ProcState::Running = e.state {
+                        return Err(format!("agent '{name}' already registered (stale instance refused)"));
+                    }
+                    drop(e);
+                    drop(entry);
+                    drop(agents);
+                }
+                {
+                    let agents = kernel.agents.lock().unwrap();
+                    let entry = agents.get(&uin).ok_or("no entry")?;
                     let mut e = entry.lock().unwrap();
                     e.caps = caps;
                     e.state = ProcState::Running;
-                    e.out = Some(writer.try_clone().map_err(|e| e.to_string())?);
+                    e.out = Some(Arc::new(Mutex::new(
+                        writer.try_clone().map_err(|e| e.to_string())?,
+                    )));
                     e.wire = wire;
                     e.last_hb = Instant::now();
                     e.stuck_sweeps = 0;
                     e.last_step = String::new();
                 }
                 *my_uin = Some(uin);
-                kernel.ledger.append("registered", json!({"uin": uin, "name": name})).map_err(|e| e.to_string())?;
+                kernel.ledger.append("registered", json!({"uin": uin, "name": name, "wire": format!("{wire:?}")})).map_err(|e| e.to_string())?;
                 let recover = kernel.ledger.last_checkpoint(uin);
                 write_envelope(writer, wire, &json!({"kind": "welcome", "uin": uin, "recover": recover}))
                     .map_err(|e| e.to_string())?;
@@ -926,6 +1105,13 @@ impl Router {
                 // ACK: the agent's drain_acks blocks until one arrives — an
                 // unacked note looked like a stalled process to the watchdog
                 write_envelope(writer, wire, &json!({"kind": "acked", "note": true})).map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Envelope::Welcome { uin: _, recover: _ } => {
+                // the kernel SENDS welcome; receiving one back is a
+                // schema-legal envelope from a confused agent — journal
+                // and ignore (never crash the reader thread)
+                kernel.ledger.append("malformed", json!({"reason": "unexpected welcome from agent", "uin": my_uin.unwrap_or(0)})).ok();
                 Ok(())
             }
             Envelope::Recovered { uin: _ } => {

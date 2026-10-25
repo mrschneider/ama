@@ -7,7 +7,7 @@
 //! EITHER transport (UDS default, `--tcp host:port` for network-remote)
 //! in EITHER wire format (JSON lines default, `--wire msgpack` binary).
 
-use ama_core::{read_msgpack_frame, write_envelope, Peer, Wire};
+use ama_core::{read_msgpack_frame, read_proto_frame, write_envelope, Peer, Wire};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -56,6 +56,7 @@ fn main() {
             "--wire" => {
                 wire = match args.next().unwrap_or_default().as_str() {
                     "msgpack" => Wire::Msgpack,
+                    "proto" => Wire::Proto,
                     _ => Wire::Json,
                 }
             }
@@ -81,7 +82,11 @@ fn main() {
         }
         None => Peer::Unix(UnixStream::connect(&socket).expect("connect to kernel")),
     };
-    let mut w = peer.try_clone().expect("clone");
+    // §3: ONE shared writer, Mutex-serialized — the heartbeat thread and
+    // the task loop write to the SAME fd; unsynchronized writes interleave
+    // msgpack frames mid-payload and the kernel's read_exact then stalls
+    // on a garbage length (caught by experiment 004: b's ping vanished)
+    let writer: Arc<Mutex<Peer>> = Arc::new(Mutex::new(peer));
 
     // reader thread: kernel pushes (welcome/msg/error) into a queue —
     // parsed per wire format
@@ -93,7 +98,7 @@ fn main() {
     {
         let inbox = inbox.clone();
         let alive = alive.clone();
-        let mut r = peer.try_clone().expect("reader clone");
+        let mut r = writer.lock().unwrap().try_clone().expect("reader clone");
         std::thread::spawn(move || match wire {
             Wire::Json => {
                 let mut r = BufReader::new(r);
@@ -119,6 +124,15 @@ fn main() {
                     Ok(v) => inbox.lock().unwrap().push_back(v),
                     Err(_) => break,
                 }
+            }
+            Wire::Proto => loop {
+                if !alive.load(Ordering::SeqCst) {
+                    break;
+                }
+                match read_proto_frame(&mut r) {
+                    Ok(v) => inbox.lock().unwrap().push_back(v),
+                    Err(_) => break,
+                }
             },
         });
     }
@@ -133,7 +147,7 @@ fn main() {
         let alive = alive.clone();
         let uin_holder = uin_holder.clone();
         let phase_task = phase.clone();
-        let mut w = w.try_clone().expect("hb clone");
+        let writer = writer.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(150));
             if !alive.load(Ordering::SeqCst) {
@@ -149,18 +163,22 @@ fn main() {
             } else {
                 "executing"
             };
+            let mut w = writer.lock().unwrap();
             let _ = write_envelope(
-                &mut w,
+                &mut *w,
                 wire,
                 &json!({"kind": "heartbeat", "uin": u, "step": step.to_string(), "phase": ph}),
             );
         });
     }
 
-    let send = |w: &mut Peer, v: &Value| write_envelope(w, wire, v).expect("send");
+    let send = |writer: &Arc<Mutex<Peer>>, v: &Value| {
+        let mut w = writer.lock().unwrap();
+        write_envelope(&mut *w, wire, v).expect("send")
+    };
 
     // register
-    send(&mut w, &json!({"kind": "register", "name": task.name, "caps": task.caps}));
+    send(&writer, &json!({"kind": "register", "name": task.name, "caps": task.caps}));
 
     // process welcome (and any recover state) first
     let mut uin: u64 = 0;
@@ -219,17 +237,17 @@ fn main() {
         match step {
             Step::Checkpoint { state } => {
                 send(
-                    &mut w,
+                    &writer,
                     &json!({"kind": "checkpoint", "uin": uin, "state": {"step_index": idx + 1, "state": state}}),
                 );
                 drain_acks(&inbox);
             }
             Step::Send { to, body } => {
-                send(&mut w, &json!({"kind": "send", "uin": uin, "to": to, "body": body}));
+                send(&writer, &json!({"kind": "send", "uin": uin, "to": to, "body": body}));
                 drain_acks(&inbox);
             }
             Step::Note { msg } => {
-                send(&mut w, &json!({"kind": "note", "uin": uin, "text": msg}));
+                send(&writer, &json!({"kind": "note", "uin": uin, "text": msg}));
                 drain_acks(&inbox);
             }
             Step::Wait => {
@@ -266,7 +284,7 @@ fn main() {
         idx += 1;
     }
     eprintln!("[agentd {}] task complete", task.name);
-    send(&mut w, &json!({"kind": "done", "uin": uin}));
+    send(&writer, &json!({"kind": "done", "uin": uin}));
     std::thread::sleep(Duration::from_millis(200)); // let the ack/EOF settle
     std::process::exit(0);
 }

@@ -1,0 +1,15 @@
+{
+  "kernel": {
+    "socket": "/tmp/ama_exp.sock",
+    "ledger": "/tmp/ama_exp/ledger.jsonl",
+    "hb_interval_ms": 150,
+    "hb_timeout_ms": 1200,
+    "max_respawns": 2,
+    "tcp_port": 7777
+  },
+  "agents": [
+    {"name": "a", "task": "experiments/tasks_004/a.json"},
+    {"name": "b", "task": "experiments/tasks_004/b.json", "transport": "tcp", "wire": "msgpack"},
+    {"name": "c", "task": "experiments/tasks_004/c.json", "transport": "tcp", "wire": "proto"}
+  ]
+}
