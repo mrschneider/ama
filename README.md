@@ -1,5 +1,9 @@
 # AMA — Agentic Microkernel Architecture
 
+[![CI](https://github.com/mrschneider/ama/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/ama/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/mrschneider/ama?sort=semver)](https://github.com/mrschneider/ama/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **Run AI agents as OS processes. Contain every failure. Prove every guarantee.**
 
 AMA is a microkernel for reliable multi-agent systems — a faithful
@@ -23,6 +27,24 @@ from the ledger. See [Verified results](#verified-results).
 
 ## Getting started
 
+Prebuilt archives are published on every tagged release:
+`ama-x86_64-linux-gnu.tar.gz` and `ama-x86_64-linux-musl.tar.gz` (static
+— the same build the microVM tier boots), each with a `.sha256`:
+
+```bash
+# latest release → https://github.com/mrschneider/ama/releases/latest
+BASE=https://github.com/mrschneider/ama/releases/latest/download
+curl -LO $BASE/ama-x86_64-linux-musl.tar.gz
+curl -LO $BASE/ama-x86_64-linux-musl.tar.gz.sha256
+sha256sum -c ama-x86_64-linux-musl.tar.gz.sha256
+tar xzf ama-x86_64-linux-musl.tar.gz    # puts ama + ama-agentd at the root
+```
+
+Each archive also carries the VM scripts, the experiments and the docs,
+so a release tarball is a runnable distribution.
+
+From source:
+
 ```bash
 # 1. Fetch the external VM assets (Firecracker, guest kernel, busybox)
 #    and build the static agentd — the repo does not commit binaries
@@ -40,8 +62,8 @@ ama serve --manifest manifest.json --agentd ./ama-agentd
 - `SECURITY.md` — how to report vulnerabilities privately, plus the
   explicit scope and design boundaries of the isolation model.
 - `.github/workflows/ci.yml` — fmt, clippy (debug *and* release),
-  unit tests, and experiments 001–004 on every push/PR; the microVM
-  experiment is documented but not run in CI (needs `/dev/kvm`).
+  unit tests, and experiments 001–004 + 006 on every push/PR; the
+  microVM experiment is documented but not run in CI (needs `/dev/kvm`).
 - `.github/workflows/release.yml` — tag-driven releases: verify →
   cross-compile gnu+musl → checksums → GitHub Release.
 
@@ -198,6 +220,17 @@ PASS: observability: agent notes are journaled into the ledger
 EXPERIMENT_002: PASS  (40 ledger events)
 ```
 
+`experiments/experiment_006_qos_dtn.sh` (11 s end-to-end):
+```
+PASS: qos: 3 sends within the bucket were accepted (sent attempts 4-6 throttled)
+PASS: dtn: custody taken for the offline destination (3 bundles stored)
+PASS: dtn: backlog delivered in order on re-registration
+PASS: dtn: no bundle expired inside the TTL window
+PASS: dtn: the respawned agent completed after draining its backlog
+PASS: qos: the throttled sender still completed its task
+EXPERIMENT_006: PASS
+```
+
 Scenario: `b` pings `a` (typed envelope, capability-checked,
 journaled); `a` pongs back and both complete. `c` checkpoints, is
 killed externally (`kill -9`, the OOM/operator path), resumes from its
@@ -212,7 +245,7 @@ userns), `004_wires` (three wires on ONE kernel), `005_microvm`
 (Firecracker tier), `006_qos_dtn` (rate limiting + store-and-forward
 custody for an offline destination).
 
-## Deliberately not implemented (v0.4)
+## Deliberately not implemented (v0.5)
 
 - **Trusted execution** — all tiers are host-enforced. A VM booting a
   malicious kernel is not contained (Firecracker assumes a trusted
@@ -226,10 +259,20 @@ custody for an offline destination).
   multi-hop relays, no custody acknowledgements, no bundle
   fragmentation or re-assembly.
 
-Git history: `3dd35d8` v0.1.0 (kernel MVP), v0.2.0 (seccomp jails + hot
-capabilities), v0.3.0 (strict allowlist, TCP transports, msgpack wire,
-user-namespace tier), v0.4.0 (protobuf wire + Firecracker microVM
-tier), v0.5.0 (per-sender QoS + DTN custody).
+## Releases
+
+| Version | Highlights |
+|---|---|
+| **v0.5.0** | Per-sender QoS (token bucket + priority) and DTN store-and-forward custody |
+| v0.4.0 | Protobuf wire, Firecracker microVM tier (one VM per agent), CI + tag-driven releases |
+| v0.3.0 | Strict seccomp allowlist, TCP transports, msgpack wire, user-namespace tier |
+| v0.2.0 | seccomp jails, hot capability grant/revoke |
+| v0.1.0 | Kernel MVP: process table, IPC router, ledger, watchdog, respawn |
+
+Assets per release: `ama-x86_64-linux-gnu.tar.gz` and
+`ama-x86_64-linux-musl.tar.gz` plus their `.sha256` checksums. Releases
+are built and verified by CI on the tag (unit tests + experiments
+001–004 and 006).
 
 ## Layout
 
