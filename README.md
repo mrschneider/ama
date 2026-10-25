@@ -89,6 +89,20 @@ reasoning loops from legitimate I/O waits), `send`, `checkpoint`,
 listed in its process-table grants. Refused sends are journaled
 (`cap_denied`).
 
+**QoS: rate limits + priority (§3)** — an agent declares
+`max_msgs_per_sec` and the kernel holds a **per-sender** token bucket: a
+bursty agent is throttled on its own sends without starving the others.
+Refusals are journaled (`qos_throttled`) — backpressure is never silent.
+`priority` (0 = highest) orders the destination's deferred queue.
+
+**DTN: store-and-forward custody (§3)** — an agent may declare
+`dtn: true`. A send to that agent while it is disconnected (killed, dead,
+not yet up) does NOT fail: the kernel takes **custody** of the bundle,
+holds it with a TTL, and delivers it on the destination's next
+registration — before the welcome, in priority order. Every transition is
+journaled (`dtn_stored`, `dtn_delivered`, `dtn_expired`). This is the
+Bundle Protocol idea reduced to what a kernel can honestly implement.
+
 **Watchdog + fail-fast recovery (§4)** — heartbeat timeout *and* a
 progress watchdog (same reasoning step for K sweeps while `executing`)
 kill the suspect with the reason journaled. Respawn is atomic: a fresh
@@ -195,7 +209,8 @@ five ran as distinct OS processes.
 
 Further experiments: `003_transports` (TCP + msgpack + allowlist +
 userns), `004_wires` (three wires on ONE kernel), `005_microvm`
-(Firecracker tier).
+(Firecracker tier), `006_qos_dtn` (rate limiting + store-and-forward
+custody for an offline destination).
 
 ## Deliberately not implemented (v0.4)
 
@@ -204,11 +219,17 @@ userns), `004_wires` (three wires on ONE kernel), `005_microvm`
   guest kernel image; the vmlinux here is the Firecracker CI build).
 - **Live migration** — the microVM tier is cold: respawn = fresh VM
   from the checkpoint, no hot migration between hosts.
+- **Full QoS suite** — no weighted fair queueing, no admission control,
+  no bandwidth accounting: only a per-sender token bucket and a
+  priority-ordered custody queue.
+- **DTN routing** — custody is single-hop kernel-side only: no
+  multi-hop relays, no custody acknowledgements, no bundle
+  fragmentation or re-assembly.
 
 Git history: `3dd35d8` v0.1.0 (kernel MVP), v0.2.0 (seccomp jails + hot
 capabilities), v0.3.0 (strict allowlist, TCP transports, msgpack wire,
 user-namespace tier), v0.4.0 (protobuf wire + Firecracker microVM
-tier).
+tier), v0.5.0 (per-sender QoS + DTN custody).
 
 ## Layout
 
@@ -236,6 +257,7 @@ bash experiments/experiment_002_caps_seccomp.sh # seccomp jail + hot capabilitie
 bash experiments/experiment_003_transports.sh  # TCP + msgpack + allowlist + userns
 bash experiments/experiment_004_wires.sh       # protobuf wire: 3 wires on ONE kernel
 bash experiments/experiment_005_microvm.sh     # Firecracker microVM tier (needs /dev/kvm + ufw allow 172.16.0.0/12)
+bash experiments/experiment_006_qos_dtn.sh     # per-sender rate limits + DTN custody for an offline agent
 ```
 
 ## License

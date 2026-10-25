@@ -148,6 +148,8 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
                     _ => None,
                 }),
                 a.isolation.clone(),
+                a.qos,
+                a.dtn,
             )
         })
         .collect();

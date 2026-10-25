@@ -1,0 +1,35 @@
+{
+  "name": "dtn",
+  "caps": [
+    "send:src"
+  ],
+  "steps": [
+    {
+      "op": "checkpoint",
+      "state": {
+        "n": 0
+      }
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "checkpoint",
+      "state": {
+        "late": true
+      }
+    },
+    {
+      "op": "checkpoint",
+      "state": {
+        "done": true
+      }
+    }
+  ]
+}

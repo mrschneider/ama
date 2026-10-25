@@ -62,5 +62,10 @@ jobs:
       - run: bash experiments/experiment_002_caps_seccomp.sh
       - run: bash experiments/experiment_003_transports.sh
       - run: bash experiments/experiment_004_wires.sh
+      - run: |
+          pkill -9 -x ama || true
+          pkill -9 -x ama-agentd || true
+          sleep 1
+          bash experiments/experiment_006_qos_dtn.sh
       # experiment_005_microvm is intentionally excluded: it requires
       # /dev/kvm, which GitHub-hosted runners do not expose.

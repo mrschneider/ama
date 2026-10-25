@@ -207,11 +207,33 @@ fn main() {
     // process welcome (and any recover state) first
     let mut uin: u64 = 0;
     let mut recovered_from: Option<Value> = None;
-    let welcome = loop {
-        match inbox.lock().unwrap().pop_front() {
-            Some(v) => break Some(v),
-            None => std::thread::sleep(Duration::from_millis(5)),
+    // DTN flush delivers the backlog BEFORE the welcome is read: the
+    // welcome loop must skip anything that is not a welcome WITHOUT
+    // losing it (a backlog message consumed as the welcome would give
+    // the agent a garbage UIN — experiment 006). Non-welcome frames are
+    // collected and pushed back IN ORDER once the welcome is found —
+    // pushing back as we go would cycle the backlog forever and the
+    // welcome at the tail would never be reached.
+    let welcome = {
+        let mut deferred: Vec<Value> = Vec::new();
+        let w = loop {
+            match inbox.lock().unwrap().pop_front() {
+                Some(v) => {
+                    if v.get("kind").and_then(Value::as_str) == Some("welcome") {
+                        break v;
+                    }
+                    deferred.push(v);
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        if !deferred.is_empty() {
+            let mut q = inbox.lock().unwrap();
+            for v in deferred {
+                q.push_back(v);
+            }
         }
+        Some(w)
     };
     if let Some(wl) = welcome {
         eprintln!(

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod proto;
+pub mod qos;
 pub mod sandbox;
 pub mod seccomp;
 
@@ -407,6 +408,11 @@ pub struct ProcEntry {
     /// "microvm" = the watched PID is a Firecracker VM, not an OS
     /// process; respawn must re-boot the VM, not the agentd binary
     pub isolation: Option<String>,
+    /// delivery priority (0 = highest); default 5
+    pub priority: u8,
+    /// delay-tolerant destination: sends to it while disconnected are
+    /// held by the kernel (custody) instead of failing
+    pub dtn: bool,
 }
 
 pub struct Kernel {
@@ -426,6 +432,9 @@ pub struct Kernel {
     /// per-agent Firecracker boot script (vm/boot_agent.sh) for the
     /// microVM isolation tier
     pub vm_boot: Option<String>,
+    /// QoS (per-sender token buckets) + DTN (store-and-forward custody
+    /// store) — see qos.rs
+    pub delivery: Mutex<qos::DeliverySystem>,
 }
 
 impl Kernel {
@@ -450,19 +459,33 @@ impl Kernel {
             apply_cgroups: false,
             tcp_addr: None,
             vm_boot: None,
+            delivery: Mutex::new(qos::DeliverySystem::new(1024, Duration::from_secs(300))),
         })
+    }
+
+    /// Declare an agent's QoS at registration time (priority is stored
+    /// on the entry; a rate limit installs its token bucket).
+    pub fn set_qos(&self, uin: u64, priority: u8, rate: Option<u32>) {
+        {
+            let agents = self.agents.lock().unwrap();
+            if let Some(e) = agents.get(&uin) {
+                e.lock().unwrap().priority = priority;
+            }
+        }
+        self.delivery.lock().unwrap().set_rate(uin, rate);
     }
 
     /// Spawn an agent process from a manifest entry. The process is the
     /// isolation unit: its own PID, its own ephemeral memory.
     pub fn spawn_agent(&self, name: &str, task_path: &str) -> std::io::Result<()> {
-        self.spawn_agent_opts(name, task_path, None, Some(Wire::Json), None)
+        self.spawn_agent_opts(name, task_path, None, Some(Wire::Json), None, None, false)
     }
 
     /// `tcp`: connect over the network-remote transport; `wire`: speak
     /// JSON, msgpack, or protobuf (per-agent options); `isolation`:
     /// "microvm" boots the agent inside its own Firecracker microVM
     /// (see vm/boot_agent.sh) instead of an OS process
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_agent_opts(
         &self,
         name: &str,
@@ -470,7 +493,11 @@ impl Kernel {
         tcp: Option<&str>,
         wire_opt: Option<Wire>,
         isolation: Option<&str>,
+        qos: Option<QosSpec>,
+        dtn: bool,
     ) -> std::io::Result<()> {
+        // 8 params by design: name/task/tcp/wire/isolation are the
+        // pre-existing spawn surface, qos+dtn are the delivery contract
         let uin = self.next_uin.fetch_add(1, Ordering::SeqCst);
         let microvm = isolation == Some("microvm");
         let mut cmd = if microvm {
@@ -577,15 +604,26 @@ impl Kernel {
             out: None,
             wire: Wire::Json,
             isolation: isolation.map(String::from),
+            priority: qos.and_then(|q| q.priority).unwrap_or(5).min(9),
+            dtn,
         }));
         if self.apply_cgroups {
             let _ = sandbox::apply_cgroup(pid, name);
         }
         self.agents.lock().unwrap().insert(uin, entry);
         self.by_name.lock().unwrap().insert(name.into(), uin);
+        // QoS registration: the sender's token bucket is installed at
+        // spawn time so a rate limit applies from the FIRST envelope
+        if let Some(q) = qos {
+            self.set_qos(
+                uin,
+                q.priority.unwrap_or(5).min(9),
+                q.max_msgs_per_sec.filter(|r| *r > 0),
+            );
+        }
         self.ledger.append(
             "spawned",
-            json!({"uin": uin, "name": name, "pid": pid, "task": task_path}),
+            json!({"uin": uin, "name": name, "pid": pid, "task": task_path, "dtn": dtn}),
         )?;
         Ok(())
     }
@@ -607,6 +645,17 @@ impl Kernel {
         }
     }
 
+    /// QoS-aware, DTN-capable delivery path.
+    ///
+    /// QoS: the SENDER's token bucket gates the send (a bursty agent
+    /// cannot starve the others); the DESTINATION's priority orders the
+    /// DTN queue when delivery must be deferred.
+    ///
+    /// DTN: when the destination is disconnected (dead, killed, or
+    /// pre-registration) and it declared `dtn: true`, the kernel takes
+    /// CUSTODY of the message instead of failing the send — store-and-
+    /// forward with a TTL, delivered on the next registration. Without
+    /// `dtn: true` the historical behaviour stands: the send fails.
     pub fn route_send(&self, from: u64, to: &str, body: &Value) -> Result<(), String> {
         let uin = self
             .by_name
@@ -615,32 +664,127 @@ impl Kernel {
             .get(to)
             .copied()
             .ok_or_else(|| format!("unknown agent '{to}'"))?;
-        let (wire, mut w): (Wire, Box<dyn IoWrite + Send>) = {
+
+        // QoS gate FIRST: a rate-limited sender is throttled even when
+        // the destination is up — backpressure before entry, not after.
+        if !self.delivery.lock().unwrap().allow(from) {
+            self.ledger
+                .append(
+                    "qos_throttled",
+                    json!({"from": from, "to": uin, "body": body}),
+                )
+                .map_err(|e| e.to_string())?;
+            return Err(format!("qos: sender {from} over its rate limit"));
+        }
+
+        let (wire, w, dest_priority, dest_dtn, deliverable): (Wire, Option<Peer>, u8, bool, bool) = {
             let agents = self.agents.lock().unwrap();
             let entry = agents.get(&uin).ok_or("no process table entry")?;
             let e = entry.lock().unwrap();
-            match e.state {
-                ProcState::Dead => Err(format!("agent '{to}' is dead (respawn budget exhausted)")),
-                ProcState::Completed => Err(format!("agent '{to}' has completed its task")),
-                _ => {
-                    let wire = e.wire;
-                    let w: Box<dyn IoWrite + Send> = match e.out.as_ref() {
-                        Some(p) => {
-                            let guard = p.lock().unwrap();
-                            Box::new(guard.try_clone().map_err(|e| e.to_string())?)
-                        }
-                        None => return Err(format!("agent '{to}' has no connection")),
-                    };
-                    Ok((wire, w))
+            let deliverable =
+                matches!(e.state, ProcState::Running | ProcState::Registered) && e.out.is_some();
+            let w = if deliverable {
+                match e.out.as_ref() {
+                    Some(p) => {
+                        let guard = p.lock().unwrap();
+                        guard.try_clone().ok()
+                    }
+                    None => None,
                 }
+            } else {
+                None
+            };
+            (e.wire, w, e.priority, e.dtn, deliverable)
+        };
+
+        if !deliverable {
+            // DTN custody: hold the message for the target's next registration
+            if dest_dtn {
+                let mut d = self.delivery.lock().unwrap();
+                d.store(from, uin, body.clone(), dest_priority, None)
+                    .map_err(|e| e.to_string())?;
+                self.ledger
+                    .append(
+                        "dtn_stored",
+                        json!({"from": from, "to": uin, "priority": dest_priority, "body": body}),
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
             }
-        }?;
+            // not DTN-tolerant: the historical explicit failure
+            let agents = self.agents.lock().unwrap();
+            let entry = agents.get(&uin).ok_or("no process table entry")?;
+            let e = entry.lock().unwrap();
+            return Err(match e.state {
+                ProcState::Dead => format!("agent '{to}' is dead (respawn budget exhausted)"),
+                ProcState::Completed => format!("agent '{to}' has completed its task"),
+                _ => format!("agent '{to}' has no connection"),
+            });
+        }
+
+        let mut w = w.ok_or_else(|| format!("agent '{to}' has no connection"))?;
         let msg = json!({"kind": "msg", "from": from, "body": body});
-        let w_ref: &mut dyn IoWrite = w.as_mut();
+        let w_ref: &mut dyn IoWrite = &mut w;
         write_envelope(w_ref, wire, &msg).map_err(|e| e.to_string())?;
         self.ledger
             .append("delivered", json!({"from": from, "to": uin, "body": body}))
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// DTN flush: called on registration — deliver the destination's held
+    /// bundles in PRIORITY order (0 first), journal every delivery and
+    /// every expiry. Runs BEFORE the welcome is written so the fresh
+    /// agent sees its backlog as its first messages.
+    pub fn dtn_flush(&self, uin: u64) -> Result<(), String> {
+        let (wire, writer, name) = {
+            let agents = self.agents.lock().unwrap();
+            let entry = agents.get(&uin).ok_or("no process table entry")?;
+            let e = entry.lock().unwrap();
+            let w = match e.out.as_ref() {
+                Some(p) => {
+                    let guard = p.lock().unwrap();
+                    guard.try_clone().map_err(|e| e.to_string())?
+                }
+                None => return Ok(()), // still no connection — nothing to flush into
+            };
+            (e.wire, w, e.name.clone())
+        };
+        let (bundles, expired) = {
+            let mut d = self.delivery.lock().unwrap();
+            let out = d.drain_for(uin);
+            let exp = d.take_expired_report();
+            (out, exp)
+        };
+        for b in &expired {
+            self.ledger
+                .append(
+                    "dtn_expired",
+                    json!({"from": b.from, "to": uin, "body": b.body}),
+                )
+                .ok();
+        }
+        let count = bundles.len();
+        for b in bundles {
+            let msg = json!({"kind": "msg", "from": b.from, "body": b.body});
+            let mut w = writer.try_clone().map_err(|e| e.to_string())?;
+            let w_ref: &mut dyn IoWrite = &mut w;
+            write_envelope(w_ref, wire, &msg).map_err(|e| e.to_string())?;
+            self.ledger
+                .append(
+                    "dtn_delivered",
+                    json!({"from": b.from, "to": uin, "priority": b.priority, "body": b.body}),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        if count > 0 {
+            self.ledger
+                .append(
+                    "dtn_flushed",
+                    json!({"to": uin, "name": name, "count": count}),
+                )
+                .ok();
+        }
         Ok(())
     }
 
@@ -714,7 +858,7 @@ impl Kernel {
     /// defaults to json and re-registers under a different wire than the
     /// manifest asked for (experiment 004: proto agent reborn as json).
     pub fn respawn(&self, uin: u64) {
-        let (name, task, respawns, checkpoint, wire, isolation) = {
+        let (name, task, respawns, checkpoint, wire, isolation, priority, dtn) = {
             let agents = self.agents.lock().unwrap();
             let e = match agents.get(&uin) {
                 Some(e) => e.lock().unwrap(),
@@ -726,7 +870,9 @@ impl Kernel {
             let c = e.last_checkpoint.clone();
             let w = e.wire;
             let iso = e.isolation.clone();
-            (n, t, r, c, w, iso)
+            let pr = e.priority;
+            let dn = e.dtn;
+            (n, t, r, c, w, iso, pr, dn)
         };
         if respawns >= self.max_respawns {
             let agents = self.agents.lock().unwrap();
@@ -800,6 +946,10 @@ impl Kernel {
             e.stuck_sweeps = 0;
             // the fresh instance inherits the ledger checkpoint on register
             e.last_checkpoint = checkpoint.or(e.last_checkpoint.clone());
+            // delivery contract survives the respawn: a reborn agent keeps
+            // its priority and its DTN custody role
+            e.priority = priority;
+            e.dtn = dtn;
         }
         drop(agents);
         self.ledger
@@ -850,6 +1000,19 @@ impl Kernel {
                 })
                 .collect()
         };
+        // DTN sweep: bundles whose TTL ran out while the destination
+        // never registered — journaled then dropped (never silent)
+        {
+            let expired = self.delivery.lock().unwrap().sweep_expired();
+            for b in expired {
+                self.ledger
+                    .append(
+                        "dtn_expired",
+                        json!({"from": b.from, "to": b.to, "body": b.body}),
+                    )
+                    .ok();
+            }
+        }
         for (uin, reason) in suspects {
             self.kill(uin, &reason);
             self.respawn(uin);
@@ -863,7 +1026,15 @@ impl Kernel {
 // ---------------------------------------------------------------------------
 
 /// One manifest agent, expanded: (name, task, tcp target, wire, isolation)
-pub type AgentSpecTuple = (String, String, Option<String>, Option<Wire>, Option<String>);
+pub type AgentSpecTuple = (
+    String,
+    String,
+    Option<String>,
+    Option<Wire>,
+    Option<String>,
+    Option<QosSpec>,
+    bool,
+);
 
 pub struct Router {
     pub kernel: Arc<Kernel>,
@@ -879,7 +1050,17 @@ impl Router {
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
         let a: Vec<AgentSpecTuple> = agents
             .iter()
-            .map(|(n, t)| (n.clone(), t.clone(), None, Some(Wire::Json), None))
+            .map(|(n, t)| {
+                (
+                    n.clone(),
+                    t.clone(),
+                    None,
+                    Some(Wire::Json),
+                    None,
+                    None,
+                    false,
+                )
+            })
             .collect();
         Router::serve_full(kernel, &a)
     }
@@ -915,10 +1096,16 @@ impl Router {
             });
         }
         // bind is live now — spawn the manifest's agents
-        for (name, task, tcp, wire, iso) in agents {
-            if let Err(e) =
-                kernel.spawn_agent_opts(name, task, tcp.as_deref(), *wire, iso.as_deref())
-            {
+        for (name, task, tcp, wire, iso, qos, dtn) in agents {
+            if let Err(e) = kernel.spawn_agent_opts(
+                name,
+                task,
+                tcp.as_deref(),
+                *wire,
+                iso.as_deref(),
+                *qos,
+                *dtn,
+            ) {
                 eprintln!("[ama] spawn {name}: {e}");
             }
         }
@@ -1293,6 +1480,10 @@ impl Router {
                     e.last_step = String::new();
                 }
                 *my_uin = Some(uin);
+                // DTN custody flush: the fresh agent gets its held bundles
+                // (priority order) BEFORE its welcome — its backlog arrives
+                // as its first messages
+                kernel.dtn_flush(uin)?;
                 kernel
                     .ledger
                     .append(
@@ -1512,6 +1703,17 @@ fn default_timeout() -> u64 {
     1200
 }
 
+/// Per-agent delivery QoS: `priority` 0..=9 (0 = highest, delivered
+/// first), `max_msgs_per_sec` = token-bucket rate limit for this SENDER
+/// (None/0 = unlimited).
+#[derive(Deserialize, Clone, Copy, Debug, Default)]
+pub struct QosSpec {
+    #[serde(default)]
+    pub priority: Option<u8>,
+    #[serde(default)]
+    pub max_msgs_per_sec: Option<u32>,
+}
+
 #[derive(Deserialize)]
 pub struct AgentSpec {
     pub name: String,
@@ -1527,6 +1729,14 @@ pub struct AgentSpec {
     /// tool code — see vm/boot_agent.sh)
     #[serde(default)]
     pub isolation: Option<String>,
+    /// delivery QoS: priority + per-sender rate limit
+    #[serde(default)]
+    pub qos: Option<QosSpec>,
+    /// delay-tolerant: when true, sends TO this agent are held by the
+    /// kernel (custody transfer) while it is disconnected, with a TTL,
+    /// and delivered when it registers again
+    #[serde(default)]
+    pub dtn: bool,
 }
 
 #[cfg(test)]

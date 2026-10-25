@@ -1,0 +1,67 @@
+{
+  "name": "src",
+  "caps": [
+    "send:dtn",
+    "send:burst"
+  ],
+  "steps": [
+    {
+      "op": "checkpoint",
+      "state": {
+        "n": 0
+      }
+    },
+    {
+      "op": "sleep",
+      "ms": 2000
+    },
+    {
+      "op": "send",
+      "to": "dtn",
+      "body": {
+        "n": 1
+      }
+    },
+    {
+      "op": "send",
+      "to": "dtn",
+      "body": {
+        "n": 2
+      }
+    },
+    {
+      "op": "send",
+      "to": "dtn",
+      "body": {
+        "n": 3
+      }
+    },
+    {
+      "op": "send",
+      "to": "dtn",
+      "body": {
+        "n": 4
+      }
+    },
+    {
+      "op": "send",
+      "to": "dtn",
+      "body": {
+        "n": 5
+      }
+    },
+    {
+      "op": "send",
+      "to": "dtn",
+      "body": {
+        "n": 6
+      }
+    },
+    {
+      "op": "checkpoint",
+      "state": {
+        "sent": 6
+      }
+    }
+  ]
+}

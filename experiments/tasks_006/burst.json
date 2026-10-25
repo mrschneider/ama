@@ -1,0 +1,11 @@
+{
+  "name": "burst",
+  "caps": ["send:src"],
+  "steps": [
+    {"op": "checkpoint", "state": {"n": 0}},
+    {"op": "sleep", "ms": 500},
+    {"op": "send", "to": "src", "body": {"b": 1}},
+    {"op": "sleep", "ms": 8000},
+    {"op": "checkpoint", "state": {"done": true}}
+  ]
+}
