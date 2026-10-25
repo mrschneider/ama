@@ -132,13 +132,29 @@ single throttle:
   `qos_accounting` after every served batch and readable at any time on
   the operator-only control channel (`ama qos`).
 
-**DTN: store-and-forward custody (§3)** — an agent may declare
-`dtn: true`. A send to that agent while it is disconnected (killed, dead,
-not yet up) does NOT fail: the kernel takes **custody** of the bundle,
-holds it with a TTL, and delivers it on the destination's next
-registration — before the welcome, in priority order. Every transition is
-journaled (`dtn_stored`, `dtn_delivered`, `dtn_expired`). This is the
-Bundle Protocol idea reduced to what a kernel can honestly implement.
+**DTN: custody, routing, fragments (§3)** — an agent may declare
+`dtn: true`. A send to it while it is disconnected does not fail: the
+kernel takes **custody** of the bundle, holds it with a TTL, and delivers
+it on the next registration. On top of that store-and-forward core:
+
+- **Multi-hop relays.** A manifest `routes` entry says "to reach `far`,
+  hand the bundle to `relay`". The kernel hands custody to the relay as a
+  `bundle` frame; the relay re-emits it (`relay`), optionally naming the
+  next hop itself. Every hop increments the count and `max_hops` caps the
+  path — a bundle that would travel too far is dropped with
+  `dtn_hop_limit`, never silently looped or stored forever.
+- **Custody acknowledgements.** A relay that accepts a bundle sends
+  `custody_ack`; the kernel then deletes its own copy
+  (`dtn_custody_ack`) — custody transfers exactly once, per fragment.
+- **Fragmentation and reassembly.** A body above `max_bundle_bytes`
+  travels as numbered fragments, each routed independently; the receiving
+  kernel delivers ONE reassembled message when the set completes
+  (`dtn_reassembled`). An incomplete set expires like any other bundle.
+
+Every transition is journaled: `dtn_stored`, `dtn_relayed`,
+`dtn_custody_ack`, `dtn_delivered`, `dtn_fragmented`, `dtn_hop_limit`,
+`dtn_expired`. This is the Bundle Protocol idea reduced to what a kernel
+can honestly implement.
 
 **Watchdog + fail-fast recovery (§4)** — heartbeat timeout *and* a
 progress watchdog (same reasoning step for K sweeps while `executing`)
@@ -259,7 +275,8 @@ Further experiments: `003_transports` (TCP + msgpack + allowlist +
 userns), `004_wires` (three wires on ONE kernel), `005_microvm`
 (Firecracker tier), `006_qos_dtn` (rate limiting + store-and-forward
 custody for an offline destination), `007_qos_suite` (WFQ weights under
-a contended link, admission control, bandwidth accounting).
+a contended link, admission control, bandwidth accounting),
+`008_dtn_routing` (two relays, custody acks, fragmentation across hops).
 
 ## Deliberately not implemented (v0.5)
 
@@ -271,15 +288,18 @@ a contended link, admission control, bandwidth accounting).
 - **QoS beyond this kernel** — the link is a per-tick byte budget, not a
   shaped NIC: no per-destination links, no ECN/queue-management (RED),
   no cross-kernel federation of the accounting counters.
-- **DTN routing** — custody is single-hop kernel-side only: no
-  multi-hop relays, no custody acknowledgements, no bundle
-  fragmentation or re-assembly.
+- **DTN routing beyond a static table** — routes are declared in the
+  manifest: no neighbour discovery, no dynamic metric, no
+  retransmission when a relay accepts custody and then loses the bundle
+  (the kernel keeps its copy until the ack, not until delivery), and no
+  bundle security (no signatures, no encryption at the bundle layer).
 
 ## Releases
 
 | Version | Highlights |
 |---|---|
-| **v0.5.0** | Per-sender QoS (token bucket + priority) and DTN store-and-forward custody |
+| **v0.6.0** | Weighted fair queueing, admission control, bandwidth accounting; DTN multi-hop routing, custody acks, fragmentation |
+| v0.5.0 | Per-sender QoS (token bucket + priority) and DTN store-and-forward custody |
 | v0.4.0 | Protobuf wire, Firecracker microVM tier (one VM per agent), CI + tag-driven releases |
 | v0.3.0 | Strict seccomp allowlist, TCP transports, msgpack wire, user-namespace tier |
 | v0.2.0 | seccomp jails, hot capability grant/revoke |
@@ -318,6 +338,7 @@ bash experiments/experiment_004_wires.sh       # protobuf wire: 3 wires on ONE k
 bash experiments/experiment_005_microvm.sh     # Firecracker microVM tier (needs /dev/kvm + ufw allow 172.16.0.0/12)
 bash experiments/experiment_006_qos_dtn.sh     # per-sender rate limits + DTN custody for an offline agent
 bash experiments/experiment_007_qos_suite.sh   # WFQ weights + admission control + bandwidth accounting
+bash experiments/experiment_008_dtn_routing.sh # multi-hop relays + custody acks + fragmentation
 ```
 
 ## License

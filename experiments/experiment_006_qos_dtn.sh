@@ -44,15 +44,17 @@ PYEOF
 )
 kill -9 "$DTN_PID" 2>/dev/null || true
 
-# t~3.0s: src has sent (its task sleeps 2s first) — custody was taken.
-# NOW the destination "comes back": a fresh agentd process for the same
-# name registers and the kernel flushes the held backlog to it
-sleep 2
+# t~6s: by now src has sent (its task sleeps 2s, and agent startup jitter
+# is ~1.5s, so the offline window must be WIDE — a 2s window raced the
+# sends and the test flaked). NOW the destination "comes back": a fresh
+# agentd process for the same name registers and the kernel flushes the
+# held backlog to it
+sleep 5
 ./target/debug/ama-agentd --socket /tmp/ama_exp.sock \
   --task experiments/tasks_006/dtn.json &
 DTN_RESTART_PID=$!
 
-sleep 7
+sleep 6
 kill $DTN_RESTART_PID 2>/dev/null || true
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true

@@ -435,6 +435,12 @@ pub struct Kernel {
     /// QoS (per-sender token buckets) + DTN (store-and-forward custody
     /// store) — see qos.rs
     pub delivery: Mutex<qos::DeliverySystem>,
+    /// DTN routing table: destination name -> relay name (next hop)
+    pub routes: std::collections::HashMap<String, String>,
+    /// hop budget for a routed bundle
+    pub max_hops: u8,
+    /// bodies above this size are fragmented (None = never)
+    pub max_bundle_bytes: Option<usize>,
 }
 
 impl Kernel {
@@ -460,6 +466,9 @@ impl Kernel {
             tcp_addr: None,
             vm_boot: None,
             delivery: Mutex::new(qos::DeliverySystem::new(1024, Duration::from_secs(300))),
+            routes: std::collections::HashMap::new(),
+            max_hops: default_max_hops_u8(),
+            max_bundle_bytes: None,
         })
     }
 
@@ -481,6 +490,76 @@ impl Kernel {
             d.wfq = qos::WfqScheduler::new(c);
         }
         d.link_bytes_per_tick = link_bytes_per_tick;
+    }
+
+    /// Install the DTN routing table and the hop/fragment policy.
+    pub fn configure_routing(
+        &mut self,
+        routes: &[RouteSpec],
+        max_hops: u8,
+        max_bundle_bytes: Option<usize>,
+    ) {
+        for r in routes {
+            self.routes.insert(r.dest.clone(), r.via.clone());
+        }
+        self.max_hops = max_hops;
+        self.max_bundle_bytes = max_bundle_bytes;
+    }
+
+    /// Is this agent connected right now?
+    fn agent_ready(&self, uin: u64) -> bool {
+        let agents = self.agents.lock().unwrap();
+        match agents.get(&uin) {
+            Some(e) => {
+                let e = e.lock().unwrap();
+                matches!(e.state, ProcState::Running | ProcState::Registered) && e.out.is_some()
+            }
+            None => false,
+        }
+    }
+
+    /// Write a kernel->agent frame to a connected agent.
+    fn write_to(&self, uin: u64, msg: &Value) -> Result<(), String> {
+        let (wire, mut w) = {
+            let agents = self.agents.lock().unwrap();
+            let entry = agents.get(&uin).ok_or("no process table entry")?;
+            let e = entry.lock().unwrap();
+            let p = e.out.as_ref().ok_or("no connection")?;
+            let guard = p.lock().unwrap();
+            (e.wire, guard.try_clone().map_err(|e| e.to_string())?)
+        };
+        let w_ref: &mut dyn IoWrite = &mut w;
+        write_envelope(w_ref, wire, msg).map_err(|e| e.to_string())
+    }
+
+    /// Reverse lookup: the destination's NAME — what a relay echoes back
+    /// when it forwards the bundle (a relay never sees the kernel's UINs).
+    fn name_of(&self, uin: u64) -> Option<String> {
+        let by_name = self.by_name.lock().unwrap();
+        by_name
+            .iter()
+            .find(|(_, u)| **u == uin)
+            .map(|(n, _)| n.clone())
+    }
+
+    /// Hand custody of `b` to its next hop (a relay agent) as a `bundle`
+    /// frame. The kernel KEEPS its copy until the relay acknowledges.
+    fn forward_to_relay(&self, b: &qos::DtnBundle, relay: u64) -> Result<(), String> {
+        let to_name = self.name_of(b.to).ok_or("no name for the destination")?;
+        let frag = b
+            .frag
+            .map(|m| json!({"id": m.id, "index": m.index, "total": m.total}));
+        let msg = json!({
+            "kind": "bundle",
+            "bundle_id": b.bundle_id,
+            "from": b.from,
+            "to": to_name,
+            "to_uin": b.to,
+            "hops": b.hops,
+            "frag": frag,
+            "body": b.body,
+        });
+        self.write_to(relay, &msg)
     }
 
     /// Declare an agent's QoS at registration time (priority is stored
@@ -747,18 +826,12 @@ impl Kernel {
         };
 
         if !deliverable {
-            // DTN custody: hold the message for the target's next registration
+            // DTN custody: hold the message for the target's next
+            // registration — or route it to a relay when the manifest
+            // says which one reaches the destination
             if dest_dtn {
-                let mut d = self.delivery.lock().unwrap();
-                d.store(from, uin, body.clone(), dest_priority, None)
-                    .map_err(|e| e.to_string())?;
-                self.ledger
-                    .append(
-                        "dtn_stored",
-                        json!({"from": from, "to": uin, "priority": dest_priority, "body": body}),
-                    )
-                    .map_err(|e| e.to_string())?;
-                return Ok(());
+                let bundle_id = self.delivery.lock().unwrap().new_bundle_id();
+                return self.dtn_route(from, to, uin, body.clone(), dest_priority, 0, bundle_id);
             }
             // not DTN-tolerant: the historical explicit failure
             let agents = self.agents.lock().unwrap();
@@ -911,6 +984,218 @@ impl Kernel {
         }
     }
 
+    /// Route one logical bundle: fragment it when it is too large,
+    /// hand it to a configured relay (journaled custody transfer), or
+    /// store it for the destination's next registration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dtn_route(
+        &self,
+        from: u64,
+        to_name: &str,
+        to_uin: u64,
+        body: Value,
+        priority: u8,
+        hops: u8,
+        bundle_id: u64,
+    ) -> Result<(), String> {
+        self.dtn_route_ext(from, to_name, to_uin, body, priority, hops, bundle_id, true)
+    }
+
+    /// `allow_routing = false` means "this bundle is already in transit":
+    /// it must not be re-routed by the static table (that is what would
+    /// make relay2 hand the bundle straight back to relay1 and loop).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dtn_route_ext(
+        &self,
+        from: u64,
+        to_name: &str,
+        to_uin: u64,
+        body: Value,
+        priority: u8,
+        hops: u8,
+        bundle_id: u64,
+        allow_routing: bool,
+    ) -> Result<(), String> {
+        self.dtn_route_frag(
+            from,
+            to_name,
+            to_uin,
+            body,
+            priority,
+            hops,
+            bundle_id,
+            allow_routing,
+            None,
+        )
+    }
+
+    /// The routing core with the fragment slot: a body that IS already a
+    /// fragment (in transit through a relay) must never be fragmented
+    /// again — that would multiply the message on every hop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dtn_route_frag(
+        &self,
+        from: u64,
+        to_name: &str,
+        to_uin: u64,
+        body: Value,
+        priority: u8,
+        hops: u8,
+        bundle_id: u64,
+        allow_routing: bool,
+        frag: Option<qos::FragMeta>,
+    ) -> Result<(), String> {
+        // FRAGMENTATION: a body above the threshold travels as numbered
+        // fragments, each routed independently
+        if frag.is_none() {
+            if let Some(max) = self.max_bundle_bytes {
+                let size = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
+                // the threshold applies to the ENCODED fragment payload (hex,
+                // so 2 chars per byte): compare like with like
+                if size * 2 > max {
+                    let frags = qos::fragment_body(&body, max, bundle_id)?;
+                    let n = frags.len();
+                    for (meta, piece) in frags {
+                        self.dtn_route_piece_ext(
+                            from,
+                            to_name,
+                            to_uin,
+                            piece,
+                            priority,
+                            hops,
+                            bundle_id,
+                            Some(meta),
+                            allow_routing,
+                        )?;
+                    }
+                    self.ledger
+                        .append(
+                            "dtn_fragmented",
+                            json!({"from": from, "to": to_uin, "bundle_id": bundle_id,
+                               "bytes": size, "fragments": n}),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+            }
+        }
+        self.dtn_route_piece_ext(
+            from,
+            to_name,
+            to_uin,
+            body,
+            priority,
+            hops,
+            bundle_id,
+            frag,
+            allow_routing,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dtn_route_piece_ext(
+        &self,
+        from: u64,
+        to_name: &str,
+        to_uin: u64,
+        body: Value,
+        priority: u8,
+        hops: u8,
+        bundle_id: u64,
+        frag: Option<qos::FragMeta>,
+        allow_routing: bool,
+    ) -> Result<(), String> {
+        // the next hop, when the manifest declares a route AND the bundle
+        // is not already in transit through a relay's chosen path
+        let next = if allow_routing {
+            self.routes
+                .get(to_name)
+                .and_then(|via| self.by_name.lock().unwrap().get(via).copied())
+        } else {
+            None
+        };
+
+        if let Some(relay) = next {
+            if hops >= self.max_hops {
+                self.ledger
+                    .append(
+                        "dtn_hop_limit",
+                        json!({"from": from, "to": to_uin, "bundle_id": bundle_id, "hops": hops}),
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Err(format!("dtn: hop limit ({}) reached", self.max_hops));
+            }
+            let relay_ready = self.agent_ready(relay);
+            {
+                let mut d = self.delivery.lock().unwrap();
+                d.store_routed(
+                    from,
+                    to_uin,
+                    body.clone(),
+                    priority,
+                    None,
+                    Some(relay),
+                    hops,
+                    bundle_id,
+                    frag,
+                )?;
+            }
+            if relay_ready {
+                let mut b = qos::DtnBundle::new(
+                    from,
+                    to_uin,
+                    body.clone(),
+                    priority,
+                    Duration::from_secs(300),
+                );
+                b.bundle_id = bundle_id;
+                b.hops = hops;
+                b.frag = frag;
+                self.forward_to_relay(&b, relay)?;
+                self.ledger
+                    .append(
+                        "dtn_relayed",
+                        json!({"from": from, "to": to_uin, "relay": relay,
+                               "bundle_id": bundle_id, "hops": hops + 1}),
+                    )
+                    .map_err(|e| e.to_string())?;
+            } else {
+                self.ledger
+                    .append(
+                        "dtn_stored",
+                        json!({"from": from, "to": to_uin, "next_hop": relay,
+                               "bundle_id": bundle_id, "hops": hops, "body": body}),
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            return Ok(());
+        }
+
+        // no route: plain custody for the destination itself
+        {
+            let mut d = self.delivery.lock().unwrap();
+            d.store_routed(
+                from,
+                to_uin,
+                body.clone(),
+                priority,
+                None,
+                None,
+                hops,
+                bundle_id,
+                frag,
+            )?;
+        }
+        self.ledger
+            .append(
+                "dtn_stored",
+                json!({"from": from, "to": to_uin, "priority": priority,
+                       "bundle_id": bundle_id, "hops": hops, "body": body}),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// DTN flush: called on registration — deliver the destination's held
     /// bundles in PRIORITY order (0 first), journal every delivery and
     /// every expiry. Runs BEFORE the welcome is written so the fresh
@@ -963,6 +1248,20 @@ impl Kernel {
                     json!({"to": uin, "name": name, "count": count}),
                 )
                 .ok();
+        }
+
+        // ROUTING: bundles whose next hop is this agent — the relay is
+        // back, hand it the custody it was waiting for
+        let via = self.delivery.lock().unwrap().drain_via(uin);
+        for b in &via {
+            self.forward_to_relay(b, uin)?;
+            self.ledger
+                .append(
+                    "dtn_relayed",
+                    json!({"from": b.from, "to": b.to, "relay": uin,
+                           "bundle_id": b.bundle_id, "hops": b.hops + 1}),
+                )
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -1622,6 +1921,168 @@ impl Router {
             }
         }
         // agent envelopes
+        // DTN routing verbs, handled at the Value level (a relay agent
+        // forwards custody and acknowledges custody transfers). They are
+        // not part of the core Envelope vocabulary because they carry
+        // routing coordinates the kernel never trusts from a wire schema.
+        if let Some(me) = *my_uin {
+            if let Some(kind) = v.get("kind").and_then(Value::as_str) {
+                match kind {
+                    "relay" => {
+                        let bundle_id = v.get("bundle_id").and_then(Value::as_u64).unwrap_or(0);
+                        let to_name = v.get("to").and_then(Value::as_str).unwrap_or("");
+                        let hops = v.get("hops").and_then(Value::as_u64).unwrap_or(0) as u8;
+                        let orig = v.get("from").and_then(Value::as_u64).unwrap_or(me);
+                        let body = v.get("body").cloned().unwrap_or(Value::Null);
+                        let frag_meta = v.get("frag").filter(|f| !f.is_null()).and_then(|f| {
+                            Some(qos::FragMeta {
+                                id: f.get("id")?.as_u64()?,
+                                index: f.get("index")?.as_u64()? as u32,
+                                total: f.get("total")?.as_u64()? as u32,
+                            })
+                        });
+                        if hops > kernel.max_hops {
+                            kernel
+                                .ledger
+                                .append(
+                                    "dtn_hop_limit",
+                                    json!({"bundle_id": bundle_id, "to": to_name, "hops": hops}),
+                                )
+                                .map_err(|e| e.to_string())?;
+                            return Err(format!("dtn: hop limit ({}) reached", kernel.max_hops));
+                        }
+                        let Some(target) = kernel.by_name.lock().unwrap().get(to_name).copied()
+                        else {
+                            return Err(format!("relay: unknown agent '{to_name}'"));
+                        };
+                        // multi-hop: the relay may name the NEXT relay
+                        // itself (the kernel validates and counts hops)
+                        if let Some(next_name) = v.get("next").and_then(Value::as_str) {
+                            if hops >= kernel.max_hops {
+                                kernel
+                                    .ledger
+                                    .append(
+                                        "dtn_hop_limit",
+                                        json!({"bundle_id": bundle_id, "hops": hops}),
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                return Err("dtn: hop limit reached".to_string());
+                            }
+                            let Some(next_uin) =
+                                kernel.by_name.lock().unwrap().get(next_name).copied()
+                            else {
+                                return Err(format!("relay: unknown next hop '{next_name}'"));
+                            };
+                            let ready = kernel.agent_ready(next_uin);
+                            {
+                                let mut d = kernel.delivery.lock().unwrap();
+                                d.store_routed(
+                                    orig,
+                                    target,
+                                    body.clone(),
+                                    5,
+                                    None,
+                                    Some(next_uin),
+                                    hops,
+                                    bundle_id,
+                                    frag_meta,
+                                )?;
+                            }
+                            if ready {
+                                let mut b = qos::DtnBundle::new(
+                                    orig,
+                                    target,
+                                    body.clone(),
+                                    5,
+                                    Duration::from_secs(300),
+                                );
+                                b.bundle_id = bundle_id;
+                                b.hops = hops;
+                                b.frag = frag_meta;
+                                kernel.forward_to_relay(&b, next_uin)?;
+                                kernel
+                                    .ledger
+                                    .append(
+                                        "dtn_relayed",
+                                        json!({"from": orig, "to": target, "relay": next_uin,
+                                               "bundle_id": bundle_id, "hops": hops + 1}),
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            // the relay's own ack contract: confirm the
+                            // hand-off, otherwise drain_acks blocks forever
+                            write_envelope(
+                                writer,
+                                wire,
+                                &json!({"kind": "acked", "bundle_id": bundle_id}),
+                            )
+                            .map_err(|e| e.to_string())?;
+                            return Ok(());
+                        }
+                        if kernel.agent_ready(target) {
+                            kernel
+                                .write_to(
+                                    target,
+                                    &json!({"kind": "msg", "from": orig, "body": body}),
+                                )
+                                .map_err(|e| e.to_string())?;
+                            kernel
+                                .ledger
+                                .append(
+                                    "dtn_delivered",
+                                    json!({"from": orig, "to": target, "via": me,
+                                           "bundle_id": bundle_id, "hops": hops}),
+                                )
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            // in transit: store custody for the destination,
+                            // do NOT re-apply the static routing table
+                            kernel.dtn_route_frag(
+                                orig, to_name, target, body, 5, hops, bundle_id, false, frag_meta,
+                            )?;
+                        }
+                        write_envelope(
+                            writer,
+                            wire,
+                            &json!({"kind": "acked", "bundle_id": bundle_id}),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        return Ok(());
+                    }
+                    "custody_ack" => {
+                        let bundle_id = v.get("bundle_id").and_then(Value::as_u64).unwrap_or(0);
+                        // CUSTODY TRANSFER: the relay owns the bundle now,
+                        // so the kernel deletes its own copy (exactly once)
+                        let frag_index = v
+                            .get("frag_index")
+                            .and_then(Value::as_u64)
+                            .map(|i| i as u32);
+                        let released = kernel
+                            .delivery
+                            .lock()
+                            .unwrap()
+                            .ack_custody(bundle_id, frag_index);
+                        kernel
+                            .ledger
+                            .append(
+                                "dtn_custody_ack",
+                                json!({"bundle_id": bundle_id, "frag_index": frag_index,
+                                       "by": me, "released": released}),
+                            )
+                            .map_err(|e| e.to_string())?;
+                        write_envelope(
+                            writer,
+                            wire,
+                            &json!({"kind": "acked", "bundle_id": bundle_id, "custody": true}),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let env = match Envelope::from_value(v) {
             Ok(e) => e,
             Err(reason) => {
@@ -1901,6 +2362,30 @@ pub struct KernelConfig {
     /// backlog — and therefore WFQ — real.
     #[serde(default)]
     pub link_bytes_per_tick: Option<u64>,
+    /// DTN routing: static routes "to reach `dest`, hand custody to
+    /// `via`" — the kernel forwards, the relay re-emits, hop by hop
+    #[serde(default)]
+    pub routes: Vec<RouteSpec>,
+    /// maximum hops a bundle may travel before it is dropped
+    #[serde(default = "default_max_hops")]
+    pub max_hops: u8,
+    /// split bodies larger than this (bytes of encoded fragment payload)
+    #[serde(default)]
+    pub max_bundle_bytes: Option<usize>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct RouteSpec {
+    pub dest: String,
+    pub via: String,
+}
+
+fn default_max_hops() -> u8 {
+    4
+}
+
+fn default_max_hops_u8() -> u8 {
+    4
 }
 
 fn default_hb() -> u64 {

@@ -44,6 +44,22 @@ enum Step {
     Note {
         msg: String,
     },
+    /// DTN relay: take custody of a `bundle` frame from the inbox,
+    /// ACKNOWLEDGE the custody transfer, then hand the bundle onward with
+    /// the `relay` envelope (hops + 1). Blocks up to `timeout_ms` waiting
+    /// for a bundle; no bundle = nothing to forward.
+    Relay {
+        #[serde(default = "default_relay_timeout")]
+        timeout_ms: u64,
+        /// the NEXT relay this agent chooses for the bundle (multi-hop);
+        /// absent = hand it to the final destination
+        #[serde(default)]
+        next: Option<String>,
+    },
+}
+
+fn default_relay_timeout() -> u64 {
+    8000
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +322,58 @@ fn main() {
                     &json!({"kind": "send", "uin": uin, "to": to, "body": body}),
                 );
                 drain_acks(&inbox);
+            }
+            Step::Relay { timeout_ms, next } => {
+                // this step is an I/O wait: declare it BLOCKED so the
+                // progress watchdog does not read it as a reasoning loop
+                phase.store(1, Ordering::SeqCst);
+                // wait for a bundle frame (the kernel hands custody here)
+                let deadline = std::time::Instant::now() + Duration::from_millis(*timeout_ms);
+                let mut bundle: Option<Value> = None;
+                while std::time::Instant::now() < deadline {
+                    if let Some(v) = inbox.lock().unwrap().pop_front() {
+                        if v.get("kind").and_then(Value::as_str) == Some("bundle") {
+                            bundle = Some(v);
+                            break;
+                        }
+                        continue;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if let Some(b) = bundle {
+                    let bundle_id = b.get("bundle_id").and_then(Value::as_u64).unwrap_or(0);
+                    let hops = b.get("hops").and_then(Value::as_u64).unwrap_or(0);
+                    // a fragment is its own custody unit: the ack names
+                    // the index so the kernel releases exactly it
+                    let frag_index = b
+                        .get("frag")
+                        .and_then(|f| f.get("index"))
+                        .and_then(Value::as_u64);
+                    // custody transfer: the relay owns it now, the kernel
+                    // drops its copy when it sees this ack
+                    send(
+                        &writer,
+                        &json!({"kind": "custody_ack", "uin": uin,
+                                "bundle_id": bundle_id, "frag_index": frag_index}),
+                    );
+                    drain_acks(&inbox);
+                    send(
+                        &writer,
+                        &json!({
+                            "kind": "relay",
+                            "uin": uin,
+                            "bundle_id": bundle_id,
+                            "from": b.get("from").cloned().unwrap_or(json!(0)),
+                            "to": b.get("to").cloned().unwrap_or(Value::Null),
+                            "hops": hops + 1,
+                            "next": next.clone(),
+                            "frag": b.get("frag").cloned().unwrap_or(Value::Null),
+                            "body": b.get("body").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                    drain_acks(&inbox);
+                }
+                phase.store(0, Ordering::SeqCst);
             }
             Step::Note { msg } => {
                 send(&writer, &json!({"kind": "note", "uin": uin, "text": msg}));

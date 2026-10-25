@@ -1,0 +1,34 @@
+{
+  "name": "relay2",
+  "caps": [],
+  "steps": [
+    {
+      "op": "checkpoint",
+      "state": {
+        "n": 0
+      }
+    },
+    {
+      "op": "sleep",
+      "ms": 6000
+    },
+    {
+      "op": "relay",
+      "timeout_ms": 3000
+    },
+    {
+      "op": "relay",
+      "timeout_ms": 3000
+    },
+    {
+      "op": "checkpoint",
+      "state": {
+        "relayed": true
+      }
+    },
+    {
+      "op": "sleep",
+      "ms": 8000
+    }
+  ]
+}

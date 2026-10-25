@@ -147,6 +147,11 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
         m.kernel.wfq_capacity,
         m.kernel.link_bytes_per_tick,
     );
+    kernel.configure_routing(
+        &m.kernel.routes,
+        m.kernel.max_hops,
+        m.kernel.max_bundle_bytes,
+    );
     let agents: Vec<AgentSpecTuple> = m
         .agents
         .iter()

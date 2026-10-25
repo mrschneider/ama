@@ -1,0 +1,21 @@
+{
+  "name": "far",
+  "caps": [],
+  "steps": [
+    {
+      "op": "checkpoint",
+      "state": {
+        "n": 0
+      }
+    },
+    {
+      "op": "wait"
+    },
+    {
+      "op": "checkpoint",
+      "state": {
+        "done": true
+      }
+    }
+  ]
+}

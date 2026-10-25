@@ -1,0 +1,36 @@
+{
+  "kernel": {
+    "socket": "/tmp/ama_exp.sock",
+    "ledger": "/tmp/ama_exp/ledger.jsonl",
+    "hb_interval_ms": 150,
+    "hb_timeout_ms": 3000,
+    "max_respawns": 0,
+    "routes": [
+      {
+        "dest": "far",
+        "via": "relay1"
+      }
+    ],
+    "max_hops": 3,
+    "max_bundle_bytes": 700
+  },
+  "agents": [
+    {
+      "name": "src",
+      "task": "experiments/tasks_008/src.json"
+    },
+    {
+      "name": "relay1",
+      "task": "experiments/tasks_008/relay1.json"
+    },
+    {
+      "name": "relay2",
+      "task": "experiments/tasks_008/relay2.json"
+    },
+    {
+      "name": "far",
+      "task": "experiments/tasks_008/far.json",
+      "dtn": true
+    }
+  ]
+}
