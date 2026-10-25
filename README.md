@@ -1,5 +1,9 @@
 # AMA — Agentic Microkernel Architecture
 
+<p align="center">
+  <img src="docs/assets/overview.png" alt="AMA — an agentic microkernel architecture: the microkernel (process table, IPC router, state ledger), agents as isolated OS processes inside seccomp jails exchanging capability-checked typed envelopes, a crashed agent respawned from its ledger checkpoint, and the runtime guarantees: isolated sessions, deterministic replay, capability-gated IPC, atomic respawn" width="100%">
+</p>
+
 A microkernel architecture for reliable multi-agent systems, translated
 from the QNX Neutrino microkernel design into the world of AI agent
 execution: agents are **OS processes**, IPC is **typed message passing**
