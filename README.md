@@ -106,6 +106,10 @@ on `0.0.0.0` for the tap. The VM boundary replaces the seccomp jail
 inside the guest (`AMA_VM=1`); the three-wire contract is byte-identical
 across the VM boundary (experiment 005).
 
+<p align="center">
+  <img src="docs/assets/microvm-tier.svg" alt="The AMA microVM tier: the host kernel (process table, IPC router, ledger, TCP bridge with per-agent taps) bridging two Firecracker microVMs, each running the static musl agentd behind its own tap subnet, with the VM boundary as the jail" width="70%">
+</p>
+
 **Hot capability renegotiation (§3)** — the operator grants and revokes
 capabilities AT RUNTIME over a control connection (`ama grant --name m
 --caps send:c` / `ama revoke`); agents can never reach the control
