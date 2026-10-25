@@ -18,11 +18,19 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
+      # the experiments execute ./target/debug/ama and ./target/debug/ama-agentd,
+      # which `cargo test` alone does NOT produce (v0.5.0 release failed here)
+      - run: cargo build --workspace
       - run: cargo test --workspace
       - run: bash experiments/experiment_001_isolation.sh
+      - run: pkill -9 -x ama || true; pkill -9 -x ama-agentd || true; sleep 1
       - run: bash experiments/experiment_002_caps_seccomp.sh
+      - run: pkill -9 -x ama || true; pkill -9 -x ama-agentd || true; sleep 1
       - run: bash experiments/experiment_003_transports.sh
+      - run: pkill -9 -x ama || true; pkill -9 -x ama-agentd || true; sleep 1
       - run: bash experiments/experiment_004_wires.sh
+      - run: pkill -9 -x ama || true; pkill -9 -x ama-agentd || true; sleep 1
+      - run: bash experiments/experiment_006_qos_dtn.sh
 
   dist:
     name: dist (${{ matrix.target }})
