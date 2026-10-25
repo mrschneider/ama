@@ -88,6 +88,24 @@ runs the tool in a fresh user+mount namespace before the seccomp filter
 that forbid unprivileged user namespaces get an explicit SKIP, not a
 fake pass.
 
+**Protobuf wire (§3)** — the third wire format: length-prefixed
+`[0x0A magic][u32 LE len][protobuf envelope]` over the same framing as
+msgpack. The full kernel↔agent vocabulary (register, welcome, heartbeat,
+send, delivered, checkpoint, ack, done) round-trips; the kernel answers
+each connection in ITS format and translates cross-wire at the target
+(experiment 004: a=json, b=msgpack, c=proto on ONE kernel).
+
+**MicroVM tier (§2, Firecracker-class)** — the deepest isolation tier,
+NOW IMPLEMENTED: an agent with `isolation: "microvm"` runs inside its
+own Firecracker microVM. The PID the kernel watches IS the whole VM (the
+boot script `exec`s firecracker); SIGKILL tears the VM down, respawn
+boots a fresh VM from the ledger checkpoint. Per-agent tap networking
+(`172.16.<1+uin>.0/24` — VMs cannot see each other's traffic), per-agent
+initramfs (static musl agentd + task baked in), kernel bridge listening
+on `0.0.0.0` for the tap. The VM boundary replaces the seccomp jail
+inside the guest (`AMA_VM=1`); the three-wire contract is byte-identical
+across the VM boundary (experiment 005).
+
 **Hot capability renegotiation (§3)** — the operator grants and revokes
 capabilities AT RUNTIME over a control connection (`ama grant --name m
 --caps send:c` / `ama revoke`); agents can never reach the control
@@ -144,27 +162,29 @@ reasoning loop — the progress watchdog detects the stuck step in
 attempts to reach an agent it has no capability for — refused and
 journaled. All five ran as distinct OS processes.
 
-## Deliberately not implemented (v0.3)
+## Deliberately not implemented (v0.4)
 
-- **Full MicroVM (Firecracker-class)**: the deepest isolation tier.
-  Today: OS process + seccomp (denylist AND strict allowlist) + user
-  namespace + best-effort cgroup v2. The remaining frontier is a real
-  VM per agent for fully hostile tool code — the user-namespace tier
-  above is its unprivileged first step.
-- **FlatBuffers/protobuf**: msgpack (length-prefixed frames) shipped as
-  the binary wire; protobuf remains an option, not a requirement — the
-  enforcement point is the kernel's schema check, not the encoder.
+- **Trusted execution**: all three tiers are host-enforced. A VM booting
+  a malicious kernel is not contained (Firecracker assumes a trusted
+  guest kernel image; the vmlinux here is the Firecracker CI build).
+- **Live migration**: the microVM tier is cold — respawn = fresh VM
+  from the checkpoint, no hot migration between hosts.
 
 Git history: `3dd35d8` v0.1.0 (kernel MVP), v0.2.0 (seccomp jails +
 hot capabilities), v0.3.0 (strict allowlist, TCP transports, msgpack
-wire, user-namespace tier).
+wire, user-namespace tier), v0.4.0 (protobuf wire + Firecracker
+microVM tier).
 
 ## Layout
 
 - `ama-core/` — the kernel library: envelopes, ledger, process table,
   router, watchdog, supervisor, sandbox
 - `ama-agentd/` — the agent-side process (`ama-agentd`)
-- `ama-cli/` — the `ama` binary (`serve`, `ps`)
+- `ama-cli/` — the `ama` binary (`serve`, `ps`, `jail`, `grant`, `revoke`)
+- `vm/` — the microVM tier: `boot_agent.sh` (per-agent tap + firecracker),
+  `assemble_initramfs.sh` (per-agent initramfs), `guest-init.sh` (guest
+  PID 1), `agentd-static` (musl static-pie agentd), `vmlinux-6.1.155`
+  (Firecracker CI guest kernel)
 - `experiments/` — runnable E2E proof + task manifests
 - `docs/research/qnx-microkernel.md` — the QNX design sources this
   architecture is translated from, with the deliberate-scope notes
@@ -177,6 +197,8 @@ cargo test             # unit tests
 bash experiments/experiment_001_isolation.sh   # isolation + watchdog + recovery
 bash experiments/experiment_002_caps_seccomp.sh # seccomp jail + hot capabilities
 bash experiments/experiment_003_transports.sh  # TCP + msgpack + allowlist + userns
+bash experiments/experiment_004_wires.sh       # protobuf wire: 3 wires on ONE kernel
+bash experiments/experiment_005_microvm.sh     # Firecracker microVM tier (needs /dev/kvm + ufw allow 172.16.0.0/12)
 ```
 
 ## License
