@@ -339,6 +339,9 @@ pub struct ProcEntry {
     /// writes interleave msgpack frames mid-payload
     pub out: Option<Arc<Mutex<Peer>>>,
     pub wire: Wire,
+    /// "microvm" = the watched PID is a Firecracker VM, not an OS
+    /// process; respawn must re-boot the VM, not the agentd binary
+    pub isolation: Option<String>,
 }
 
 pub struct Kernel {
@@ -355,6 +358,9 @@ pub struct Kernel {
     /// network-remote IPC (§3): agents may connect over TCP from other
     /// hosts; the envelope contract and capability checks are identical
     pub tcp_addr: Option<String>,
+    /// per-agent Firecracker boot script (vm/boot_agent.sh) for the
+    /// microVM isolation tier
+    pub vm_boot: Option<String>,
 }
 
 impl Kernel {
@@ -378,40 +384,86 @@ impl Kernel {
             agentd_path: agentd_path.to_string(),
             apply_cgroups: false,
             tcp_addr: None,
+            vm_boot: None,
         })
     }
 
     /// Spawn an agent process from a manifest entry. The process is the
     /// isolation unit: its own PID, its own ephemeral memory.
     pub fn spawn_agent(&self, name: &str, task_path: &str) -> std::io::Result<()> {
-        self.spawn_agent_opts(name, task_path, None, Some(Wire::Json))
+        self.spawn_agent_opts(name, task_path, None, Some(Wire::Json), None)
     }
 
     /// `tcp`: connect over the network-remote transport; `wire`: speak
-    /// JSON, msgpack, or protobuf (per-agent options)
+    /// JSON, msgpack, or protobuf (per-agent options); `isolation`:
+    /// "microvm" boots the agent inside its own Firecracker microVM
+    /// (see vm/boot_agent.sh) instead of an OS process
     pub fn spawn_agent_opts(
         &self,
         name: &str,
         task_path: &str,
         tcp: Option<&str>,
         wire_opt: Option<Wire>,
+        isolation: Option<&str>,
     ) -> std::io::Result<()> {
         let uin = self.next_uin.fetch_add(1, Ordering::SeqCst);
-        let mut cmd = Command::new(&self.agentd_path);
-        cmd.args(["--socket", self.socket_path.to_str().unwrap_or("/tmp/ama.sock"), "--task", task_path]);
-        let tcp_addr = tcp.map(String::from).or_else(|| self.tcp_addr.clone());
-        if let Some(addr) = tcp_addr {
-            cmd.arg("--tcp").arg(addr);
+        let microvm = isolation == Some("microvm");
+        let mut cmd = if microvm {
+            // the VM tier: the "agent process" IS a Firecracker microVM.
+            // The boot script assembles the per-agent initramfs (static
+            // agentd + task baked in), wires a private tap and execs
+            // firecracker — the PID we watch is the whole VM. The guest
+            // agentd connects back over TCP; the envelope contract and
+            // capability checks are byte-identical to the host tiers.
+            let script = self.vm_boot.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "isolation 'microvm' requires kernel.vm_boot (vm/boot_agent.sh)",
+                )
+            })?;
+            let port = self
+                .tcp_addr
+                .as_ref()
+                .and_then(|a| a.rsplit(':').next()?.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "isolation 'microvm' requires kernel.tcp_port",
+                    )
+                })?;
+            let mut c = Command::new(script);
+            c.args([uin.to_string(), task_path.into(), port.to_string()]);
+            c
+        } else {
+            let mut c = Command::new(&self.agentd_path);
+            c.args(["--socket", self.socket_path.to_str().unwrap_or("/tmp/ama.sock"), "--task", task_path]);
+            c
+        };
+        if !microvm {
+            let tcp_addr = tcp.map(String::from).or_else(|| self.tcp_addr.clone());
+            if let Some(addr) = tcp_addr {
+                cmd.arg("--tcp").arg(addr);
+            }
         }
-        if let Some(w) = wire_opt {
-            let s = match w {
-                Wire::Json => "json",
-                Wire::Msgpack => "msgpack",
-                Wire::Proto => "proto",
-            };
-            cmd.arg("--wire").arg(s);
+        if !microvm {
+            if let Some(w) = wire_opt {
+                let s = match w {
+                    Wire::Json => "json",
+                    Wire::Msgpack => "msgpack",
+                    Wire::Proto => "proto",
+                };
+                cmd.arg("--wire").arg(s);
+            }
         }
-        cmd.env("AMA_UIN", uin.to_string()).stdout(Stdio::null());
+        cmd.env("AMA_UIN", uin.to_string());
+        // microVM: the guest's SERIAL CONSOLE is firecracker's STDOUT —
+        // nulling it discards the only window into the VM (and the
+        // guest agentd's panics); capture it with the stderr file
+        if microvm && std::env::var("AMA_DEBUG").is_ok() {
+            // stdout follows the debug path chosen below (set after)
+        } else {
+            cmd.stdout(Stdio::null());
+        }
         // debug mode: keep agent stderr in a per-agent file (watchdog
         // forensics) instead of dropping it
         if std::env::var("AMA_DEBUG").is_ok() {
@@ -421,6 +473,11 @@ impl Kernel {
             ));
             let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&p);
             if let Ok(f) = f {
+                if microvm {
+                    // the VM's serial console (firecracker stdout) shares
+                    // the forensics file
+                    let _ = cmd.stdout(Stdio::from(f.try_clone().expect("stdout clone")));
+                }
                 cmd.stderr(Stdio::from(f));
             } else {
                 cmd.stderr(Stdio::null());
@@ -445,6 +502,7 @@ impl Kernel {
             task_path: task_path.into(),
             out: None,
             wire: Wire::Json,
+            isolation: isolation.map(String::from),
         }));
         if self.apply_cgroups {
             let _ = sandbox::apply_cgroup(pid, name);
@@ -529,6 +587,7 @@ impl Kernel {
                     },
                     "killed_reason": if let ProcState::Killed(r) = &e.state { json!(r) } else { Value::Null },
                     "respawns": e.respawns,
+                    "isolation": e.isolation.clone().unwrap_or_else(|| "process".into()),
                     "last_step": e.last_step,
                     "caps": e.caps,
                     "wire": match e.wire {
@@ -574,7 +633,7 @@ impl Kernel {
     /// defaults to json and re-registers under a different wire than the
     /// manifest asked for (experiment 004: proto agent reborn as json).
     pub fn respawn(&self, uin: u64) {
-        let (name, task, respawns, checkpoint, wire) = {
+        let (name, task, respawns, checkpoint, wire, isolation) = {
             let agents = self.agents.lock().unwrap();
             let e = match agents.get(&uin) {
                 Some(e) => e.lock().unwrap(),
@@ -585,7 +644,8 @@ impl Kernel {
             let r = e.respawns;
             let c = e.last_checkpoint.clone();
             let w = e.wire;
-            (n, t, r, c, w)
+            let iso = e.isolation.clone();
+            (n, t, r, c, w, iso)
         };
         if respawns >= self.max_respawns {
             let agents = self.agents.lock().unwrap();
@@ -596,19 +656,36 @@ impl Kernel {
             self.ledger.append("dead", json!({"uin": uin, "name": name, "reason": "respawn budget exhausted"})).ok();
             return;
         }
-        let mut cmd = Command::new(&self.agentd_path);
-        cmd.args(["--socket", self.socket_path.to_str().unwrap_or("/tmp/ama.sock"), "--task", &task])
-            .env("AMA_UIN", uin.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        {
-            let s = match wire {
-                Wire::Json => "json",
-                Wire::Msgpack => "msgpack",
-                Wire::Proto => "proto",
-            };
-            cmd.arg("--wire").arg(s);
-        }
+        let microvm = isolation.as_deref() == Some("microvm");
+        let mut cmd = if microvm {
+            // the respawn of a VM agent re-boots the WHOLE microVM: a
+            // fresh initramfs is assembled (the ledger checkpoint rides
+            // inside the task file) and firecracker runs it again
+            let script = self.vm_boot.as_deref().unwrap_or("vm/boot_agent.sh");
+            let port = self
+                .tcp_addr
+                .as_ref()
+                .and_then(|a| a.rsplit(':').next()?.parse::<u64>().ok())
+                .unwrap_or(0);
+            let mut c = Command::new(script);
+            c.args([uin.to_string(), task.clone(), port.to_string()]);
+            c
+        } else {
+            let mut c = Command::new(&self.agentd_path);
+            c.args(["--socket", self.socket_path.to_str().unwrap_or("/tmp/ama.sock"), "--task", &task])
+                .env("AMA_UIN", uin.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            {
+                let s = match wire {
+                    Wire::Json => "json",
+                    Wire::Msgpack => "msgpack",
+                    Wire::Proto => "proto",
+                };
+                c.arg("--wire").arg(s);
+            }
+            c
+        };
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -693,16 +770,16 @@ impl Router {
         kernel: Kernel,
         agents: &[(String, String)],
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
-        let a: Vec<(String, String, Option<String>, Option<Wire>)> = agents
+        let a: Vec<(String, String, Option<String>, Option<Wire>, Option<String>)> = agents
             .iter()
-            .map(|(n, t)| (n.clone(), t.clone(), None, Some(Wire::Json)))
+            .map(|(n, t)| (n.clone(), t.clone(), None, Some(Wire::Json), None))
             .collect();
         Router::serve_full(kernel, &a)
     }
 
     pub fn serve_full(
         kernel: Kernel,
-        agents: &[(String, String, Option<String>, Option<Wire>)],
+        agents: &[(String, String, Option<String>, Option<Wire>, Option<String>)],
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
         let kernel = Arc::new(kernel);
         let _ = std::fs::remove_file(&kernel.socket_path);
@@ -732,8 +809,8 @@ impl Router {
             });
         }
         // bind is live now — spawn the manifest's agents
-        for (name, task, tcp, wire) in agents {
-            if let Err(e) = kernel.spawn_agent_opts(name, task, tcp.as_deref(), *wire) {
+        for (name, task, tcp, wire, iso) in agents {
+            if let Err(e) = kernel.spawn_agent_opts(name, task, tcp.as_deref(), *wire, iso.as_deref()) {
                 eprintln!("[ama] spawn {name}: {e}");
             }
         }
@@ -1226,6 +1303,15 @@ pub struct KernelConfig {
     /// network-remote listener (kernel accepts agents over TCP too)
     #[serde(default)]
     pub tcp_port: Option<u16>,
+    /// bind address for the TCP listener — "0.0.0.0" when microVM agents
+    /// arrive through tap devices (the default 127.0.0.1 only serves
+    /// host-local agents)
+    #[serde(default)]
+    pub tcp_bind: Option<String>,
+    /// per-agent Firecracker boot script (relative to the kernel's cwd);
+    /// required when any agent declares isolation "microvm"
+    #[serde(default)]
+    pub vm_boot: Option<String>,
 }
 
 fn default_hb() -> u64 {
@@ -1245,6 +1331,11 @@ pub struct AgentSpec {
     /// "msgpack" = binary wire format (default: JSON lines)
     #[serde(default)]
     pub wire: Option<String>,
+    /// "microvm" = run this agent inside its own Firecracker microVM
+    /// (the deepest isolation tier: a real VM per agent for hostile
+    /// tool code — see vm/boot_agent.sh)
+    #[serde(default)]
+    pub isolation: Option<String>,
 }
 
 #[cfg(test)]

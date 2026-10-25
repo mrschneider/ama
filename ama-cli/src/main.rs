@@ -115,8 +115,14 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
     .expect("kernel");
     let mut kernel = kernel; // shadow for mutation
     kernel.apply_cgroups = cgroups; // opt-in, best-effort (see sandbox.rs)
-    kernel.tcp_addr = m.kernel.tcp_port.map(|p| format!("127.0.0.1:{p}"));
-    let agents: Vec<(String, String, Option<String>, Option<ama_core::Wire>)> = m
+    kernel.tcp_addr = m.kernel.tcp_port.map(|p| {
+        format!(
+            "{}:{p}",
+            m.kernel.tcp_bind.as_deref().unwrap_or("127.0.0.1")
+        )
+    });
+    kernel.vm_boot = m.kernel.vm_boot.clone();
+    let agents: Vec<(String, String, Option<String>, Option<ama_core::Wire>, Option<String>)> = m
         .agents
         .iter()
         .map(|a| {
@@ -130,6 +136,7 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
                 "proto" => Some(ama_core::Wire::Proto),
                 _ => None,
             }),
+                a.isolation.clone(),
             )
         })
         .collect();

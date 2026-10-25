@@ -69,16 +69,25 @@ fn main() {
     .expect("task schema");
 
     // §2: the agent jails ITSELF before doing any work — no_new_privs +
-    // seccomp denylist (mount/ptrace/module-load/bpf/… return EPERM)
-    if let Err(e) = ama_core::seccomp::apply_seccomp_self() {
-        eprintln!("[agentd {}] seccomp jail unavailable: {e}", task.name);
+    // seccomp denylist (mount/ptrace/module-load/bpf/… return EPERM).
+    // SKIPPED for microVM agents (AMA_VM=1): the guest runs inside a real
+    // Firecracker VM — the VM is the jail, and a seccomp filter that
+    // denies socket(AF_INET) kills PID 1 BEFORE it can connect (exit code
+    // 0x6500 = panic "Attempted to kill init", experiment 005)
+    if std::env::var("AMA_VM").is_err() {
+        if let Err(e) = ama_core::seccomp::apply_seccomp_self() {
+            eprintln!("[agentd {}] seccomp jail unavailable: {e}", task.name);
+        }
     }
 
     // §3: connect over the transport this agent was configured for —
     // UDS (local) or TCP (network-remote). Same contract either way.
     let peer = match &tcp {
         Some(addr) => {
-            Peer::Tcp(std::net::TcpStream::connect(addr).expect("connect to kernel over TCP"))
+            Peer::Tcp({
+                eprintln!("[agentd {}] connecting to kernel over TCP: {addr}", task.name);
+                std::net::TcpStream::connect(addr).expect("connect to kernel over TCP")
+            })
         }
         None => Peer::Unix(UnixStream::connect(&socket).expect("connect to kernel")),
     };

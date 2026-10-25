@@ -1,0 +1,11 @@
+{
+  "name": "vm1",
+  "caps": ["send:a"],
+  "steps": [
+    {"op": "checkpoint", "state": {"inside": "microvm"}},
+    {"op": "sleep", "ms": 500},
+    {"op": "send", "to": "a", "body": {"ping": "from-vm"}},
+    {"op": "wait"},
+    {"op": "checkpoint", "state": {"done": true}}
+  ]
+}

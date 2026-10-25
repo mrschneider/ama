@@ -1,0 +1,16 @@
+{
+  "kernel": {
+    "socket": "/tmp/ama_exp.sock",
+    "ledger": "/tmp/ama_exp/ledger.jsonl",
+    "hb_interval_ms": 150,
+    "hb_timeout_ms": 3000,
+    "max_respawns": 2,
+    "tcp_port": 7777,
+    "tcp_bind": "0.0.0.0",
+    "vm_boot": "vm/boot_agent.sh"
+  },
+  "agents": [
+    {"name": "a", "task": "experiments/tasks_005/a.json"},
+    {"name": "vm1", "task": "experiments/tasks_005/vm1.json", "transport": "tcp", "isolation": "microvm"}
+  ]
+}
