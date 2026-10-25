@@ -8,6 +8,7 @@
 //! kernel enforces that control verbs are only accepted on connections
 //! that never registered as agents — agents cannot control the kernel.
 
+use ama_core::AgentSpecTuple;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::exit;
@@ -19,7 +20,6 @@ fn main() {
     let mut manifest = String::new();
     let mut agentd = String::new();
     let mut cgroups = false;
-    let mut rest: Vec<String> = Vec::new();
     let mut name = String::new();
     let mut caps = String::new();
     let mut strict = false;
@@ -85,7 +85,11 @@ fn main() {
 }
 
 fn ctl_caps(socket: &str, verb: &str, name: &str, caps: &str) {
-    let list: Vec<&str> = caps.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let list: Vec<&str> = caps
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     let msg = format!(
         "{}\n",
         serde_json::json!({"kind": verb, "name": name, "caps": list})
@@ -102,8 +106,13 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
         eprintln!("serve requires --manifest <file> --agentd <path>");
         exit(2);
     }
-    let m: ama_core::Manifest = serde_json::from_slice(&std::fs::read(manifest).expect("manifest")).expect("manifest schema");
-    let socket = if socket.is_empty() { m.kernel.socket.clone() } else { socket.to_string() };
+    let m: ama_core::Manifest = serde_json::from_slice(&std::fs::read(manifest).expect("manifest"))
+        .expect("manifest schema");
+    let socket = if socket.is_empty() {
+        m.kernel.socket.clone()
+    } else {
+        socket.to_string()
+    };
     let kernel = ama_core::Kernel::new(
         std::path::Path::new(&socket),
         std::path::Path::new(&m.kernel.ledger),
@@ -122,20 +131,22 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
         )
     });
     kernel.vm_boot = m.kernel.vm_boot.clone();
-    let agents: Vec<(String, String, Option<String>, Option<ama_core::Wire>, Option<String>)> = m
+    let agents: Vec<AgentSpecTuple> = m
         .agents
         .iter()
         .map(|a| {
             (
                 a.name.clone(),
                 a.task.clone(),
-                a.transport.clone().map(|t| format!("127.0.0.1:{}", m.kernel.tcp_port.unwrap_or(0))),
+                a.transport
+                    .clone()
+                    .map(|_| format!("127.0.0.1:{}", m.kernel.tcp_port.unwrap_or(0))),
                 a.wire.as_deref().and_then(|w| match w {
-                "json" => Some(ama_core::Wire::Json),
-                "msgpack" => Some(ama_core::Wire::Msgpack),
-                "proto" => Some(ama_core::Wire::Proto),
-                _ => None,
-            }),
+                    "json" => Some(ama_core::Wire::Json),
+                    "msgpack" => Some(ama_core::Wire::Msgpack),
+                    "proto" => Some(ama_core::Wire::Proto),
+                    _ => None,
+                }),
                 a.isolation.clone(),
             )
         })

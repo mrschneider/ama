@@ -1,2 +1,8 @@
 target/
 *.ledger.jsonl
+*.sock
+vm/vmlinux-*
+vm/bin/firecracker
+vm/bin/busybox
+vm/agentd-static
+/tmp/

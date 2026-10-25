@@ -77,13 +77,17 @@ struct Filter {
 
 impl Filter {
     fn new() -> Filter {
-        Filter { prog: Vec::new(), deny_jumps: Vec::new(), allow_jumps: Vec::new() }
+        Filter {
+            prog: Vec::new(),
+            deny_jumps: Vec::new(),
+            allow_jumps: Vec::new(),
+        }
     }
     fn push(&mut self, code: u16, jt: u8, jf: u8, k: u32) {
         self.prog.push(SockFilter { code, jt, jf, k });
     }
     fn push_jeq_deny(&mut self, nr: u32) {
-        self.push(BPF_JEQ_K, 0, 0, nr as u32);
+        self.push(BPF_JEQ_K, 0, 0, nr);
         self.deny_jumps.push(self.prog.len() - 1);
     }
     /// resolve all recorded deny jumps to the final RET ERRNO at `at`
@@ -137,9 +141,7 @@ pub fn apply_seccomp_self() -> Result<(), String> {
     };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        return Err(format!(
-            "PR_SET_SECCOMP failed: {rc} ({err})"
-        ));
+        return Err(format!("PR_SET_SECCOMP failed: {rc} ({err})"));
     }
     Ok(())
 }
@@ -238,12 +240,21 @@ pub fn jail_exec(argv: &[String], profile: Profile) -> Result<(), String> {
         }
         let err = std::io::Error::last_os_error();
         match err.raw_os_error() {
-            Some(2) | Some(13) => { last_err = Some(err); continue; } // ENOENT/EACCES: next PATH dir
+            Some(2) | Some(13) => {
+                last_err = Some(err);
+                continue;
+            } // ENOENT/EACCES: next PATH dir
             Some(e) => return Err(format!("jail: exec refused: errno {e}")),
-            None => { last_err = Some(err); continue; }
+            None => {
+                last_err = Some(err);
+                continue;
+            }
         }
     }
-    Err(format!("jail: exec failed: {:?}", last_err.map(|e| e.to_string())))
+    Err(format!(
+        "jail: exec failed: {:?}",
+        last_err.map(|e| e.to_string())
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +274,12 @@ pub fn apply_seccomp_allowlist() -> Result<(), String> {
     // curated x86_64 allowlist — everything ama-agentd + shell/python
     // tooling actually need; everything else is EPERM
     const OK: &[u32] = &[
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28, 32, 33, 34, 35, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 72, 73, 79, 80, 87, 88, 89, 90, 96, 97, 99, 104, 105, 106, 107, 108, 109, 110, 111, 127, 128, 129, 131, 137, 138, 157, 158, 160, 186, 202, 204, 213, 217, 218, 226, 228, 231, 232, 233, 257, 259, 260, 262, 265, 266, 267, 269, 270, 273, 291, 293, 294, 297, 302, 309, 318, 334, 435,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25,
+        26, 27, 28, 32, 33, 34, 35, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
+        55, 56, 57, 58, 59, 60, 61, 62, 63, 72, 73, 79, 80, 87, 88, 89, 90, 96, 97, 99, 104, 105,
+        106, 107, 108, 109, 110, 111, 127, 128, 129, 131, 137, 138, 157, 158, 160, 186, 202, 204,
+        213, 217, 218, 226, 228, 231, 232, 233, 257, 259, 260, 262, 265, 266, 267, 269, 270, 273,
+        291, 293, 294, 297, 302, 309, 318, 334, 435,
     ];
     let mut f = Filter::new();
     // foreign arch → deny everything
@@ -282,7 +298,7 @@ pub fn apply_seccomp_allowlist() -> Result<(), String> {
             f.push(BPF_JEQ_K, 0, 0, AF_UNIX); // JEQ AF_UNIX -> ALLOW / else DENY
             f.allow_jumps.push((f.prog.len() - 1, true));
             f.prog[j].jt = 0; // matched -> the ARG0 load is the NEXT instruction
-            // reload nr (the ARG0 load clobbered the accumulator)
+                              // reload nr (the ARG0 load clobbered the accumulator)
             f.push(BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_DATA_NR);
             // CRITICAL: the socket JEQ's FALSE branch must SKIP the whole
             // conditional block (LD arg0 clobbers the accumulator — without
@@ -303,16 +319,26 @@ pub fn apply_seccomp_allowlist() -> Result<(), String> {
     // plain entries' jf = 0 (fall through to the NEXT comparison)
     for (pos, conditional) in &f.allow_jumps {
         f.prog[*pos].jt = (allow_at - pos - 1) as u8;
-        f.prog[*pos].jf = if *conditional { (deny_at - pos - 1) as u8 } else { 0 };
+        f.prog[*pos].jf = if *conditional {
+            (deny_at - pos - 1) as u8
+        } else {
+            0
+        };
     }
     if std::env::var("AMA_DUMP_FILTER").is_ok() {
         eprintln!("=== BPF filter ({} instructions) ===", f.prog.len());
         for (i, ins) in f.prog.iter().enumerate() {
-            eprintln!("{i:3}: code=0x{:04x} jt={} jf={} k=0x{:x}", ins.code, ins.jt, ins.jf, ins.k);
+            eprintln!(
+                "{i:3}: code=0x{:04x} jt={} jf={} k=0x{:x}",
+                ins.code, ins.jt, ins.jf, ins.k
+            );
         }
         eprintln!("deny_at={deny_at} allow_at={allow_at}");
     }
-    let fprog = SockFProg { len: f.prog.len() as u16, filter: f.prog.as_ptr() };
+    let fprog = SockFProg {
+        len: f.prog.len() as u16,
+        filter: f.prog.as_ptr(),
+    };
     let rc = unsafe { prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if rc != 0 {
         return Err(format!("PR_SET_NO_NEW_PRIVS failed: {rc}"));

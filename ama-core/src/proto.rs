@@ -79,8 +79,7 @@ fn put_bytes(buf: &mut Vec<u8>, field: u32, v: &Value) {
 /// Envelope → Value (via its own JSON contract — one source of truth)
 /// → protobuf WITH framing ([0x0A][u32 LE len][msg]).
 pub fn encode(envelope: &Envelope) -> Vec<u8> {
-    let v = serde_json::from_str::<Value>(&envelope.to_line().trim_end())
-        .unwrap_or(json!({}));
+    let v = serde_json::from_str::<Value>(envelope.to_line().trim_end()).unwrap_or(json!({}));
     frame(encode_value(&v).unwrap_or_default())
 }
 
@@ -111,7 +110,10 @@ const FIELD_NUMBERS: &[(&str, u32)] = &[
 ];
 
 fn field_of(key: &str) -> Option<u32> {
-    FIELD_NUMBERS.iter().find(|(k, _)| *k == key).map(|(_, n)| *n)
+    FIELD_NUMBERS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, n)| *n)
 }
 
 /// Any envelope-shaped Value (agent send OR kernel reply) → protobuf.
@@ -199,47 +201,74 @@ pub fn decode_raw(msg: &[u8]) -> Result<Value, String> {
             }
             (3, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                name = Some(String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec()).map_err(|e| e.to_string())?);
+                name = Some(
+                    String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec())
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (4, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                caps.push(String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec()).map_err(|e| e.to_string())?);
+                caps.push(
+                    String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec())
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (5, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                to = Some(String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec()).map_err(|e| e.to_string())?);
+                to = Some(
+                    String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec())
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (6, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                body = Some(serde_json::from_slice(msg.get(pos..pos + len).ok_or("proto: range")?).map_err(|e| e.to_string())?);
+                body = Some(
+                    serde_json::from_slice(msg.get(pos..pos + len).ok_or("proto: range")?)
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (7, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                step = Some(String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec()).map_err(|e| e.to_string())?);
+                step = Some(
+                    String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec())
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (8, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                phase = Some(String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec()).map_err(|e| e.to_string())?);
+                phase = Some(
+                    String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec())
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (9, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                state = Some(serde_json::from_slice(msg.get(pos..pos + len).ok_or("proto: range")?).map_err(|e| e.to_string())?);
+                state = Some(
+                    serde_json::from_slice(msg.get(pos..pos + len).ok_or("proto: range")?)
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (10, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                text = Some(String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec()).map_err(|e| e.to_string())?);
+                text = Some(
+                    String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec())
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (11, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                recover = Some(serde_json::from_slice(msg.get(pos..pos + len).ok_or("proto: range")?).map_err(|e| e.to_string())?);
+                recover = Some(
+                    serde_json::from_slice(msg.get(pos..pos + len).ok_or("proto: range")?)
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (12, 0) => {
@@ -252,7 +281,10 @@ pub fn decode_raw(msg: &[u8]) -> Result<Value, String> {
             }
             (14, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
-                reason = Some(String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec()).map_err(|e| e.to_string())?);
+                reason = Some(
+                    String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec())
+                        .map_err(|e| e.to_string())?,
+                );
                 pos += len;
             }
             (15, 0) => {
@@ -326,13 +358,36 @@ mod proto_tests {
     #[test]
     fn roundtrip_every_kind() {
         let envs = vec![
-            Envelope::Register { name: "a".into(), caps: vec!["send:b".into(), "send:c".into()] },
-            Envelope::Heartbeat { uin: 7, step: "3".into(), phase: "executing".into() },
-            Envelope::Welcome { uin: 6, recover: Some(json!({"step": 2, "n": 9})) },
-            Envelope::Welcome { uin: 8, recover: None },
-            Envelope::Send { uin: 1, to: "b".into(), body: json!({"ping": 1, "nested": {"x": [1, 2, "three"]}}) },
-            Envelope::Checkpoint { uin: 2, state: json!({"n": 9, "flag": false}) },
-            Envelope::Note { uin: 3, text: "hello".into() },
+            Envelope::Register {
+                name: "a".into(),
+                caps: vec!["send:b".into(), "send:c".into()],
+            },
+            Envelope::Heartbeat {
+                uin: 7,
+                step: "3".into(),
+                phase: "executing".into(),
+            },
+            Envelope::Welcome {
+                uin: 6,
+                recover: Some(json!({"step": 2, "n": 9})),
+            },
+            Envelope::Welcome {
+                uin: 8,
+                recover: None,
+            },
+            Envelope::Send {
+                uin: 1,
+                to: "b".into(),
+                body: json!({"ping": 1, "nested": {"x": [1, 2, "three"]}}),
+            },
+            Envelope::Checkpoint {
+                uin: 2,
+                state: json!({"n": 9, "flag": false}),
+            },
+            Envelope::Note {
+                uin: 3,
+                text: "hello".into(),
+            },
             Envelope::Done { uin: 4 },
             Envelope::Recovered { uin: 5 },
         ];

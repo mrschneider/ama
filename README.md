@@ -21,18 +21,35 @@ Everything below is **implemented and verified by running it** — five
 real agent processes, end-to-end experiments, every assertion taken
 from the ledger. See [Verified results](#verified-results).
 
-## 60-second tour
+## Getting started
 
 ```bash
-# 1. Start the kernel ("the Executive") with a manifest of agents
+# 1. Fetch the external VM assets (Firecracker, guest kernel, busybox)
+#    and build the static agentd — the repo does not commit binaries
+./setup.sh
+
+# 2. Start the kernel ("the Executive") with a manifest of agents
 ama serve --manifest manifest.json --agentd ./ama-agentd
-
-# 2. Each agent is spawned as its own OS process (ama-agentd --task task.json)
-#    and executes its task — send, wait, checkpoint, sleep, loop, crash —
-#    talking to the kernel and to other agents ONLY through typed envelopes.
-
-# 3. Watch the ledger: every send, refusal, kill, respawn and checkpoint is there.
 ```
+
+## Contributing & security
+
+- `CONTRIBUTING.md` — the rules of the road: experiments are the
+  executable specification, `cargo fmt`/`clippy -D warnings` are CI-
+  enforced, the kernel stays minimal, refusals are journaled.
+- `SECURITY.md` — how to report vulnerabilities privately, plus the
+  explicit scope and design boundaries of the isolation model.
+- `.github/workflows/ci.yml` — fmt, clippy (debug *and* release),
+  unit tests, and experiments 001–004 on every push/PR; the microVM
+  experiment is documented but not run in CI (needs `/dev/kvm`).
+- `.github/workflows/release.yml` — tag-driven releases: verify →
+  cross-compile gnu+musl → checksums → GitHub Release.
+
+Then each agent is spawned as its own OS process (`ama-agentd --task
+task.json`) and executes its task — `send`, `wait`, `checkpoint`,
+`sleep`, `loop`, `crash` — talking to the kernel and to other agents
+ONLY through typed envelopes. Watch the ledger: every send, refusal,
+kill, respawn and checkpoint is there.
 
 ## Why it matters
 
@@ -202,8 +219,9 @@ tier).
   `revoke`)
 - `vm/` — the microVM tier: `boot_agent.sh` (per-agent tap +
   firecracker), `assemble_initramfs.sh` (per-agent initramfs),
-  `guest-init.sh` (guest PID 1), `agentd-static` (musl static-pie
-  agentd), `vmlinux-6.1.155` (Firecracker CI guest kernel)
+  `guest-init.sh` (guest PID 1); `vm/bin/firecracker`,
+  `vm/vmlinux-6.1.155` and `vm/agentd-static` are fetched/built by
+  `./setup.sh` (binaries are not committed)
 - `experiments/` — runnable E2E proof + task manifests
 - `docs/research/qnx-microkernel.md` — the QNX design sources this
   architecture is translated from, with the deliberate-scope notes

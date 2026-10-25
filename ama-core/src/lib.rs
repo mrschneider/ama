@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -69,7 +69,10 @@ pub fn read_proto_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
     let mut magic = [0u8; 1];
     r.read_exact(&mut magic)?;
     if magic[0] != 0x0A {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing 0x0A magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing 0x0A magic",
+        ));
     }
     let mut lenb = [0u8; 4];
     r.read_exact(&mut lenb)?;
@@ -81,9 +84,7 @@ pub fn read_proto_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
     // the agent→kernel Envelope vocabulary. The kernel's handle_value
     // re-validates agent envelopes; the agent's reader accepts replies
     // verbatim, exactly like the JSON/msgpack readers.
-    proto::decode_raw(&buf).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, e)
-    })
+    proto::decode_raw(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Read one msgpack frame (0xFF magic + u32 LE length + payload).
@@ -91,7 +92,10 @@ pub fn read_msgpack_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
     let mut magic = [0u8; 1];
     r.read_exact(&mut magic)?;
     if magic[0] != 0xFF {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing 0xFF magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing 0xFF magic",
+        ));
     }
     let mut lenb = [0u8; 4];
     r.read_exact(&mut lenb)?;
@@ -110,20 +114,44 @@ pub fn read_msgpack_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Envelope {
-    Register { name: String, caps: Vec<String> },
-    Heartbeat { uin: u64, step: String, phase: String },
+    Register {
+        name: String,
+        caps: Vec<String>,
+    },
+    Heartbeat {
+        uin: u64,
+        step: String,
+        phase: String,
+    },
     /// Kernel → agent: registration accepted. `recover` carries the last
     /// ledger checkpoint (None when the agent is fresh). The proto reader
     /// enforces this schema — a missing Welcome variant made the agentd
     /// drop the connection on the very first frame (experiment 004:
     /// proto agents died of heartbeat timeout because welcome never
     /// reached the inbox).
-    Welcome { uin: u64, recover: Option<Value> },
-    Send { uin: u64, to: String, body: Value },
-    Checkpoint { uin: u64, state: Value },
-    Recovered { uin: u64 },
-    Done { uin: u64 },
-    Note { uin: u64, text: String },
+    Welcome {
+        uin: u64,
+        recover: Option<Value>,
+    },
+    Send {
+        uin: u64,
+        to: String,
+        body: Value,
+    },
+    Checkpoint {
+        uin: u64,
+        state: Value,
+    },
+    Recovered {
+        uin: u64,
+    },
+    Done {
+        uin: u64,
+    },
+    Note {
+        uin: u64,
+        text: String,
+    },
 }
 
 impl Envelope {
@@ -137,13 +165,16 @@ impl Envelope {
     /// The typed contract over ANY wire format (JSON lines or msgpack —
     /// the SAME validation, the kernel never best-effort parses).
     pub fn from_value(v: &Value) -> Result<Envelope, String> {
-        let v = v;
         let kind = v
             .get("kind")
             .and_then(Value::as_str)
             .ok_or("missing 'kind'")?
             .to_string();
-        let take_u64 = |k: &str| v.get(k).and_then(Value::as_u64).ok_or(format!("missing '{k}'"));
+        let take_u64 = |k: &str| {
+            v.get(k)
+                .and_then(Value::as_u64)
+                .ok_or(format!("missing '{k}'"))
+        };
         match kind.as_str() {
             "register" => {
                 let name = v
@@ -181,9 +212,13 @@ impl Envelope {
             }),
             "welcome" => Ok(Envelope::Welcome {
                 uin: take_u64("uin")?,
-                recover: v
-                    .get("recover")
-                    .and_then(|r| if r.is_null() { None } else { Some(r.clone()) }),
+                recover: v.get("recover").and_then(|r| {
+                    if r.is_null() {
+                        None
+                    } else {
+                        Some(r.clone())
+                    }
+                }),
             }),
             "send" => Ok(Envelope::Send {
                 uin: take_u64("uin")?,
@@ -196,10 +231,17 @@ impl Envelope {
             }),
             "checkpoint" => Ok(Envelope::Checkpoint {
                 uin: take_u64("uin")?,
-                state: v.get("state").cloned().ok_or("checkpoint: missing 'state'")?,
+                state: v
+                    .get("state")
+                    .cloned()
+                    .ok_or("checkpoint: missing 'state'")?,
             }),
-            "recovered" => Ok(Envelope::Recovered { uin: take_u64("uin")? }),
-            "done" => Ok(Envelope::Done { uin: take_u64("uin")? }),
+            "recovered" => Ok(Envelope::Recovered {
+                uin: take_u64("uin")?,
+            }),
+            "done" => Ok(Envelope::Done {
+                uin: take_u64("uin")?,
+            }),
             "note" => Ok(Envelope::Note {
                 uin: take_u64("uin")?,
                 text: v
@@ -214,15 +256,21 @@ impl Envelope {
 
     pub fn to_line(&self) -> String {
         let v = match self {
-            Envelope::Register { name, caps } => json!({"kind": "register", "name": name, "caps": caps}),
+            Envelope::Register { name, caps } => {
+                json!({"kind": "register", "name": name, "caps": caps})
+            }
             Envelope::Heartbeat { uin, step, phase } => {
                 json!({"kind": "heartbeat", "uin": uin, "step": step, "phase": phase})
             }
             Envelope::Welcome { uin, recover } => {
                 json!({"kind": "welcome", "uin": uin, "recover": recover})
             }
-            Envelope::Send { uin, to, body } => json!({"kind": "send", "uin": uin, "to": to, "body": body}),
-            Envelope::Checkpoint { uin, state } => json!({"kind": "checkpoint", "uin": uin, "state": state}),
+            Envelope::Send { uin, to, body } => {
+                json!({"kind": "send", "uin": uin, "to": to, "body": body})
+            }
+            Envelope::Checkpoint { uin, state } => {
+                json!({"kind": "checkpoint", "uin": uin, "state": state})
+            }
             Envelope::Recovered { uin } => json!({"kind": "recovered", "uin": uin}),
             Envelope::Done { uin } => json!({"kind": "done", "uin": uin}),
             Envelope::Note { uin, text } => json!({"kind": "note", "uin": uin, "text": text}),
@@ -265,19 +313,34 @@ impl Ledger {
             }
             AtomicU64::new(n)
         };
-        Ok(Ledger { path: path.to_path_buf(), seq, write_lock: Mutex::new(()) })
+        Ok(Ledger {
+            path: path.to_path_buf(),
+            seq,
+            write_lock: Mutex::new(()),
+        })
     }
 
     pub fn append(&self, ev: &str, detail: Value) -> std::io::Result<LedgerEvent> {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let e = LedgerEvent { seq, ts_ms, ev: ev.into(), detail };
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let e = LedgerEvent {
+            seq,
+            ts_ms,
+            ev: ev.into(),
+            detail,
+        };
         let _guard = self.write_lock.lock().unwrap();
         // the ledger must survive its parent dir being removed mid-flight
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         writeln!(f, "{}", serde_json::to_string(&e).unwrap())?;
         f.flush()?;
         drop(_guard);
@@ -302,7 +365,9 @@ impl Ledger {
         self.read_all()
             .into_iter()
             .rev()
-            .find(|e| e.ev == "checkpoint" && e.detail.get("uin").and_then(Value::as_u64) == Some(uin))
+            .find(|e| {
+                e.ev == "checkpoint" && e.detail.get("uin").and_then(Value::as_u64) == Some(uin)
+            })
             .map(|e| e.detail.get("state").cloned().unwrap_or(Value::Null))
     }
 }
@@ -436,7 +501,12 @@ impl Kernel {
             c
         } else {
             let mut c = Command::new(&self.agentd_path);
-            c.args(["--socket", self.socket_path.to_str().unwrap_or("/tmp/ama.sock"), "--task", task_path]);
+            c.args([
+                "--socket",
+                self.socket_path.to_str().unwrap_or("/tmp/ama.sock"),
+                "--task",
+                task_path,
+            ]);
             c
         };
         if !microvm {
@@ -471,7 +541,11 @@ impl Kernel {
                 "/tmp/ama_dbg_agent_{}.stderr",
                 self.next_uin.load(Ordering::SeqCst)
             ));
-            let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&p);
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&p);
             if let Ok(f) = f {
                 if microvm {
                     // the VM's serial console (firecracker stdout) shares
@@ -509,7 +583,10 @@ impl Kernel {
         }
         self.agents.lock().unwrap().insert(uin, entry);
         self.by_name.lock().unwrap().insert(name.into(), uin);
-        self.ledger.append("spawned", json!({"uin": uin, "name": name, "pid": pid, "task": task_path}))?;
+        self.ledger.append(
+            "spawned",
+            json!({"uin": uin, "name": name, "pid": pid, "task": task_path}),
+        )?;
         Ok(())
     }
 
@@ -541,11 +618,9 @@ impl Kernel {
         let (wire, mut w): (Wire, Box<dyn IoWrite + Send>) = {
             let agents = self.agents.lock().unwrap();
             let entry = agents.get(&uin).ok_or("no process table entry")?;
-            let mut e = entry.lock().unwrap();
+            let e = entry.lock().unwrap();
             match e.state {
-                ProcState::Dead => {
-                    Err(format!("agent '{to}' is dead (respawn budget exhausted)"))
-                }
+                ProcState::Dead => Err(format!("agent '{to}' is dead (respawn budget exhausted)")),
                 ProcState::Completed => Err(format!("agent '{to}' has completed its task")),
                 _ => {
                     let wire = e.wire;
@@ -582,7 +657,7 @@ impl Kernel {
                         ProcState::Registered => "registered",
                         ProcState::Running => "running",
                         ProcState::Completed => "completed",
-                        ProcState::Killed(r) => "killed",
+                        ProcState::Killed(_) => "killed",
                         ProcState::Dead => "dead",
                     },
                     "killed_reason": if let ProcState::Killed(r) = &e.state { json!(r) } else { Value::Null },
@@ -608,7 +683,10 @@ impl Kernel {
             match agents.get(&uin) {
                 Some(e) => {
                     let mut e = e.lock().unwrap();
-                    if matches!(e.state, ProcState::Killed(_) | ProcState::Dead | ProcState::Completed) {
+                    if matches!(
+                        e.state,
+                        ProcState::Killed(_) | ProcState::Dead | ProcState::Completed
+                    ) {
                         return; // already judged — fail-fast is idempotent
                     }
                     e.state = ProcState::Killed(reason.into());
@@ -624,7 +702,10 @@ impl Kernel {
             .stderr(Stdio::null())
             .status();
         self.ledger
-            .append("killed", json!({"uin": uin, "pid": child_pid, "reason": reason}))
+            .append(
+                "killed",
+                json!({"uin": uin, "pid": child_pid, "reason": reason}),
+            )
             .ok();
     }
 
@@ -653,7 +734,12 @@ impl Kernel {
                 e.lock().unwrap().state = ProcState::Dead;
             }
             drop(agents);
-            self.ledger.append("dead", json!({"uin": uin, "name": name, "reason": "respawn budget exhausted"})).ok();
+            self.ledger
+                .append(
+                    "dead",
+                    json!({"uin": uin, "name": name, "reason": "respawn budget exhausted"}),
+                )
+                .ok();
             return;
         }
         let microvm = isolation.as_deref() == Some("microvm");
@@ -672,10 +758,15 @@ impl Kernel {
             c
         } else {
             let mut c = Command::new(&self.agentd_path);
-            c.args(["--socket", self.socket_path.to_str().unwrap_or("/tmp/ama.sock"), "--task", &task])
-                .env("AMA_UIN", uin.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+            c.args([
+                "--socket",
+                self.socket_path.to_str().unwrap_or("/tmp/ama.sock"),
+                "--task",
+                &task,
+            ])
+            .env("AMA_UIN", uin.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
             {
                 let s = match wire {
                     Wire::Json => "json",
@@ -689,7 +780,9 @@ impl Kernel {
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                self.ledger.append("respawn_failed", json!({"uin": uin, "err": e.to_string()})).ok();
+                self.ledger
+                    .append("respawn_failed", json!({"uin": uin, "err": e.to_string()}))
+                    .ok();
                 return;
             }
         };
@@ -722,10 +815,12 @@ impl Kernel {
                 .values()
                 .filter_map(|e| {
                     let mut e = e.lock().unwrap();
-                    if e.out.is_none() {
-                        return None; // never connected — registration grace
-                    }
-                    if matches!(e.state, ProcState::Dead | ProcState::Completed | ProcState::Killed(_)) {
+                    // never connected — registration grace
+                    e.out.as_ref()?;
+                    if matches!(
+                        e.state,
+                        ProcState::Dead | ProcState::Completed | ProcState::Killed(_)
+                    ) {
                         return None; // already judged — never re-kill, never re-journal
                     }
                     let hb_age = e.last_hb.elapsed().as_millis() as u64;
@@ -736,10 +831,19 @@ impl Kernel {
                     // EXECUTING = an infinite reasoning loop candidate. A
                     // BLOCKED agent (wait/sleep/kernel IO) is legitimate —
                     // the distinction is carried on the heartbeat.
-                    if e.last_phase == "executing" && !e.last_step.is_empty() && e.state == ProcState::Running {
+                    if e.last_phase == "executing"
+                        && !e.last_step.is_empty()
+                        && e.state == ProcState::Running
+                    {
                         e.stuck_sweeps += 1;
                         if e.stuck_sweeps >= 5 {
-                            return Some((e.uin, format!("no progress on step '{}' for {} sweeps", e.last_step, e.stuck_sweeps)));
+                            return Some((
+                                e.uin,
+                                format!(
+                                    "no progress on step '{}' for {} sweeps",
+                                    e.last_step, e.stuck_sweeps
+                                ),
+                            ));
                         }
                     }
                     None
@@ -758,6 +862,9 @@ impl Kernel {
 // writes deliveries to the same socket it reads envelopes from.
 // ---------------------------------------------------------------------------
 
+/// One manifest agent, expanded: (name, task, tcp target, wire, isolation)
+pub type AgentSpecTuple = (String, String, Option<String>, Option<Wire>, Option<String>);
+
 pub struct Router {
     pub kernel: Arc<Kernel>,
 }
@@ -770,7 +877,7 @@ impl Router {
         kernel: Kernel,
         agents: &[(String, String)],
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
-        let a: Vec<(String, String, Option<String>, Option<Wire>, Option<String>)> = agents
+        let a: Vec<AgentSpecTuple> = agents
             .iter()
             .map(|(n, t)| (n.clone(), t.clone(), None, Some(Wire::Json), None))
             .collect();
@@ -779,7 +886,7 @@ impl Router {
 
     pub fn serve_full(
         kernel: Kernel,
-        agents: &[(String, String, Option<String>, Option<Wire>, Option<String>)],
+        agents: &[AgentSpecTuple],
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
         let kernel = Arc::new(kernel);
         let _ = std::fs::remove_file(&kernel.socket_path);
@@ -796,13 +903,12 @@ impl Router {
             std::thread::spawn(move || match std::net::TcpListener::bind(&addr) {
                 Ok(tcp) => {
                     eprintln!("[ama] tcp listener up on {addr}");
-                    for conn in tcp.incoming() {
-                        if let Ok(stream) = conn {
-                            let k = k.clone();
-                            let _ = stream.set_nodelay(true);
-                            let _ = stream.set_read_timeout(None);
-                            std::thread::spawn(move || Router::connection(k, Peer::Tcp(stream)));
-                        }
+                    for conn in tcp.incoming().flatten() {
+                        let stream = conn;
+                        let k = k.clone();
+                        let _ = stream.set_nodelay(true);
+                        let _ = stream.set_read_timeout(None);
+                        std::thread::spawn(move || Router::connection(k, Peer::Tcp(stream)));
                     }
                 }
                 Err(e) => eprintln!("[ama] tcp listener {addr}: {e}"),
@@ -810,7 +916,9 @@ impl Router {
         }
         // bind is live now — spawn the manifest's agents
         for (name, task, tcp, wire, iso) in agents {
-            if let Err(e) = kernel.spawn_agent_opts(name, task, tcp.as_deref(), *wire, iso.as_deref()) {
+            if let Err(e) =
+                kernel.spawn_agent_opts(name, task, tcp.as_deref(), *wire, iso.as_deref())
+            {
                 eprintln!("[ama] spawn {name}: {e}");
             }
         }
@@ -896,7 +1004,13 @@ impl Router {
             match proto::decode_raw(&buf) {
                 Ok(val) => val,
                 Err(e) => {
-                    kernel.ledger.append("malformed", json!({"reason": format!("proto: first frame decode failed: {e}")})).ok();
+                    kernel
+                        .ledger
+                        .append(
+                            "malformed",
+                            json!({"reason": format!("proto: first frame decode failed: {e}")}),
+                        )
+                        .ok();
                     return None;
                 }
             }
@@ -908,7 +1022,11 @@ impl Router {
             match Router::handle_value(&kernel, &mut peer, &v, &mut my_uin, Wire::Proto) {
                 Ok(()) => {}
                 Err(e) => {
-                    let _ = write_envelope(&mut peer, Wire::Proto, &json!({"kind": "error", "reason": e}));
+                    let _ = write_envelope(
+                        &mut peer,
+                        Wire::Proto,
+                        &json!({"kind": "error", "reason": e}),
+                    );
                 }
             }
             match read_proto_frame(&mut peer) {
@@ -943,17 +1061,24 @@ impl Router {
             match rmp_serde::from_slice::<Value>(&buf) {
                 Ok(v) => v,
                 Err(e) => {
-                    kernel.ledger.append("malformed", json!({"reason": format!("msgpack: {e}")})).ok();
+                    kernel
+                        .ledger
+                        .append("malformed", json!({"reason": format!("msgpack: {e}")}))
+                        .ok();
                     return None;
                 }
             }
         };
-        let mut last_wire = Wire::Msgpack;
+        let last_wire = Wire::Msgpack;
         loop {
             match Router::handle_value(&kernel, &mut peer, &v, &mut my_uin, last_wire) {
                 Ok(()) => {}
                 Err(e) => {
-                    let _ = write_envelope(&mut peer, Wire::Msgpack, &json!({"kind": "error", "reason": e}));
+                    let _ = write_envelope(
+                        &mut peer,
+                        Wire::Msgpack,
+                        &json!({"kind": "error", "reason": e}),
+                    );
                 }
             }
             match read_msgpack_frame(&mut peer) {
@@ -993,7 +1118,13 @@ impl Router {
                 v
             }
             Err(e) => {
-                kernel.ledger.append("malformed", json!({"reason": format!("invalid json: {e}"), "line": first})).ok();
+                kernel
+                    .ledger
+                    .append(
+                        "malformed",
+                        json!({"reason": format!("invalid json: {e}"), "line": first}),
+                    )
+                    .ok();
                 return None;
             }
         };
@@ -1001,7 +1132,11 @@ impl Router {
             match Router::handle_value(&kernel, reader.peer_mut(), &v, &mut my_uin, Wire::Json) {
                 Ok(()) => {}
                 Err(e) => {
-                    let _ = write_envelope(reader.peer_mut(), Wire::Json, &json!({"kind": "error", "reason": format!("rejected: {e}")}));
+                    let _ = write_envelope(
+                        reader.peer_mut(),
+                        Wire::Json,
+                        &json!({"kind": "error", "reason": format!("rejected: {e}")}),
+                    );
                 }
             }
             line.clear();
@@ -1021,7 +1156,11 @@ impl Router {
                 }
                 Err(e) => {
                     kernel.ledger.append("malformed", json!({"reason": format!("invalid json: {e}"), "line": line.trim_end()})).ok();
-                    let _ = write_envelope(reader.peer_mut(), Wire::Json, &json!({"kind": "error", "reason": format!("rejected: invalid json: {e}")}));
+                    let _ = write_envelope(
+                        reader.peer_mut(),
+                        Wire::Json,
+                        &json!({"kind": "error", "reason": format!("rejected: invalid json: {e}")}),
+                    );
                     continue;
                 }
             }
@@ -1030,7 +1169,13 @@ impl Router {
     }
 
     /// Handle ONE decoded envelope (transport- and format-agnostic).
-    fn handle_value(kernel: &Kernel, writer: &mut Peer, v: &Value, my_uin: &mut Option<u64>, wire: Wire) -> Result<(), String> {
+    fn handle_value(
+        kernel: &Kernel,
+        writer: &mut Peer,
+        v: &Value,
+        my_uin: &mut Option<u64>,
+        wire: Wire,
+    ) -> Result<(), String> {
         // control channel verbs — operators may dump the table and
         // renegotiate capabilities AT RUNTIME; agents can never reach
         // this: their first envelope registers them
@@ -1051,7 +1196,12 @@ impl Router {
                         let caps: Vec<String> = v
                             .get("caps")
                             .and_then(Value::as_array)
-                            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(String::from)
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         let uin = kernel.by_name.lock().unwrap().get(name).copied();
                         if let Some(uin) = uin {
@@ -1070,9 +1220,20 @@ impl Router {
                                     }
                                 }
                             }
-                            let ev = if kind == "ctl_grant" { "cap_granted" } else { "cap_revoked" };
-                            kernel.ledger.append(ev, json!({"uin": uin, "name": name, "caps": caps})).ok();
-                            let ack = if kind == "ctl_grant" { "granted" } else { "revoked" };
+                            let ev = if kind == "ctl_grant" {
+                                "cap_granted"
+                            } else {
+                                "cap_revoked"
+                            };
+                            kernel
+                                .ledger
+                                .append(ev, json!({"uin": uin, "name": name, "caps": caps}))
+                                .ok();
+                            let ack = if kind == "ctl_grant" {
+                                "granted"
+                            } else {
+                                "revoked"
+                            };
                             write_envelope(writer, wire, &json!({"kind": ack, "name": name}))
                                 .map_err(|e| e.to_string())?;
                             return Ok(());
@@ -1086,7 +1247,10 @@ impl Router {
         let env = match Envelope::from_value(v) {
             Ok(e) => e,
             Err(reason) => {
-                kernel.ledger.append("malformed", json!({"reason": reason, "line": v})).ok();
+                kernel
+                    .ledger
+                    .append("malformed", json!({"reason": reason, "line": v}))
+                    .ok();
                 return Err(reason);
             }
         };
@@ -1107,10 +1271,11 @@ impl Router {
                     // process that didn't get the kill, or a duplicate)
                     // is refused — the respawning pid is the authority
                     if let ProcState::Running = e.state {
-                        return Err(format!("agent '{name}' already registered (stale instance refused)"));
+                        return Err(format!(
+                            "agent '{name}' already registered (stale instance refused)"
+                        ));
                     }
                     drop(e);
-                    drop(entry);
                     drop(agents);
                 }
                 {
@@ -1128,10 +1293,20 @@ impl Router {
                     e.last_step = String::new();
                 }
                 *my_uin = Some(uin);
-                kernel.ledger.append("registered", json!({"uin": uin, "name": name, "wire": format!("{wire:?}")})).map_err(|e| e.to_string())?;
-                let recover = kernel.ledger.last_checkpoint(uin);
-                write_envelope(writer, wire, &json!({"kind": "welcome", "uin": uin, "recover": recover}))
+                kernel
+                    .ledger
+                    .append(
+                        "registered",
+                        json!({"uin": uin, "name": name, "wire": format!("{wire:?}")}),
+                    )
                     .map_err(|e| e.to_string())?;
+                let recover = kernel.ledger.last_checkpoint(uin);
+                write_envelope(
+                    writer,
+                    wire,
+                    &json!({"kind": "welcome", "uin": uin, "recover": recover}),
+                )
+                .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Heartbeat { uin, step, phase } => {
@@ -1152,7 +1327,8 @@ impl Router {
             Envelope::Send { uin, to, body } => {
                 kernel.check_cap(uin, "send", &to)?;
                 kernel.route_send(uin, &to, &body)?;
-                write_envelope(writer, wire, &json!({"kind": "sent", "to": to})).map_err(|e| e.to_string())?;
+                write_envelope(writer, wire, &json!({"kind": "sent", "to": to}))
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Checkpoint { uin, state } => {
@@ -1165,7 +1341,8 @@ impl Router {
                     entry.lock().unwrap().last_checkpoint = Some(state.clone());
                 }
                 drop(agents);
-                write_envelope(writer, wire, &json!({"kind": "acked", "seq": e.seq})).map_err(|e| e.to_string())?;
+                write_envelope(writer, wire, &json!({"kind": "acked", "seq": e.seq}))
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Done { uin } => {
@@ -1174,14 +1351,21 @@ impl Router {
                     entry.lock().unwrap().state = ProcState::Completed;
                 }
                 drop(agents);
-                kernel.ledger.append("completed", json!({"uin": uin})).map_err(|e| e.to_string())?;
+                kernel
+                    .ledger
+                    .append("completed", json!({"uin": uin}))
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Note { uin, text } => {
-                kernel.ledger.append("agent_note", json!({"uin": uin, "text": text})).map_err(|e| e.to_string())?;
+                kernel
+                    .ledger
+                    .append("agent_note", json!({"uin": uin, "text": text}))
+                    .map_err(|e| e.to_string())?;
                 // ACK: the agent's drain_acks blocks until one arrives — an
                 // unacked note looked like a stalled process to the watchdog
-                write_envelope(writer, wire, &json!({"kind": "acked", "note": true})).map_err(|e| e.to_string())?;
+                write_envelope(writer, wire, &json!({"kind": "acked", "note": true}))
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Welcome { uin: _, recover: _ } => {
@@ -1192,7 +1376,10 @@ impl Router {
                 Ok(())
             }
             Envelope::Recovered { uin: _ } => {
-                kernel.ledger.append("recovered", json!({"uin": my_uin.unwrap_or(0)})).map_err(|e| e.to_string())?;
+                kernel
+                    .ledger
+                    .append("recovered", json!({"uin": my_uin.unwrap_or(0)}))
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
         }
@@ -1248,7 +1435,11 @@ struct JsonPeer {
 
 impl JsonPeer {
     fn new(peer: Peer, first: u8) -> JsonPeer {
-        JsonPeer { peer, first: Some(first), done: false }
+        JsonPeer {
+            peer,
+            first: Some(first),
+            done: false,
+        }
     }
     /// read one JSON line; the stored first byte is prepended on the
     /// first call; returns Ok(false) on EOF

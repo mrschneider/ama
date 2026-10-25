@@ -11,7 +11,7 @@ use ama_core::{read_msgpack_frame, read_proto_frame, write_envelope, Peer, Wire}
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,18 +21,29 @@ use std::time::Duration;
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Step {
     /// checkpoint the current step index + state into the ledger
-    Checkpoint { state: Value },
+    Checkpoint {
+        state: Value,
+    },
     /// send to another agent (capability-gated by the kernel)
-    Send { to: String, body: Value },
+    Send {
+        to: String,
+        body: Value,
+    },
     /// block until a message arrives
     Wait,
     /// simulate an uncaught crash (fail-fast demo)
     Crash,
     /// simulate an infinite reasoning loop (watchdog demo)
-    Loop { ms: u64 },
-    Sleep { ms: u64 },
+    Loop {
+        ms: u64,
+    },
+    Sleep {
+        ms: u64,
+    },
     /// journal an observation into the ledger (kernel `agent_note` event)
-    Note { msg: String },
+    Note {
+        msg: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,12 +94,13 @@ fn main() {
     // §3: connect over the transport this agent was configured for —
     // UDS (local) or TCP (network-remote). Same contract either way.
     let peer = match &tcp {
-        Some(addr) => {
-            Peer::Tcp({
-                eprintln!("[agentd {}] connecting to kernel over TCP: {addr}", task.name);
-                std::net::TcpStream::connect(addr).expect("connect to kernel over TCP")
-            })
-        }
+        Some(addr) => Peer::Tcp({
+            eprintln!(
+                "[agentd {}] connecting to kernel over TCP: {addr}",
+                task.name
+            );
+            std::net::TcpStream::connect(addr).expect("connect to kernel over TCP")
+        }),
         None => Peer::Unix(UnixStream::connect(&socket).expect("connect to kernel")),
     };
     // §3: ONE shared writer, Mutex-serialized — the heartbeat thread and
@@ -101,7 +113,7 @@ fn main() {
     // parsed per wire format
     let inbox: Arc<Mutex<VecDeque<Value>>> = Arc::new(Mutex::new(VecDeque::new()));
     let last_step: Arc<AtomicU64> = Arc::new(AtomicU64::new(0)); // current step index for heartbeats
-    // 0 = executing (watchdog counts stuck sweeps), 1 = blocked on IO/wait
+                                                                 // 0 = executing (watchdog counts stuck sweeps), 1 = blocked on IO/wait
     let phase: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let alive: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
     {
@@ -133,7 +145,7 @@ fn main() {
                     Ok(v) => inbox.lock().unwrap().push_back(v),
                     Err(_) => break,
                 }
-            }
+            },
             Wire::Proto => loop {
                 if !alive.load(Ordering::SeqCst) {
                     break;
@@ -187,7 +199,10 @@ fn main() {
     };
 
     // register
-    send(&writer, &json!({"kind": "register", "name": task.name, "caps": task.caps}));
+    send(
+        &writer,
+        &json!({"kind": "register", "name": task.name, "caps": task.caps}),
+    );
 
     // process welcome (and any recover state) first
     let mut uin: u64 = 0;
@@ -199,7 +214,11 @@ fn main() {
         }
     };
     if let Some(wl) = welcome {
-        eprintln!("[agentd {}] welcome at {:?}", task.name, std::time::SystemTime::now());
+        eprintln!(
+            "[agentd {}] welcome at {:?}",
+            task.name,
+            std::time::SystemTime::now()
+        );
         uin = wl.get("uin").and_then(Value::as_u64).unwrap_or(0);
         uin_holder.store(uin, Ordering::SeqCst);
         recovered_from = match wl.get("recover") {
@@ -214,7 +233,10 @@ fn main() {
         if let Some(done) = rec.get("step_index").and_then(Value::as_u64) {
             idx = done as usize;
         }
-        eprintln!("[agentd {}] recovered at step {} from ledger checkpoint", task.name, idx);
+        eprintln!(
+            "[agentd {}] recovered at step {} from ledger checkpoint",
+            task.name, idx
+        );
     }
 
     let drain_acks = |inbox: &Arc<Mutex<VecDeque<Value>>>| {
@@ -239,7 +261,12 @@ fn main() {
 
     while idx < task.steps.len() {
         if std::env::var("AMA_DEBUG_STEP").is_ok() {
-            eprintln!("[agentd {}] step {} at {:?}", task.name, idx, std::time::SystemTime::now());
+            eprintln!(
+                "[agentd {}] step {} at {:?}",
+                task.name,
+                idx,
+                std::time::SystemTime::now()
+            );
         }
         last_step.store(idx as u64, Ordering::SeqCst);
         let step = &task.steps[idx];
@@ -252,7 +279,10 @@ fn main() {
                 drain_acks(&inbox);
             }
             Step::Send { to, body } => {
-                send(&writer, &json!({"kind": "send", "uin": uin, "to": to, "body": body}));
+                send(
+                    &writer,
+                    &json!({"kind": "send", "uin": uin, "to": to, "body": body}),
+                );
                 drain_acks(&inbox);
             }
             Step::Note { msg } => {

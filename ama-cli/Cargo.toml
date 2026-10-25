@@ -3,6 +3,8 @@ name = "ama-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
 
 [dependencies]
 ama-core = { path = "../ama-core" }
