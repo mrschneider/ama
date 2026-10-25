@@ -1,126 +1,136 @@
 # AMA — Agentic Microkernel Architecture
 
-<p align="center">
-  <img src="docs/assets/overview.png" alt="AMA — an agentic microkernel architecture: the microkernel (process table, IPC router, state ledger), agents as isolated OS processes inside seccomp jails exchanging capability-checked typed envelopes, a crashed agent respawned from its ledger checkpoint, and the runtime guarantees: isolated sessions, deterministic replay, capability-gated IPC, atomic respawn" width="100%">
-</p>
+**Run AI agents as OS processes. Contain every failure. Prove every guarantee.**
 
-A microkernel architecture for reliable multi-agent systems, translated
-from the QNX Neutrino microkernel design into the world of AI agent
-execution: agents are **OS processes**, IPC is **typed message passing**
-over Unix Domain Sockets, global state is an **append-only ledger**,
-failures are contained by **isolation** and healed by **atomic respawn
-from the last checkpoint**.
+AMA is a microkernel for reliable multi-agent systems — a faithful
+translation of the QNX Neutrino microkernel design into the world of AI
+agent execution.
 
-Everything below is **implemented and verified by running it**: the
-experiment in `experiments/` executes the real kernel with 5 real agent
-processes and asserts every behaviour from the ledger — see
-[Verified results](#verified-results).
+Instead of a framework that trusts agents to behave, AMA gives every
+agent a **hard operating-system boundary**:
 
-## A protocol run
+| Agent concern | AMA mechanism |
+|---|---|
+| Agents are isolated | Each agent is its own OS process (up to a full Firecracker microVM) |
+| Agents communicate | Typed message passing over UDS/TCP, capability-checked |
+| State is trusted | Global state is an **append-only ledger** — agents never write it |
+| Agents fail | The kernel detects, kills, and **respawns from the last checkpoint** |
+| Agents misbehave | seccomp jails, strict allowlists, user namespaces, microVMs |
 
+Everything below is **implemented and verified by running it** — five
+real agent processes, end-to-end experiments, every assertion taken
+from the ledger. See [Verified results](#verified-results).
+
+## 60-second tour
+
+```bash
+# 1. Start the kernel ("the Executive") with a manifest of agents
+ama serve --manifest manifest.json --agentd ./ama-agentd
+
+# 2. Each agent is spawned as its own OS process (ama-agentd --task task.json)
+#    and executes its task — send, wait, checkpoint, sleep, loop, crash —
+#    talking to the kernel and to other agents ONLY through typed envelopes.
+
+# 3. Watch the ledger: every send, refusal, kill, respawn and checkpoint is there.
 ```
-ama serve --manifest manifest.json --agentd ./ama-agentd   # the Executive
-```
 
-Each agent in the manifest is spawned as its own OS process (`ama-agentd
---task <task.json>`): it registers on the kernel's UDS socket, then
-executes its task — `send`, `wait`, `checkpoint`, `sleep`, `loop`,
-`crash` — talking to the kernel and to other agents ONLY through typed
-envelopes.
+## Why it matters
 
-## What the kernel guarantees (v0.1)
+- **Reliability by construction.** A crashed or stuck agent is killed by
+  the watchdog and respawned atomically from its ledger checkpoint — it
+  resumes at the exact step it died on. A respawn budget turns
+  persistent crashers into `dead` instead of restarting forever.
+- **Security you can audit.** Every send is capability-checked against
+  the process table; refusals are journaled security events, never
+  silent drops. Operators grant and revoke capabilities *at runtime*
+  from a control channel agents cannot reach.
+- **Isolation in tiers.** Pick the depth: OS process → seccomp jail →
+  strict allowlist (Unix sockets only) → user namespace →
+  **Firecracker microVM**, one VM per agent with its own tap subnet.
+- **Three wire formats, one kernel.** JSON lines, length-prefixed
+  msgpack (`0xFF`), and Protobuf (`0x0A`) — decided per connection, with
+  the kernel translating cross-wire at the target. Over UDS **and** TCP
+  with the identical envelope contract.
+- **Observability for free.** Agents journal notes into the same ledger
+  as kernel events, so a seccomp refusal or capability denial appears in
+  the same auditable stream.
 
-**Minimal Executive (§1)** — the kernel holds only: the process table
+## What the kernel guarantees
+
+**Minimal Executive (§1)** — the kernel holds only the process table
 (UIN, PID, capabilities, last heartbeat), the IPC router, and the
-append-only ledger. Agents never write global state; they checkpoint
-THEIR OWN state into the ledger and are recovered from it.
+append-only ledger. Agents checkpoint their *own* state into the ledger
+and are recovered from it.
 
 **Typed message passing (§3)** — every envelope is validated against a
-strict per-kind schema by the kernel: `register`, `heartbeat` (with
+strict per-kind schema: `register`, `heartbeat` (with
 `executing`/`blocked` phase — the watchdog distinguishes infinite
 reasoning loops from legitimate I/O waits), `send`, `checkpoint`,
-`done`. A malformed envelope is refused with a reason and journaled.
+`done`. Malformed envelopes are refused with a reason and journaled.
 
-**Capability-based access (§3)** — an agent can only send to a target
-listed in its process-table grants. A refused send is a journaled
-security event (`cap_denied`), never a silent drop.
+**Capability-based access (§3)** — an agent can only send to targets
+listed in its process-table grants. Refused sends are journaled
+(`cap_denied`).
 
-**Watchdog + fail-fast recovery (§4)** — heartbeat timeout AND a
+**Watchdog + fail-fast recovery (§4)** — heartbeat timeout *and* a
 progress watchdog (same reasoning step for K sweeps while `executing`)
 kill the suspect with the reason journaled. Respawn is atomic: a fresh
-process inherits the last ledger checkpoint and resumes. A respawn
-budget turns persistent crashers into `dead` instead of restarting
-forever.
+process inherits the last checkpoint and resumes.
 
-**Isolation (§2)** — each agent is a separate PID; its ephemeral memory
-dies with the process. cgroup v2 memory/CPU limits are applied
-best-effort when `/sys/fs/cgroup/ama` is writable.
+**Isolation tiers (§2)** — from shallow to deep:
 
-**Tool Execution Jail (§2)** — `ama-agentd` jails ITSELF with
-seccomp-bpf (raw BPF, no libseccomp): a denylist of host-dangerous
-syscalls — `ptrace`, `mount`, module loading, `bpf`, `userfaultfd`,
-`setns`, `unshare`… — returns EPERM to the jailed process, with
-`PR_SET_NO_NEW_PRIVS` set so privileges can never be regained. Tools
-run inside the same filter via `ama jail -- <cmd>` (PATH-resolved).
-Differential probe: unjailed `ptrace(TRACEME)` returns 0; the identical
-call inside the jail returns EPERM.
-
-**Strict allowlist seccomp (§3)** — `ama jail --strict` flips the
-filter to default-DENY with an explicit x86_64 allowlist, and
-`socket()` is allowed ONLY for `AF_UNIX`: the differential probe shows
-`socket(AF_INET)` returning EPERM while `socket(AF_UNIX)` works — the
-kernel is the agent's ONLY channel.
-
-**Network-remote IPC (§3)** — the kernel accepts agents over TCP
-(`tcp_port` in the manifest) with the IDENTICAL envelope contract and
-capability checks; an agent list `transport: "tcp"` in its spec. The
-round trip crosses transports AND wire formats transparently
-(experiment 003).
-
-**Binary wire format (§3)** — every connection speaks either JSON
-lines (v0.1) or length-prefixed msgpack (`0xFF` magic), decided by the
-first byte; the kernel answers each connection in ITS format and
-delivers cross-format messages by translating at the target's wire.
-
-**User-namespace tier (§2, MicroVM frontier)** — `ama jail --userns`
-runs the tool in a fresh user+mount namespace before the seccomp filter
-(uid 0 inside, host ownership unchanged). Gated by host policy: hosts
-that forbid unprivileged user namespaces get an explicit SKIP, not a
-fake pass.
-
-**Protobuf wire (§3)** — the third wire format: length-prefixed
-`[0x0A magic][u32 LE len][protobuf envelope]` over the same framing as
-msgpack. The full kernel↔agent vocabulary (register, welcome, heartbeat,
-send, delivered, checkpoint, ack, done) round-trips; the kernel answers
-each connection in ITS format and translates cross-wire at the target
-(experiment 004: a=json, b=msgpack, c=proto on ONE kernel).
-
-**MicroVM tier (§2, Firecracker-class)** — the deepest isolation tier,
-NOW IMPLEMENTED: an agent with `isolation: "microvm"` runs inside its
-own Firecracker microVM. The PID the kernel watches IS the whole VM (the
-boot script `exec`s firecracker); SIGKILL tears the VM down, respawn
-boots a fresh VM from the ledger checkpoint. Per-agent tap networking
-(`172.16.<1+uin>.0/24` — VMs cannot see each other's traffic), per-agent
-initramfs (static musl agentd + task baked in), kernel bridge listening
-on `0.0.0.0` for the tap. The VM boundary replaces the seccomp jail
-inside the guest (`AMA_VM=1`); the three-wire contract is byte-identical
-across the VM boundary (experiment 005).
+1. **OS process** — each agent is a separate PID; ephemeral memory dies
+   with the process. cgroup v2 memory/CPU limits are applied
+   best-effort when `/sys/fs/cgroup/ama` is writable.
+2. **Seccomp jail** — `ama-agentd` jails *itself* with raw seccomp-BPF
+   (no libseccomp): a denylist of host-dangerous syscalls — `ptrace`,
+   `mount`, module loading, `bpf`, `userfaultfd`, `setns`, `unshare` —
+   returns EPERM, with `PR_SET_NO_NEW_PRIVS` so privileges can never be
+   regained. Tools run inside the same filter via `ama jail -- <cmd>`.
+   Differential probe: unjailed `ptrace(TRACEME)` succeeds; the same
+   call inside the jail returns EPERM.
+3. **Strict allowlist** — `ama jail --strict` flips to default-DENY with
+   an explicit x86_64 allowlist where `socket()` is allowed **only for
+   AF_UNIX**: `socket(AF_INET)` returns EPERM while `socket(AF_UNIX)`
+   works — the kernel is the agent's only channel.
+4. **User namespace** — `ama jail --userns` runs the tool in a fresh
+   user+mount namespace before the seccomp filter (uid 0 inside, host
+   ownership unchanged). Hosts that forbid unprivileged user namespaces
+   get an explicit SKIP, not a fake pass.
+5. **MicroVM (Firecracker-class)** — the deepest tier. An agent with
+   `isolation: "microvm"` runs inside its **own Firecracker microVM**.
+   The PID the kernel watches *is* the whole VM (the boot script `exec`s
+   firecracker); SIGKILL tears the VM down, respawn boots a fresh VM
+   from the ledger checkpoint. Per-agent tap networking
+   (`172.16.<1+uin>.0/24` — VMs cannot see each other's traffic),
+   per-agent initramfs (static musl agentd + task baked in), kernel
+   bridge listening on `0.0.0.0` for the tap. The VM boundary replaces
+   the seccomp jail inside the guest; the three-wire contract is
+   byte-identical across the VM boundary.
 
 <p align="center">
   <img src="docs/assets/microvm-tier.svg" alt="The AMA microVM tier: the host kernel (process table, IPC router, ledger, TCP bridge with per-agent taps) bridging two Firecracker microVMs, each running the static musl agentd behind its own tap subnet, with the VM boundary as the jail" width="70%">
 </p>
 
+**Network-remote IPC (§3)** — the kernel accepts agents over TCP
+(`tcp_port` in the manifest) with the identical envelope contract and
+capability checks; an agent sets `transport: "tcp"` in its spec. The
+round trip crosses transports **and** wire formats transparently.
+
+**Binary wire formats (§3)** — every connection speaks JSON lines, or
+length-prefixed msgpack (`0xFF` magic), or Protobuf (`0x0A` magic),
+decided by the first byte. The kernel answers each connection in *its*
+format and translates cross-format messages at the target's wire.
+
 **Hot capability renegotiation (§3)** — the operator grants and revokes
-capabilities AT RUNTIME over a control connection (`ama grant --name m
+capabilities at runtime over a control connection (`ama grant --name m
 --caps send:c` / `ama revoke`); agents can never reach the control
-channel. Every grant and revocation is journaled; a send attempt after
-revocation is refused again, even for a capability that previously
-worked.
+channel. A send attempt after revocation is refused again — even for a
+capability that previously worked.
 
 **Agent observability** — agents journal notes into the ledger
-(`note`/`agent_note` events), so agent-visible failures (a seccomp
-refusal, a capability denial) appear in the same auditable stream as
-kernel events.
+(`note`/`agent_note` events), so agent-visible failures appear in the
+same auditable stream as kernel events.
 
 ## Verified results (experiments 001 + 002)
 
@@ -157,38 +167,43 @@ PASS: observability: agent notes are journaled into the ledger
 EXPERIMENT_002: PASS  (40 ledger events)
 ```
 
-Scenario: `b` pings `a` (typed envelope, capability-checked, journaled);
-`a` pongs back and both complete. `c` checkpoints, is killed externally
-(`kill -9`, the OOM/operator path), resumes from its ledger checkpoint
-at the exact step it died on, and completes. `d` runs an infinite
-reasoning loop — the progress watchdog detects the stuck step in
-`executing` phase, kills it, and exhausts the respawn budget. `m`
-attempts to reach an agent it has no capability for — refused and
-journaled. All five ran as distinct OS processes.
+Scenario: `b` pings `a` (typed envelope, capability-checked,
+journaled); `a` pongs back and both complete. `c` checkpoints, is
+killed externally (`kill -9`, the OOM/operator path), resumes from its
+ledger checkpoint at the exact step it died on, and completes. `d`
+runs an infinite reasoning loop — the progress watchdog detects the
+stuck step, kills it, and exhausts the respawn budget. `m` attempts to
+reach an agent it has no capability for — refused and journaled. All
+five ran as distinct OS processes.
+
+Further experiments: `003_transports` (TCP + msgpack + allowlist +
+userns), `004_wires` (three wires on ONE kernel), `005_microvm`
+(Firecracker tier).
 
 ## Deliberately not implemented (v0.4)
 
-- **Trusted execution**: all three tiers are host-enforced. A VM booting
-  a malicious kernel is not contained (Firecracker assumes a trusted
+- **Trusted execution** — all tiers are host-enforced. A VM booting a
+  malicious kernel is not contained (Firecracker assumes a trusted
   guest kernel image; the vmlinux here is the Firecracker CI build).
-- **Live migration**: the microVM tier is cold — respawn = fresh VM
+- **Live migration** — the microVM tier is cold: respawn = fresh VM
   from the checkpoint, no hot migration between hosts.
 
-Git history: `3dd35d8` v0.1.0 (kernel MVP), v0.2.0 (seccomp jails +
-hot capabilities), v0.3.0 (strict allowlist, TCP transports, msgpack
-wire, user-namespace tier), v0.4.0 (protobuf wire + Firecracker
-microVM tier).
+Git history: `3dd35d8` v0.1.0 (kernel MVP), v0.2.0 (seccomp jails + hot
+capabilities), v0.3.0 (strict allowlist, TCP transports, msgpack wire,
+user-namespace tier), v0.4.0 (protobuf wire + Firecracker microVM
+tier).
 
 ## Layout
 
 - `ama-core/` — the kernel library: envelopes, ledger, process table,
   router, watchdog, supervisor, sandbox
 - `ama-agentd/` — the agent-side process (`ama-agentd`)
-- `ama-cli/` — the `ama` binary (`serve`, `ps`, `jail`, `grant`, `revoke`)
-- `vm/` — the microVM tier: `boot_agent.sh` (per-agent tap + firecracker),
-  `assemble_initramfs.sh` (per-agent initramfs), `guest-init.sh` (guest
-  PID 1), `agentd-static` (musl static-pie agentd), `vmlinux-6.1.155`
-  (Firecracker CI guest kernel)
+- `ama-cli/` — the `ama` binary (`serve`, `ps`, `jail`, `grant`,
+  `revoke`)
+- `vm/` — the microVM tier: `boot_agent.sh` (per-agent tap +
+  firecracker), `assemble_initramfs.sh` (per-agent initramfs),
+  `guest-init.sh` (guest PID 1), `agentd-static` (musl static-pie
+  agentd), `vmlinux-6.1.155` (Firecracker CI guest kernel)
 - `experiments/` — runnable E2E proof + task manifests
 - `docs/research/qnx-microkernel.md` — the QNX design sources this
   architecture is translated from, with the deliberate-scope notes
