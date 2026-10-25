@@ -463,6 +463,26 @@ impl Kernel {
         })
     }
 
+    /// Configure the delivery link from the manifest's kernel section:
+    /// admission limits and the WFQ capacity.
+    pub fn configure_delivery(
+        &self,
+        max_bytes_per_sec: Option<u32>,
+        max_queue_bytes: Option<u64>,
+        wfq_capacity: Option<f64>,
+        link_bytes_per_tick: Option<u64>,
+    ) {
+        let mut d = self.delivery.lock().unwrap();
+        d.admission.max_bytes_per_sec = max_bytes_per_sec;
+        if let Some(q) = max_queue_bytes {
+            d.admission.max_queue_bytes = q;
+        }
+        if let Some(c) = wfq_capacity {
+            d.wfq = qos::WfqScheduler::new(c);
+        }
+        d.link_bytes_per_tick = link_bytes_per_tick;
+    }
+
     /// Declare an agent's QoS at registration time (priority is stored
     /// on the entry; a rate limit installs its token bucket).
     pub fn set_qos(&self, uin: u64, priority: u8, rate: Option<u32>) {
@@ -620,6 +640,10 @@ impl Kernel {
                 q.priority.unwrap_or(5).min(9),
                 q.max_msgs_per_sec.filter(|r| *r > 0),
             );
+            let mut d = self.delivery.lock().unwrap();
+            // WFQ weight and the sender's own admission budget
+            d.set_weight(uin, q.weight.unwrap_or(1.0));
+            d.set_byte_rate(uin, q.max_bytes_per_sec);
         }
         self.ledger.append(
             "spawned",
@@ -665,9 +689,34 @@ impl Kernel {
             .copied()
             .ok_or_else(|| format!("unknown agent '{to}'"))?;
 
-        // QoS gate FIRST: a rate-limited sender is throttled even when
+        let bytes = serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0);
+
+        // ADMISSION CONTROL first: byte rate + queue bound. A refused
+        // message never enters the kernel (journaled, never silent).
+        // NOTE: the guard must be scoped — a MutexGuard held by an
+        // `if let` scrutinee lives to the end of the whole `if let`
+        // statement, and re-locking inside the block self-deadlocks
+        // (std Mutex is not reentrant; this hung the kernel once).
+        let admission = {
+            let mut d = self.delivery.lock().unwrap();
+            d.admit_bytes(from, bytes)
+        };
+        if let Err(reason) = admission {
+            self.delivery.lock().unwrap().record_denied();
+            self.ledger
+                .append(
+                    "admission_denied",
+                    json!({"from": from, "to": uin, "bytes": bytes, "reason": reason}),
+                )
+                .map_err(|e| e.to_string())?;
+            return Err(format!("admission: {reason}"));
+        }
+
+        // QoS gate: a rate-limited sender is throttled even when
         // the destination is up — backpressure before entry, not after.
-        if !self.delivery.lock().unwrap().allow(from) {
+        let allowed = { self.delivery.lock().unwrap().allow(from) };
+        if !allowed {
+            self.delivery.lock().unwrap().record_throttled();
             self.ledger
                 .append(
                     "qos_throttled",
@@ -722,14 +771,144 @@ impl Kernel {
             });
         }
 
+        // SCHEDULING: while the link is idle a connected destination is
+        // served straight through (work-conserving, zero added latency).
+        // Under contention the message joins the WFQ queue and the
+        // watchdog's tick serves it by virtual finish tag — weight, not
+        // arrival order, decides who gets the link.
+        let go_fast = {
+            let mut d = self.delivery.lock().unwrap();
+            !d.link_busy() && d.link_ready(bytes)
+        };
+        if !go_fast {
+            let mut d = self.delivery.lock().unwrap();
+            d.schedule(from, uin, body.clone(), bytes)
+                .map_err(|e| e.to_string())?;
+            drop(d);
+            self.ledger
+                .append(
+                    "qos_scheduled",
+                    json!({"from": from, "to": uin, "bytes": bytes}),
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
         let mut w = w.ok_or_else(|| format!("agent '{to}' has no connection"))?;
         let msg = json!({"kind": "msg", "from": from, "body": body});
         let w_ref: &mut dyn IoWrite = &mut w;
         write_envelope(w_ref, wire, &msg).map_err(|e| e.to_string())?;
+        self.delivery
+            .lock()
+            .unwrap()
+            .record_fast_path(from, uin, bytes);
         self.ledger
-            .append("delivered", json!({"from": from, "to": uin, "body": body}))
+            .append(
+                "delivered",
+                json!({"from": from, "to": uin, "bytes": bytes, "body": body}),
+            )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Drain the WFQ delivery queue in virtual-finish-tag order. Called
+    /// from the watchdog tick (and once more at the end of `sweep`), so a
+    /// scheduled message waits at most one tick (200 ms) — the price of
+    /// fair scheduling on a kernel with no dedicated link thread.
+    pub fn drain_delivery_queue(&self) {
+        let mut served = 0usize;
+        loop {
+            let next = {
+                let mut d = self.delivery.lock().unwrap();
+                // peek before popping: a message the link cannot carry
+                // yet stays queued (WFQ order is preserved across ticks)
+                let head = d.pending.peek().map(|m| m.0.bytes);
+                match head {
+                    Some(b) if d.link_ready(b) => match d.pop_next() {
+                        Some(m) => m,
+                        None => break,
+                    },
+                    _ => break,
+                }
+            };
+            // resolve the destination's writer
+            let target: Option<(Wire, Peer)> = {
+                let agents = self.agents.lock().unwrap();
+                match agents.get(&next.to) {
+                    Some(entry) => {
+                        let e = entry.lock().unwrap();
+                        let deliverable =
+                            matches!(e.state, ProcState::Running | ProcState::Registered)
+                                && e.out.is_some();
+                        if deliverable {
+                            e.out.as_ref().and_then(|p| {
+                                let guard = p.lock().unwrap();
+                                guard.try_clone().ok().map(|w| (e.wire, w))
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            };
+            match target {
+                Some((wire, mut w)) => {
+                    let msg = json!({"kind": "msg", "from": next.from, "body": next.body});
+                    let w_ref: &mut dyn IoWrite = &mut w;
+                    match write_envelope(w_ref, wire, &msg) {
+                        Ok(()) => {
+                            served += 1;
+                            self.delivery.lock().unwrap().record_delivery(&next);
+                            self.ledger
+                                .append(
+                                    "qos_delivered",
+                                    json!({
+                                        "from": next.from,
+                                        "to": next.to,
+                                        "bytes": next.bytes,
+                                        "tag": next.tag,
+                                    }),
+                                )
+                                .ok();
+                        }
+                        Err(e) => {
+                            let mut d = self.delivery.lock().unwrap();
+                            d.record_queued_drop(next.bytes);
+                            drop(d);
+                            self.ledger
+                                .append(
+                                    "qos_dropped",
+                                    json!({"to": next.to, "bytes": next.bytes, "err": e.to_string()}),
+                                )
+                                .ok();
+                        }
+                    }
+                }
+                None => {
+                    // destination vanished while queued: it loses the
+                    // message, and the drop is journaled (never silent)
+                    let mut d = self.delivery.lock().unwrap();
+                    d.record_queued_drop(next.bytes);
+                    drop(d);
+                    self.ledger
+                        .append(
+                            "qos_dropped",
+                            json!({"to": next.to, "bytes": next.bytes, "reason": "destination disconnected"}),
+                        )
+                        .ok();
+                }
+            }
+        }
+        if served > 0 {
+            let snap = self.delivery.lock().unwrap().stats();
+            self.ledger
+                .append(
+                    "qos_accounting",
+                    json!({"served_now": served, "stats": snap}),
+                )
+                .ok();
+        }
     }
 
     /// DTN flush: called on registration — deliver the destination's held
@@ -1000,6 +1179,11 @@ impl Kernel {
                 })
                 .collect()
         };
+        // QoS: refill the link's per-tick budget, then serve the WFQ
+        // queue while the budget lasts (the rest waits for the next tick)
+        self.delivery.lock().unwrap().refill_link();
+        self.drain_delivery_queue();
+
         // DTN sweep: bundles whose TTL ran out while the destination
         // never registered — journaled then dropped (never silent)
         {
@@ -1369,6 +1553,13 @@ impl Router {
         if my_uin.is_none() {
             if let Some(kind) = v.get("kind").and_then(Value::as_str) {
                 match kind {
+                    "ctl_qos" => {
+                        // bandwidth accounting + queue state, operator-only
+                        let stats = kernel.delivery.lock().unwrap().stats();
+                        let reply = json!({"kind": "qos", "stats": stats});
+                        write_envelope(writer, wire, &reply).map_err(|e| e.to_string())?;
+                        return Ok(());
+                    }
                     "ctl_ps" => {
                         let dump = kernel.ps_dump();
                         let reply = json!({"kind": "ps", "agents": dump});
@@ -1694,6 +1885,22 @@ pub struct KernelConfig {
     /// required when any agent declares isolation "microvm"
     #[serde(default)]
     pub vm_boot: Option<String>,
+    /// admission control: kernel-wide byte rate per sender (None =
+    /// unlimited; an agent's own `qos.max_bytes_per_sec` overrides it)
+    #[serde(default)]
+    pub admission_max_bytes_per_sec: Option<u32>,
+    /// admission control: hard bound on the bytes the kernel may hold in
+    /// its delivery queue (default 16 MiB)
+    #[serde(default)]
+    pub admission_max_queue_bytes: Option<u64>,
+    /// WFQ link capacity in bytes per virtual tick (default 16384)
+    #[serde(default)]
+    pub wfq_capacity: Option<f64>,
+    /// delivery link capacity in BYTES PER WATCHDOG TICK (None = the
+    /// link is infinitely fast). A finite value is what makes the
+    /// backlog — and therefore WFQ — real.
+    #[serde(default)]
+    pub link_bytes_per_tick: Option<u64>,
 }
 
 fn default_hb() -> u64 {
@@ -1710,8 +1917,17 @@ fn default_timeout() -> u64 {
 pub struct QosSpec {
     #[serde(default)]
     pub priority: Option<u8>,
+    /// message-rate token bucket (per sender)
     #[serde(default)]
     pub max_msgs_per_sec: Option<u32>,
+    /// byte-rate admission budget (per sender); overrides the kernel-wide
+    /// `admission_max_bytes_per_sec` for this agent
+    #[serde(default)]
+    pub max_bytes_per_sec: Option<u32>,
+    /// WFQ weight: the share of a contended delivery link (default 1.0;
+    /// weight 3 gets three times the link of weight 1)
+    #[serde(default)]
+    pub weight: Option<f64>,
 }
 
 #[derive(Deserialize)]

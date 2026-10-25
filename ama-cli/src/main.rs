@@ -54,6 +54,7 @@ fn main() {
     match cmd.as_str() {
         "serve" => serve(&socket, &manifest, &agentd, cgroups),
         "ps" => ps(&socket),
+        "qos" => ctl_qos(&socket),
         "grant" => ctl_caps(&socket, "ctl_grant", &name, &caps),
         "revoke" => ctl_caps(&socket, "ctl_revoke", &name, &caps),
         "jail" => {
@@ -78,10 +79,19 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: ama serve|ps|grant|revoke|jail");
+            eprintln!("usage: ama serve|ps|qos|grant|revoke|jail");
             exit(2);
         }
     }
+}
+
+fn ctl_qos(socket: &str) {
+    let msg = format!("{}\n", serde_json::json!({"kind": "ctl_qos"}));
+    let mut s = UnixStream::connect(socket).expect("connect");
+    s.write_all(msg.as_bytes()).expect("ctl");
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).expect("reply");
+    println!("{}", line.trim());
 }
 
 fn ctl_caps(socket: &str, verb: &str, name: &str, caps: &str) {
@@ -131,6 +141,12 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
         )
     });
     kernel.vm_boot = m.kernel.vm_boot.clone();
+    kernel.configure_delivery(
+        m.kernel.admission_max_bytes_per_sec,
+        m.kernel.admission_max_queue_bytes,
+        m.kernel.wfq_capacity,
+        m.kernel.link_bytes_per_tick,
+    );
     let agents: Vec<AgentSpecTuple> = m
         .agents
         .iter()

@@ -111,11 +111,26 @@ reasoning loops from legitimate I/O waits), `send`, `checkpoint`,
 listed in its process-table grants. Refused sends are journaled
 (`cap_denied`).
 
-**QoS: rate limits + priority (§3)** — an agent declares
-`max_msgs_per_sec` and the kernel holds a **per-sender** token bucket: a
-bursty agent is throttled on its own sends without starving the others.
-Refusals are journaled (`qos_throttled`) — backpressure is never silent.
-`priority` (0 = highest) orders the destination's deferred queue.
+**QoS: scheduling, admission, accounting (§3)** — a real stack, not a
+single throttle:
+
+- **Weighted Fair Queueing.** The kernel models the delivery link with a
+  per-tick byte budget (`link_bytes_per_tick`). When the link is
+  backlogged, messages are served by virtual finish tag
+  `F = max(V, F_flow) + len / weight` with the clock `V` advancing by
+  `len / capacity` (start-time fair queueing). An agent with `weight: 3`
+  gets three times the link of `weight: 1`, and never starves it. An
+  idle link is work-conserving: the message is written straight through
+  with zero added latency.
+- **Admission control.** A byte-rate bucket per sender
+  (`max_bytes_per_sec`, or the kernel-wide
+  `admission_max_bytes_per_sec`) plus a hard bound on the queue
+  (`admission_max_queue_bytes`). A refused message never enters the
+  kernel: it is journaled `admission_denied` with the reason.
+- **Bandwidth accounting.** Bytes in/out per agent, queue depth and peak,
+  accepted/delivered/throttled/denied counters — journaled as
+  `qos_accounting` after every served batch and readable at any time on
+  the operator-only control channel (`ama qos`).
 
 **DTN: store-and-forward custody (§3)** — an agent may declare
 `dtn: true`. A send to that agent while it is disconnected (killed, dead,
@@ -243,7 +258,8 @@ five ran as distinct OS processes.
 Further experiments: `003_transports` (TCP + msgpack + allowlist +
 userns), `004_wires` (three wires on ONE kernel), `005_microvm`
 (Firecracker tier), `006_qos_dtn` (rate limiting + store-and-forward
-custody for an offline destination).
+custody for an offline destination), `007_qos_suite` (WFQ weights under
+a contended link, admission control, bandwidth accounting).
 
 ## Deliberately not implemented (v0.5)
 
@@ -252,9 +268,9 @@ custody for an offline destination).
   guest kernel image; the vmlinux here is the Firecracker CI build).
 - **Live migration** — the microVM tier is cold: respawn = fresh VM
   from the checkpoint, no hot migration between hosts.
-- **Full QoS suite** — no weighted fair queueing, no admission control,
-  no bandwidth accounting: only a per-sender token bucket and a
-  priority-ordered custody queue.
+- **QoS beyond this kernel** — the link is a per-tick byte budget, not a
+  shaped NIC: no per-destination links, no ECN/queue-management (RED),
+  no cross-kernel federation of the accounting counters.
 - **DTN routing** — custody is single-hop kernel-side only: no
   multi-hop relays, no custody acknowledgements, no bundle
   fragmentation or re-assembly.
@@ -301,6 +317,7 @@ bash experiments/experiment_003_transports.sh  # TCP + msgpack + allowlist + use
 bash experiments/experiment_004_wires.sh       # protobuf wire: 3 wires on ONE kernel
 bash experiments/experiment_005_microvm.sh     # Firecracker microVM tier (needs /dev/kvm + ufw allow 172.16.0.0/12)
 bash experiments/experiment_006_qos_dtn.sh     # per-sender rate limits + DTN custody for an offline agent
+bash experiments/experiment_007_qos_suite.sh   # WFQ weights + admission control + bandwidth accounting
 ```
 
 ## License

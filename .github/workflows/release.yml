@@ -31,6 +31,8 @@ jobs:
       - run: bash experiments/experiment_004_wires.sh
       - run: pkill -9 -x ama || true; pkill -9 -x ama-agentd || true; sleep 1
       - run: bash experiments/experiment_006_qos_dtn.sh
+      - run: pkill -9 -x ama || true; pkill -9 -x ama-agentd || true; sleep 1
+      - run: bash experiments/experiment_007_qos_suite.sh
 
   dist:
     name: dist (${{ matrix.target }})

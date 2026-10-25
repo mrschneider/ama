@@ -67,5 +67,10 @@ jobs:
           pkill -9 -x ama-agentd || true
           sleep 1
           bash experiments/experiment_006_qos_dtn.sh
+      - run: |
+          pkill -9 -x ama || true
+          pkill -9 -x ama-agentd || true
+          sleep 1
+          bash experiments/experiment_007_qos_suite.sh
       # experiment_005_microvm is intentionally excluded: it requires
       # /dev/kvm, which GitHub-hosted runners do not expose.

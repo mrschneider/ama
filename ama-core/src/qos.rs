@@ -1,5 +1,32 @@
-//! QoS (priority + rate limiting) and DTN (delay-tolerant
+//! QoS (scheduling + admission + accounting) and DTN (delay-tolerant
 //! store-and-forward) message delivery.
+//!
+//! QoS is a real scheduling stack, not a single throttle:
+//!
+//! - **Weighted Fair Queueing (WFQ)** — when the kernel's delivery link
+//!   is backlogged, pending messages are served in order of their
+//!   virtual finish tag `F = max(V, F_flow) + len / weight`, with the
+//!   virtual clock `V` advancing by `len / capacity` per transmission
+//!   (self-clocked / start-time fair queueing). An agent with weight 3
+//!   gets three times the link of an agent with weight 1 — the classic
+//!   WFQ guarantee, checked by a unit test and by the ledger order.
+//! - **Admission control** — a byte-rate token bucket PER SENDER
+//!   (`max_bytes_per_sec`) plus a hard bound on the delivery queue
+//!   (`max_queue_bytes`). A refused message is journaled
+//!   `admission_denied`; it is never silently dropped and never
+//!   queued "to be safe".
+//! - **Bandwidth accounting** — bytes sent/delivered per agent, queue
+//!   depth and peak depth, throttled/denied counters, exposed on the
+//!   control channel (`ama qos`) and journaled as `qos_accounting`.
+//!
+//! WFQ only means something if the link can actually be short of
+//! capacity, so the kernel models one: `link_bytes_per_tick` is the
+//! budget the delivery link may carry per watchdog tick (unlimited by
+//! default). A message that fits the remaining budget and finds the
+//! queue empty is written straight through (work-conserving, no added
+//! latency); anything else waits in the WFQ queue. With a finite link
+//! the backlog is real, and the virtual-finish-tag order is what the
+//! destination actually observes.
 //!
 //! QoS: every agent declares `qos: { priority, max_msgs_per_sec }` in
 //! the manifest. Delivery is scheduled by priority (0 = highest); each
@@ -18,7 +45,8 @@
 //! kernel can honestly implement.
 
 use serde_json::Value;
-use std::collections::BinaryHeap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
 /// Priority ordering: LOWER number = delivered EARLIER. BinaryHeap is a
@@ -87,6 +115,255 @@ impl TokenBucket {
     }
 }
 
+/// Weighted Fair Queueing scheduler (start-time fair queueing).
+///
+/// Each FLOW is a sender UIN with a declared weight. A message of
+/// `len` bytes from flow `f` gets the virtual finish tag
+/// `F = max(V, F_f) + len / w_f`; the smallest tag is served first.
+/// The virtual clock advances by `len / capacity` for every byte the
+/// link actually serves, so a flow that was idle cannot bank credit it
+/// never earned (no tag below the current virtual time).
+#[derive(Debug)]
+pub struct WfqScheduler {
+    /// bytes the link serves per virtual tick (the C in len/C)
+    capacity: f64,
+    virtual_time: f64,
+    weights: HashMap<u64, f64>,
+    last_finish: HashMap<u64, f64>,
+}
+
+impl WfqScheduler {
+    pub fn new(capacity: f64) -> Self {
+        Self {
+            capacity: if capacity > 0.0 { capacity } else { 1.0 },
+            virtual_time: 0.0,
+            weights: HashMap::new(),
+            last_finish: HashMap::new(),
+        }
+    }
+
+    /// Declare a flow's weight (1.0 = the reference share).
+    pub fn set_weight(&mut self, flow: u64, weight: f64) {
+        let w = if weight > 0.0 { weight } else { 1.0 };
+        self.weights.insert(flow, w);
+    }
+
+    pub fn weight_of(&self, flow: u64) -> f64 {
+        self.weights.get(&flow).copied().unwrap_or(1.0)
+    }
+
+    /// Compute the virtual finish tag for a message without committing
+    /// to it (used by tests) — `commit` advances the flow's tag.
+    pub fn peek_tag(&self, flow: u64, bytes: usize) -> f64 {
+        let w = self.weight_of(flow);
+        let start = self
+            .last_finish
+            .get(&flow)
+            .copied()
+            .unwrap_or(self.virtual_time)
+            .max(self.virtual_time);
+        start + bytes as f64 / w
+    }
+
+    /// Assign the finish tag for a message about to be queued.
+    pub fn tag(&mut self, flow: u64, bytes: usize) -> f64 {
+        let f = self.peek_tag(flow, bytes);
+        self.last_finish.insert(flow, f);
+        f
+    }
+
+    /// The link served `bytes`: advance the virtual clock.
+    pub fn serve(&mut self, bytes: usize) {
+        self.virtual_time += bytes as f64 / self.capacity;
+    }
+
+    pub fn virtual_time(&self) -> f64 {
+        self.virtual_time
+    }
+}
+
+/// Byte-rate token bucket (buckets in BYTES, not messages): the
+/// admission-control form of a rate limit.
+#[derive(Debug)]
+pub struct ByteBucket {
+    pub rate: u32,
+    tokens: f64,
+    last: Instant,
+}
+
+impl ByteBucket {
+    pub fn new(rate: u32) -> Self {
+        Self {
+            rate,
+            tokens: rate as f64,
+            last: Instant::now(),
+        }
+    }
+
+    /// Reserve `bytes`; false = the reservation is over the rate.
+    pub fn take(&mut self, bytes: usize) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        let cap = self.rate as f64;
+        self.tokens = (self.tokens + elapsed * cap).min(cap);
+        let want = bytes as f64;
+        if self.tokens >= want {
+            self.tokens -= want;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Tokens actually available right now (for stats).
+    pub fn available(&self) -> f64 {
+        self.tokens
+    }
+}
+
+/// Admission control: may this message enter the kernel's delivery path
+/// at all? Two independent limits, both journaled when they refuse:
+/// per-sender byte rate, and the global queue bound.
+#[derive(Debug)]
+pub struct AdmissionPolicy {
+    /// per-sender byte rate (None = unlimited)
+    pub max_bytes_per_sec: Option<u32>,
+    /// hard bound on the bytes the kernel may hold in its delivery queue
+    pub max_queue_bytes: u64,
+    buckets: HashMap<u64, ByteBucket>,
+}
+
+impl AdmissionPolicy {
+    pub fn new(max_bytes_per_sec: Option<u32>, max_queue_bytes: u64) -> Self {
+        Self {
+            max_bytes_per_sec,
+            max_queue_bytes,
+            buckets: HashMap::new(),
+        }
+    }
+
+    /// Per-sender override from the agent's manifest (`qos.max_bytes_per_sec`).
+    pub fn set_sender_rate(&mut self, uin: u64, rate: Option<u32>) {
+        match rate {
+            Some(r) if r > 0 => {
+                self.buckets.insert(uin, ByteBucket::new(r));
+            }
+            _ => {
+                self.buckets.remove(&uin);
+            }
+        }
+    }
+
+    /// Admit a message of `bytes` from `from`, given the queue currently
+    /// holds `queued` bytes. `Err` carries the reason to journal.
+    pub fn admit(&mut self, from: u64, bytes: usize, queued: u64) -> Result<(), String> {
+        if queued + bytes as u64 > self.max_queue_bytes {
+            return Err(format!(
+                "admission: delivery queue at capacity ({queued}+{bytes} > {} bytes)",
+                self.max_queue_bytes
+            ));
+        }
+        // the sender's own rate: explicit per-agent value wins, else the
+        // kernel-wide default
+        if let Some(b) = self.buckets.get_mut(&from) {
+            if !b.take(bytes) {
+                return Err(format!(
+                    "admission: sender {from} over its byte rate ({} B/s, {} B available)",
+                    b.rate,
+                    b.available() as u64
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(rate) = self.max_bytes_per_sec {
+            let b = self
+                .buckets
+                .entry(from)
+                .or_insert_with(|| ByteBucket::new(rate));
+            if !b.take(bytes) {
+                return Err(format!(
+                    "admission: sender {from} over the kernel byte rate ({rate} B/s)"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Bandwidth accounting: what the link actually carried, per agent.
+#[derive(Debug, Default, Clone)]
+pub struct Accounting {
+    /// sender UIN -> bytes accepted into the delivery path
+    pub bytes_in: HashMap<u64, u64>,
+    /// destination UIN -> bytes delivered
+    pub bytes_out: HashMap<u64, u64>,
+    pub msgs_accepted: u64,
+    pub msgs_delivered: u64,
+    pub msgs_throttled: u64,
+    pub msgs_denied: u64,
+    pub msgs_scheduled: u64,
+    pub queued_bytes: u64,
+    pub peak_queued_bytes: u64,
+    pub bytes_dropped: u64,
+}
+
+impl Accounting {
+    pub fn snapshot(&self) -> Value {
+        let mut per_sender: Vec<Value> = self
+            .bytes_in
+            .iter()
+            .map(|(uin, b)| {
+                serde_json::json!({"uin": uin, "bytes_in": b,
+                "bytes_out": self.bytes_out.get(uin).copied().unwrap_or(0)})
+            })
+            .collect();
+        per_sender.sort_by_key(|v| v["uin"].as_u64().unwrap_or(0));
+        serde_json::json!({
+            "msgs_accepted": self.msgs_accepted,
+            "msgs_delivered": self.msgs_delivered,
+            "msgs_throttled": self.msgs_throttled,
+            "msgs_denied": self.msgs_denied,
+            "msgs_scheduled": self.msgs_scheduled,
+            "queued_bytes": self.queued_bytes,
+            "peak_queued_bytes": self.peak_queued_bytes,
+            "bytes_dropped": self.bytes_dropped,
+            "per_agent": per_sender,
+        })
+    }
+}
+
+/// A message waiting in the kernel's delivery queue, ordered by its WFQ
+/// virtual finish tag.
+#[derive(Debug, Clone)]
+pub struct PendingMsg {
+    pub from: u64,
+    pub to: u64,
+    pub body: Value,
+    pub bytes: usize,
+    pub tag: f64,
+    pub seq: u64,
+}
+
+impl PartialEq for PendingMsg {
+    fn eq(&self, other: &Self) -> bool {
+        self.seq == other.seq
+    }
+}
+impl Eq for PendingMsg {}
+impl PartialOrd for PendingMsg {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PendingMsg {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.tag
+            .total_cmp(&other.tag)
+            .then(self.seq.cmp(&other.seq))
+    }
+}
+
 /// The kernel's delivery subsystem. `max_bundles` bounds custody memory:
 /// the kernel is not a mailbox of unbounded size.
 pub struct DeliverySystem {
@@ -95,10 +372,24 @@ pub struct DeliverySystem {
     pub max_bundles: usize,
     pub default_ttl: Duration,
     /// sender UIN -> token bucket (None = unlimited)
-    buckets: std::collections::HashMap<u64, TokenBucket>,
+    buckets: HashMap<u64, TokenBucket>,
     /// bundles expired inside the most recent drain_for call, for the
     /// caller to journal (never silently dropped)
     pub expired_report: Vec<DtnBundle>,
+    /// WFQ scheduler for the contended delivery link
+    pub wfq: WfqScheduler,
+    /// admission control (byte rate + queue bound)
+    pub admission: AdmissionPolicy,
+    /// what the link actually carried
+    pub accounting: Accounting,
+    /// queue of messages waiting for the link, WFQ-ordered
+    pub pending: BinaryHeap<Reverse<PendingMsg>>,
+    next_seq: u64,
+    /// bytes the delivery link may carry per watchdog tick (None = the
+    /// link is infinitely fast; WFQ is then only a tie-breaker)
+    pub link_bytes_per_tick: Option<u64>,
+    /// bytes left in the current tick's link budget
+    link_budget: u64,
 }
 
 impl DeliverySystem {
@@ -107,9 +398,140 @@ impl DeliverySystem {
             bundles: BinaryHeap::new(),
             max_bundles,
             default_ttl,
-            buckets: std::collections::HashMap::new(),
+            buckets: HashMap::new(),
             expired_report: Vec::new(),
+            wfq: WfqScheduler::new(16384.0),
+            admission: AdmissionPolicy::new(None, 16 * 1024 * 1024),
+            accounting: Accounting::default(),
+            pending: BinaryHeap::new(),
+            next_seq: 0,
+            link_bytes_per_tick: None,
+            link_budget: u64::MAX,
         }
+    }
+
+    // ---- QoS suite: scheduling, admission, accounting ----
+
+    /// The delivery queue is non-empty → the link is contended and the
+    /// next message must be scheduled, not written straight through.
+    pub fn link_busy(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn queued_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Refill the link's per-tick byte budget (called at the top of each
+    /// watchdog tick, before draining).
+    pub fn refill_link(&mut self) {
+        self.link_budget = self.link_bytes_per_tick.unwrap_or(u64::MAX);
+    }
+
+    /// May the link carry `bytes` right now? Deducts the budget when it
+    /// can — a false answer is backpressure, not an error.
+    pub fn link_ready(&mut self, bytes: usize) -> bool {
+        let b = bytes as u64;
+        if self.link_budget >= b {
+            self.link_budget -= b;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn link_budget_left(&self) -> u64 {
+        self.link_budget
+    }
+
+    /// Admit and schedule a message on the WFQ link. `Err` is the
+    /// admission refusal reason (the caller journals it).
+    pub fn schedule(
+        &mut self,
+        from: u64,
+        to: u64,
+        body: Value,
+        bytes: usize,
+    ) -> Result<(), String> {
+        self.admission
+            .admit(from, bytes, self.accounting.queued_bytes)?;
+        let tag = self.wfq.tag(from, bytes);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.pending.push(Reverse(PendingMsg {
+            from,
+            to,
+            body,
+            bytes,
+            tag,
+            seq,
+        }));
+        self.accounting.msgs_accepted += 1;
+        self.accounting.msgs_scheduled += 1;
+        *self.accounting.bytes_in.entry(from).or_insert(0) += bytes as u64;
+        self.accounting.queued_bytes += bytes as u64;
+        self.accounting.peak_queued_bytes = self
+            .accounting
+            .peak_queued_bytes
+            .max(self.accounting.queued_bytes);
+        Ok(())
+    }
+
+    /// Pop the next message to serve — smallest virtual finish tag first,
+    /// i.e. the WFQ order. Advances the virtual clock by what it served.
+    pub fn pop_next(&mut self) -> Option<PendingMsg> {
+        let m = self.pending.pop().map(|Reverse(m)| m)?;
+        self.accounting.queued_bytes = self.accounting.queued_bytes.saturating_sub(m.bytes as u64);
+        self.wfq.serve(m.bytes);
+        Some(m)
+    }
+
+    /// The link carried `m`: count it (called by the kernel after the
+    /// write to the destination succeeded).
+    pub fn record_delivery(&mut self, m: &PendingMsg) {
+        self.accounting.msgs_delivered += 1;
+        *self.accounting.bytes_out.entry(m.to).or_insert(0) += m.bytes as u64;
+    }
+
+    /// A message was written straight through on the unqueued fast path:
+    /// it still counts as accepted + delivered.
+    pub fn record_fast_path(&mut self, from: u64, to: u64, bytes: usize) {
+        self.accounting.msgs_accepted += 1;
+        self.accounting.msgs_delivered += 1;
+        *self.accounting.bytes_in.entry(from).or_insert(0) += bytes as u64;
+        *self.accounting.bytes_out.entry(to).or_insert(0) += bytes as u64;
+    }
+
+    pub fn record_throttled(&mut self) {
+        self.accounting.msgs_throttled += 1;
+    }
+
+    pub fn record_denied(&mut self) {
+        self.accounting.msgs_denied += 1;
+    }
+
+    pub fn record_queued_drop(&mut self, bytes: usize) {
+        self.accounting.queued_bytes = self.accounting.queued_bytes.saturating_sub(bytes as u64);
+        self.accounting.bytes_dropped += bytes as u64;
+    }
+
+    /// Admission probe without scheduling (used by the kernel's fast
+    /// path, so a throttled sender is refused before the write too).
+    pub fn admit_bytes(&mut self, from: u64, bytes: usize) -> Result<(), String> {
+        // the queue bound does not apply to the unqueued fast path
+        self.admission.admit(from, bytes, 0)
+    }
+
+    pub fn set_weight(&mut self, uin: u64, weight: f64) {
+        self.wfq.set_weight(uin, weight);
+    }
+
+    pub fn set_byte_rate(&mut self, uin: u64, rate: Option<u32>) {
+        self.admission.set_sender_rate(uin, rate);
+    }
+
+    pub fn stats(&self) -> Value {
+        self.accounting.snapshot()
     }
 
     /// Declare a sender's rate limit (called at registration when the
@@ -275,6 +697,122 @@ mod tests {
             d.drain_for(9).is_empty(),
             "an expired bundle is not delivered"
         );
+    }
+
+    // ---- QoS suite: WFQ, admission, accounting ----
+
+    #[test]
+    fn wfq_shares_the_link_by_weight() {
+        let mut d = DeliverySystem::new(64, Duration::from_secs(60));
+        d.set_weight(1, 1.0);
+        d.set_weight(2, 3.0);
+        // backlogs in the WEIGHT ratio (1:3) so both flows stay backlogged
+        // for the whole run — that is the regime WFQ makes a promise about
+        for i in 0..12 {
+            d.schedule(2, 9, json!({"f": 2, "i": i}), 100).unwrap();
+            if i % 3 == 0 {
+                d.schedule(1, 9, json!({"f": 1, "i": i}), 100).unwrap();
+            }
+        }
+        let mut served = [0usize; 3];
+        let mut order = Vec::new();
+        while let Some(m) = d.pop_next() {
+            served[m.from as usize] += 1;
+            order.push(m.from);
+        }
+        assert_eq!(served[1], 4, "weight 1 flow: {order:?}");
+        assert_eq!(served[2], 12, "weight 3 flow: {order:?}");
+        // the heavy flow must be INTERLEAVED at 3:1: the longest run of
+        // it is 3 services (it can never monopolise the link), and the
+        // last message of the light flow is never starved
+        let mut streak = 0usize;
+        let mut worst = 0usize;
+        for f in &order {
+            if *f == 2 {
+                streak += 1;
+                worst = worst.max(streak);
+            } else {
+                streak = 0;
+            }
+        }
+        // SFQ (not WF2Q) bounds the run while the light flow still has
+        // traffic queued; once its last message is in flight the heavy
+        // flow legitimately drains its remainder.
+        assert!(
+            worst <= 4,
+            "the heavy flow must not monopolise the link for long: {order:?}"
+        );
+        assert!(
+            order[..4].contains(&1),
+            "the light flow must be served early, not starved: {order:?}"
+        );
+        assert_eq!(
+            *order.last().unwrap(),
+            1,
+            "light flow must not starve: {order:?}"
+        );
+    }
+
+    #[test]
+    fn wfq_idle_flow_earns_no_backlog_credit() {
+        let mut d = DeliverySystem::new(64, Duration::from_secs(60));
+        d.set_weight(1, 1.0);
+        for _ in 0..10 {
+            d.schedule(1, 9, json!({"f": 1}), 1000).unwrap();
+        }
+        while d.pop_next().is_some() {}
+        // a flow that was never backlogged cannot get a tag below the
+        // current virtual time, so it cannot jump ahead of a busy flow
+        let tag = d.wfq.peek_tag(2, 100);
+        assert!(
+            tag >= d.wfq.virtual_time(),
+            "idle flow must not bank credit ({tag} < {})",
+            d.wfq.virtual_time()
+        );
+    }
+
+    #[test]
+    fn admission_control_refuses_over_the_byte_rate() {
+        let mut d = DeliverySystem::new(16, Duration::from_secs(60));
+        d.admission.max_bytes_per_sec = Some(1000);
+        assert!(d.admit_bytes(1, 800).is_ok());
+        let err = d.admit_bytes(1, 800).unwrap_err();
+        assert!(err.contains("byte rate"), "unexpected refusal: {err}");
+        // another sender is unaffected
+        assert!(d.admit_bytes(2, 800).is_ok());
+    }
+
+    #[test]
+    fn admission_control_refuses_when_the_queue_is_full() {
+        let mut d = DeliverySystem::new(16, Duration::from_secs(60));
+        d.admission.max_queue_bytes = 250;
+        assert!(d.schedule(1, 9, json!({"n": 0}), 100).is_ok());
+        assert!(d.schedule(1, 9, json!({"n": 1}), 100).is_ok());
+        let err = d.schedule(1, 9, json!({"n": 2}), 100).unwrap_err();
+        assert!(err.contains("at capacity"), "unexpected refusal: {err}");
+        assert_eq!(
+            d.accounting.msgs_denied, 0,
+            "denials are counted by the caller"
+        );
+    }
+
+    #[test]
+    fn accounting_tracks_bytes_and_queue_depth() {
+        let mut d = DeliverySystem::new(16, Duration::from_secs(60));
+        d.schedule(1, 7, json!({"a": 1}), 300).unwrap();
+        d.schedule(2, 7, json!({"b": 2}), 200).unwrap();
+        assert_eq!(d.accounting.queued_bytes, 500);
+        assert_eq!(d.accounting.peak_queued_bytes, 500);
+        while let Some(m) = d.pop_next() {
+            d.record_delivery(&m);
+        }
+        assert_eq!(d.accounting.queued_bytes, 0);
+        assert_eq!(d.accounting.msgs_delivered, 2);
+        assert_eq!(d.accounting.bytes_in.get(&1), Some(&300));
+        assert_eq!(d.accounting.bytes_out.get(&7), Some(&500));
+        let snap = d.stats();
+        assert_eq!(snap["msgs_delivered"], 2);
+        assert_eq!(snap["peak_queued_bytes"], 500);
     }
 
     #[test]

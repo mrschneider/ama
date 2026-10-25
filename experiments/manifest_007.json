@@ -1,0 +1,39 @@
+{
+  "kernel": {
+    "socket": "/tmp/ama_exp.sock",
+    "ledger": "/tmp/ama_exp/ledger.jsonl",
+    "hb_interval_ms": 150,
+    "hb_timeout_ms": 3000,
+    "max_respawns": 0,
+    "admission_max_queue_bytes": 262144,
+    "wfq_capacity": 512,
+    "link_bytes_per_tick": 200
+  },
+  "agents": [
+    {
+      "name": "light",
+      "task": "experiments/tasks_007/light.json",
+      "qos": {
+        "weight": 1
+      }
+    },
+    {
+      "name": "heavy",
+      "task": "experiments/tasks_007/heavy.json",
+      "qos": {
+        "weight": 3
+      }
+    },
+    {
+      "name": "sink",
+      "task": "experiments/tasks_007/sink.json"
+    },
+    {
+      "name": "big",
+      "task": "experiments/tasks_007/big.json",
+      "qos": {
+        "max_bytes_per_sec": 2000
+      }
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "name": "heavy",
+  "caps": [
+    "send:sink"
+  ],
+  "steps": [
+    {
+      "op": "checkpoint",
+      "state": {
+        "n": 0
+      }
+    },
+    {
+      "op": "sleep",
+      "ms": 1200
+    },
+    {
+      "op": "send",
+      "to": "sink",
+      "body": {
+        "i": 0,
+        "pad": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "op": "send",
+      "to": "sink",
+      "body": {
+        "i": 1,
+        "pad": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "op": "send",
+      "to": "sink",
+      "body": {
+        "i": 2,
+        "pad": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "op": "send",
+      "to": "sink",
+      "body": {
+        "i": 3,
+        "pad": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "op": "send",
+      "to": "sink",
+      "body": {
+        "i": 4,
+        "pad": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "op": "send",
+      "to": "sink",
+      "body": {
+        "i": 5,
+        "pad": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "op": "send",
+      "to": "sink",
+      "body": {
+        "i": 6,
+        "pad": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "op": "send",
+      "to": "sink",
+      "body": {
+        "i": 7,
+        "pad": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "op": "send",
+      "to": "sink",
+      "body": {
+        "i": 8,
+        "pad": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "op": "checkpoint",
+      "state": {
+        "sent": 9
+      }
+    },
+    {
+      "op": "sleep",
+      "ms": 6000
+    }
+  ]
+}
