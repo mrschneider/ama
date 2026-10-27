@@ -574,6 +574,13 @@ impl Kernel {
         self.delivery.lock().unwrap().set_rate(uin, rate);
     }
 
+    /// Bind a name to a UIN without spawning a process. Probes, tests and
+    /// harnesses register hand-built process-table entries through this —
+    /// the by-name map is otherwise reachable only via spawn_agent.
+    pub fn bind_name(&self, name: &str, uin: u64) {
+        self.by_name.lock().unwrap().insert(name.into(), uin);
+    }
+
     /// Spawn an agent process from a manifest entry. The process is the
     /// isolation unit: its own PID, its own ephemeral memory.
     pub fn spawn_agent(&self, name: &str, task_path: &str) -> std::io::Result<()> {
