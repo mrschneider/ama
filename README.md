@@ -8,10 +8,14 @@
 
 AMA is a microkernel for reliable multi-agent systems — a faithful
 translation of the QNX Neutrino microkernel design into the world of AI
-agent execution.
+agent execution. Instead of a framework that trusts agents to behave,
+every agent gets a **hard operating-system boundary**.
 
-Instead of a framework that trusts agents to behave, AMA gives every
-agent a **hard operating-system boundary**:
+<p align="center">
+  <img src="docs/assets/explainer.png" alt="AMA explainer: agents as isolated OS processes talking to the ama-core microkernel (process table, typed IPC router, append-only state ledger) under supervision and recovery, with capability-gated sends, five isolation tiers from OS process to Firecracker microVM, weighted-fair-queueing QoS, and DTN custody for offline agents" width="95%">
+</p>
+
+> **Failures stay isolated · Capabilities gate every send · Recovery uses ledger checkpoints.**
 
 | Agent concern | AMA mechanism |
 |---|---|
@@ -23,7 +27,7 @@ agent a **hard operating-system boundary**:
 
 Everything below is **implemented and verified by running it** — five
 real agent processes, end-to-end experiments, every assertion taken
-from the ledger. See [Verified results](#verified-results).
+from the ledger. See [Proven results](#proven-results-not-promises).
 
 ## Getting started
 
@@ -54,26 +58,13 @@ From source:
 ama serve --manifest manifest.json --agentd ./ama-agentd
 ```
 
-## Contributing & security
-
-- `CONTRIBUTING.md` — the rules of the road: experiments are the
-  executable specification, `cargo fmt`/`clippy -D warnings` are CI-
-  enforced, the kernel stays minimal, refusals are journaled.
-- `SECURITY.md` — how to report vulnerabilities privately, plus the
-  explicit scope and design boundaries of the isolation model.
-- `.github/workflows/ci.yml` — fmt, clippy (debug *and* release),
-  unit tests, and experiments 001–004 + 006 on every push/PR; the
-  microVM experiment is documented but not run in CI (needs `/dev/kvm`).
-- `.github/workflows/release.yml` — tag-driven releases: verify →
-  cross-compile gnu+musl → checksums → GitHub Release.
-
-Then each agent is spawned as its own OS process (`ama-agentd --task
+Each agent then spawns as its own OS process (`ama-agentd --task
 task.json`) and executes its task — `send`, `wait`, `checkpoint`,
 `sleep`, `loop`, `crash` — talking to the kernel and to other agents
 ONLY through typed envelopes. Watch the ledger: every send, refusal,
 kill, respawn and checkpoint is there.
 
-## Why it matters
+## Why AMA
 
 - **Reliability by construction.** A crashed or stuck agent is killed by
   the watchdog and respawned atomically from its ledger checkpoint — it
@@ -216,7 +207,7 @@ capability that previously worked.
 (`note`/`agent_note` events), so agent-visible failures appear in the
 same auditable stream as kernel events.
 
-## Verified results (experiments 001 + 002)
+## Proven results (not promises)
 
 `experiments/experiment_001_isolation.sh` (14 s end-to-end, 5 real
 processes):
@@ -278,7 +269,9 @@ custody for an offline destination), `007_qos_suite` (WFQ weights under
 a contended link, admission control, bandwidth accounting),
 `008_dtn_routing` (two relays, custody acks, fragmentation across hops).
 
-## Deliberately not implemented (v0.5)
+## Deliberately not implemented
+
+Honest boundaries, stated on purpose (v0.5 scope, still current):
 
 - **Trusted execution** — all tiers are host-enforced. A VM booting a
   malicious kernel is not contained (Firecracker assumes a trusted
@@ -298,6 +291,7 @@ a contended link, admission control, bandwidth accounting),
 
 | Version | Highlights |
 |---|---|
+| **v0.7.0** | Hot-path performance: persistent ledger handle, single serialization, merged delivery locks, tail-scan checkpoints, O(1) name lookup, splice/write_envelope JSON |
 | **v0.6.0** | Weighted fair queueing, admission control, bandwidth accounting; DTN multi-hop routing, custody acks, fragmentation |
 | v0.5.0 | Per-sender QoS (token bucket + priority) and DTN store-and-forward custody |
 | v0.4.0 | Protobuf wire, Firecracker microVM tier (one VM per agent), CI + tag-driven releases |
@@ -309,6 +303,19 @@ Assets per release: `ama-x86_64-linux-gnu.tar.gz` and
 `ama-x86_64-linux-musl.tar.gz` plus their `.sha256` checksums. Releases
 are built and verified by CI on the tag (unit tests + experiments
 001–004 and 006).
+
+## Contributing & security
+
+- `CONTRIBUTING.md` — the rules of the road: experiments are the
+  executable specification, `cargo fmt`/`clippy -D warnings` are CI-
+  enforced, the kernel stays minimal, refusals are journaled.
+- `SECURITY.md` — how to report vulnerabilities privately, plus the
+  explicit scope and design boundaries of the isolation model.
+- `.github/workflows/ci.yml` — fmt, clippy (debug *and* release), unit
+  tests, and experiments 001–004 + 006 on every push/PR; the microVM
+  experiment is documented but not run in CI (needs `/dev/kvm`).
+- `.github/workflows/release.yml` — tag-driven releases: verify →
+  cross-compile gnu+musl → checksums → GitHub Release.
 
 ## Layout
 
