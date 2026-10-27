@@ -388,7 +388,9 @@ impl Ledger {
         let stale = match guard.as_ref() {
             Some(f) => {
                 let handle = f.metadata().ok().map(|m| (m.dev(), m.ino()));
-                let on_disk = std::fs::metadata(&self.path).ok().map(|m| (m.dev(), m.ino()));
+                let on_disk = std::fs::metadata(&self.path)
+                    .ok()
+                    .map(|m| (m.dev(), m.ino()));
                 handle != on_disk
             }
             None => true,
@@ -2626,7 +2628,7 @@ mod ledger_perf_tests {
         let ledger2 = Ledger::open(&path).unwrap();
         let e = ledger2.append("event", json!({"i": 100})).unwrap();
         assert_eq!(e.seq, 101); // 100 persisted lines, this is the 101st event
-        // all 101 events parse back
+                                // all 101 events parse back
         let all = ledger2.read_all();
         assert_eq!(all.len(), 101);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2665,9 +2667,7 @@ mod ledger_perf_tests {
             let ledger = Ledger::open(&path).unwrap();
             // checkpoints interleaved with noise; uin 3 checkpoints BEFORE uin 7
             for i in 0..n_events {
-                ledger
-                    .append("noise", json!({"i": i}))
-                    .unwrap();
+                ledger.append("noise", json!({"i": i})).unwrap();
                 if i == n_events / 3 {
                     ledger
                         .append("checkpoint", json!({"uin": 3, "state": {"v": "old"}}))
@@ -2698,8 +2698,12 @@ mod ledger_perf_tests {
             .unwrap();
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(b"{\"seq\":99,\"ts_ms\":1,\"ev\":\"checkpo").unwrap(); // torn
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"{\"seq\":99,\"ts_ms\":1,\"ev\":\"checkpo")
+                .unwrap(); // torn
         }
         assert_eq!(ledger.last_checkpoint(1).unwrap(), json!({"v": "good"}));
         let _ = std::fs::remove_dir_all(&dir);

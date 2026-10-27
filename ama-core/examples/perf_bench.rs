@@ -62,15 +62,22 @@ fn main() {
     // the drainer MUST hold the end of pair 2
     let (a_tx, _a_rx) = UnixStream::pair().unwrap();
     let (b_tx, mut b_rx) = UnixStream::pair().unwrap();
-    k.agents.lock().unwrap().insert(1, fake_entry(1, "perf-a", a_tx));
-    k.agents.lock().unwrap().insert(2, fake_entry(2, "perf-b", b_tx));
+    k.agents
+        .lock()
+        .unwrap()
+        .insert(1, fake_entry(1, "perf-a", a_tx));
+    k.agents
+        .lock()
+        .unwrap()
+        .insert(2, fake_entry(2, "perf-b", b_tx));
     k.bind_name("perf-a", 1);
     k.bind_name("perf-b", 2);
 
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let drainer_done = done.clone();
     let drainer = std::thread::spawn(move || {
-        b_rx.set_read_timeout(Some(std::time::Duration::from_millis(50))).unwrap();
+        b_rx.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
         let mut total = 0usize;
         let mut buf = vec![0u8; 1 << 16];
         loop {
@@ -128,7 +135,10 @@ fn main() {
         let t0 = Instant::now();
         for i in 0..n {
             ledger
-                .append("delivered", json!({"from": 1, "to": 2, "bytes": payload, "body": &body, "i": i}))
+                .append(
+                    "delivered",
+                    json!({"from": 1, "to": 2, "bytes": payload, "body": &body, "i": i}),
+                )
                 .unwrap();
         }
         let dt = t0.elapsed();
@@ -146,7 +156,8 @@ fn main() {
         for i in 0..size {
             l2.append("noise", json!({"i": i})).unwrap();
         }
-        l2.append("checkpoint", json!({"uin": 1, "state": json!({"x": 1})})).unwrap();
+        l2.append("checkpoint", json!({"uin": 1, "state": json!({"x": 1})}))
+            .unwrap();
         let t0 = Instant::now();
         let _ = l2.last_checkpoint(1);
         println!(
