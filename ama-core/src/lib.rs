@@ -42,13 +42,13 @@ pub enum Wire {
 pub fn debug_enabled() -> bool {
     use std::sync::OnceLock;
     static AMA_DEBUG: OnceLock<bool> = OnceLock::new();
-    *AMA_DEBUG.get_or_init(|| debug_enabled())
+    *AMA_DEBUG.get_or_init(|| std::env::var("AMA_DEBUG").is_ok())
 }
 
 pub fn debug_json_enabled() -> bool {
     use std::sync::OnceLock;
     static AMA_DEBUG_JSON: OnceLock<bool> = OnceLock::new();
-    *AMA_DEBUG_JSON.get_or_init(|| debug_json_enabled())
+    *AMA_DEBUG_JSON.get_or_init(|| std::env::var("AMA_DEBUG_JSON").is_ok())
 }
 
 /// Serialize + frame an envelope in the connection's wire format.
