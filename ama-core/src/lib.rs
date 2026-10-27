@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,15 +36,36 @@ pub enum Wire {
     Proto,
 }
 
+/// Debug flags resolved ONCE per process. `std::env::var` on EVERY frame
+/// (the router read loops did this) takes the environ lock and scans the
+/// environment per message — a hot-path syscall-free win for free.
+pub fn debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static AMA_DEBUG: OnceLock<bool> = OnceLock::new();
+    *AMA_DEBUG.get_or_init(|| debug_enabled())
+}
+
+pub fn debug_json_enabled() -> bool {
+    use std::sync::OnceLock;
+    static AMA_DEBUG_JSON: OnceLock<bool> = OnceLock::new();
+    *AMA_DEBUG_JSON.get_or_init(|| debug_json_enabled())
+}
+
 /// Serialize + frame an envelope in the connection's wire format.
 pub fn write_envelope(w: &mut dyn IoWrite, wire: Wire, v: &Value) -> io::Result<()> {
     match wire {
         Wire::Json => {
-            // ONE write() syscall: `writeln!(w, "{v}")` fragments the
-            // Display output byte-by-byte, and two threads sharing one
-            // stream can interleave fragments MID-LINE (seen in the
-            // experiment 003 ledger: heartbeats corrupting checkpoints)
-            w.write_all(format!("{v}\n").as_bytes())?;
+            // ONE write() syscall (writeln! fragments the Display output
+            // byte-by-byte, and two threads sharing one stream interleave
+            // fragments MID-LINE — experiment 003) AND one serialization:
+            // to_writer straight into the frame buffer replaces
+            // format!("{v}\n"), which paid a full Display pass plus a
+            // String allocation per message.
+            let mut buf = Vec::with_capacity(256);
+            serde_json::to_writer(&mut buf, v)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            buf.push(b'\n');
+            w.write_all(&buf)?;
             w.flush()
         }
         Wire::Msgpack => {
@@ -296,8 +318,12 @@ pub struct Ledger {
     path: std::path::PathBuf,
     seq: AtomicU64,
     /// append is called from multiple connection threads — a torn line
-    /// poisons the whole ledger (experiment 003 caught this)
-    write_lock: Mutex<()>,
+    /// poisons the whole ledger (experiment 003 caught this). The writer
+    /// handle is persistent: opening the file on EVERY append cost ~8-18 us
+    /// per event and was roughly HALF the route_send hot-path cost
+    /// (perf_bench measured it). Reopened on demand when the file or its
+    /// parent dir vanish mid-flight.
+    writer: Mutex<Option<std::fs::File>>,
 }
 
 impl Ledger {
@@ -306,8 +332,14 @@ impl Ledger {
             let f = std::fs::File::open(path).ok();
             let mut n = 0u64;
             if let Some(f) = f {
+                // count lines WITHOUT parsing JSON: Ledger::open is O(file)
+                // at startup either way, but parsing every event to count it
+                // made startup several times slower on large ledgers. A torn
+                // line (crash mid-write) costs one off-by-one in seq —
+                // harmless: seq is a monotonic id, nothing correlates it
+                // with the file's line count.
                 for line in BufReader::new(f).lines().map_while(Result::ok) {
-                    if serde_json::from_str::<Value>(&line).is_ok() {
+                    if !line.trim().is_empty() {
                         n += 1;
                     }
                 }
@@ -317,8 +349,19 @@ impl Ledger {
         Ok(Ledger {
             path: path.to_path_buf(),
             seq,
-            write_lock: Mutex::new(()),
+            writer: Mutex::new(None),
         })
+    }
+
+    fn open_handle(&self) -> std::io::Result<std::fs::File> {
+        // the ledger must survive its parent dir being removed mid-flight
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
     }
 
     pub fn append(&self, ev: &str, detail: Value) -> std::io::Result<LedgerEvent> {
@@ -333,18 +376,29 @@ impl Ledger {
             ev: ev.into(),
             detail,
         };
-        let _guard = self.write_lock.lock().unwrap();
-        // the ledger must survive its parent dir being removed mid-flight
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let line = serde_json::to_string(&e).unwrap();
+        let mut guard = self.writer.lock().unwrap();
+        // The cached handle can silently point at an UNLINKED inode: after
+        // the file (or its parent dir) is removed, write() into the still-
+        // open fd SUCCEEDS — into the void. The old open-per-append code
+        // re-detected that implicitly; with a persistent handle the
+        // contract "the ledger survives its parent dir being removed
+        // mid-flight" is enforced here by comparing identities (dev, ino).
+        // One stat per append is far cheaper than the open we removed.
+        let stale = match guard.as_ref() {
+            Some(f) => {
+                let handle = f.metadata().ok().map(|m| (m.dev(), m.ino()));
+                let on_disk = std::fs::metadata(&self.path).ok().map(|m| (m.dev(), m.ino()));
+                handle != on_disk
+            }
+            None => true,
+        };
+        if stale {
+            *guard = Some(self.open_handle()?);
         }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        writeln!(f, "{}", serde_json::to_string(&e).unwrap())?;
-        f.flush()?;
-        drop(_guard);
+        let f = guard.as_mut().unwrap();
+        f.write_all(line.as_bytes())?;
+        f.write_all(b"\n")?;
         Ok(e)
     }
 
@@ -362,14 +416,61 @@ impl Ledger {
     }
 
     /// Last checkpoint recorded for a UIN — the respawn source of truth.
+    ///
+    /// Scans the file BACKWARDS in chunks and returns on the first match:
+    /// the old implementation parsed the WHOLE ledger per call, and this
+    /// sits on the respawn critical path — perf_bench measured 0.7 us/event
+    /// (a 1M-event ledger would pay ~0.7 s per respawn).
     pub fn last_checkpoint(&self, uin: u64) -> Option<Value> {
-        self.read_all()
-            .into_iter()
-            .rev()
-            .find(|e| {
-                e.ev == "checkpoint" && e.detail.get("uin").and_then(Value::as_u64) == Some(uin)
-            })
-            .map(|e| e.detail.get("state").cloned().unwrap_or(Value::Null))
+        use std::io::{Seek, SeekFrom};
+        let mut f = std::fs::File::open(&self.path).ok()?;
+        let len = f.metadata().ok()?.len();
+        const CHUNK: usize = 8192;
+        let mut carry: Vec<u8> = Vec::new(); // tail fragment of a line whose start is in the previous chunk
+        let mut pos = len;
+        while pos > 0 {
+            let take = (CHUNK as u64).min(pos) as usize;
+            pos -= take as u64;
+            f.seek(SeekFrom::Start(pos)).ok()?;
+            let mut chunk = vec![0u8; take];
+            f.read_exact(&mut chunk).ok()?;
+            let segs: Vec<&[u8]> = chunk.split(|&b| b == b'\n').collect();
+            // the chunk's last segment (+ carry from the chunk closer to the
+            // EOF) is the line closest to the end — check it first. A line
+            // longer than CHUNK accumulates in carry across iterations and
+            // assembles correctly here.
+            let mut line = segs[segs.len() - 1].to_vec();
+            line.extend_from_slice(&carry);
+            if let Some(state) = Self::checkpoint_in_line(&line, uin) {
+                return Some(state);
+            }
+            // then the chunk's complete lines, nearest-EOF first
+            for s in segs[1..segs.len() - 1].iter().rev() {
+                if let Some(state) = Self::checkpoint_in_line(s, uin) {
+                    return Some(state);
+                }
+            }
+            carry = segs[0].to_vec();
+        }
+        // pos == 0: carry now holds the file's FIRST line (it starts at byte
+        // 0, so it needs no head from anywhere). If the first line spanned
+        // chunks it was already assembled and checked as the boundary line.
+        if let Some(state) = Self::checkpoint_in_line(&carry, uin) {
+            return Some(state);
+        }
+        None
+    }
+
+    fn checkpoint_in_line(line: &[u8], uin: u64) -> Option<Value> {
+        if !line.contains(&b'"') {
+            return None; // fast reject: no JSON at all (empty segment, newline)
+        }
+        let e: LedgerEvent = serde_json::from_slice(line).ok()?;
+        if e.ev == "checkpoint" && e.detail.get("uin").and_then(Value::as_u64) == Some(uin) {
+            Some(e.detail.get("state").cloned().unwrap_or(Value::Null))
+        } else {
+            None
+        }
     }
 }
 
@@ -534,12 +635,14 @@ impl Kernel {
 
     /// Reverse lookup: the destination's NAME — what a relay echoes back
     /// when it forwards the bundle (a relay never sees the kernel's UINs).
+    /// O(1) via the process table: the entry already stores the name (the
+    /// old path scanned the whole by_name map per call — O(n) on a hot
+    /// routing path).
     fn name_of(&self, uin: u64) -> Option<String> {
-        let by_name = self.by_name.lock().unwrap();
-        by_name
-            .iter()
-            .find(|(_, u)| **u == uin)
-            .map(|(n, _)| n.clone())
+        let agents = self.agents.lock().unwrap();
+        let e = agents.get(&uin)?;
+        let name = e.lock().unwrap().name.clone();
+        Some(name)
     }
 
     /// Hand custody of `b` to its next hop (a relay agent) as a `bundle`
@@ -662,14 +765,14 @@ impl Kernel {
         // microVM: the guest's SERIAL CONSOLE is firecracker's STDOUT —
         // nulling it discards the only window into the VM (and the
         // guest agentd's panics); capture it with the stderr file
-        if microvm && std::env::var("AMA_DEBUG").is_ok() {
+        if microvm && debug_enabled() {
             // stdout follows the debug path chosen below (set after)
         } else {
             cmd.stdout(Stdio::null());
         }
         // debug mode: keep agent stderr in a per-agent file (watchdog
         // forensics) instead of dropping it
-        if std::env::var("AMA_DEBUG").is_ok() {
+        if debug_enabled() {
             let p = std::path::PathBuf::from(format!(
                 "/tmp/ama_dbg_agent_{}.stderr",
                 self.next_uin.load(Ordering::SeqCst)
@@ -775,41 +878,61 @@ impl Kernel {
             .copied()
             .ok_or_else(|| format!("unknown agent '{to}'"))?;
 
-        let bytes = serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0);
+        // ONE serialization: the encoded body doubles as the byte count for
+        // admission AND, on the JSON fast path, is spliced into the frame
+        // directly (route_send used to serialize the body a second time
+        // inside write_envelope — the body went through serde_json twice
+        // per message).
+        let body_encoded = serde_json::to_vec(body).unwrap_or_default();
+        let bytes = body_encoded.len();
 
-        // ADMISSION CONTROL first: byte rate + queue bound. A refused
-        // message never enters the kernel (journaled, never silent).
+        // ADMISSION + QoS in ONE locked pass: admit (byte rate + queue
+        // bound), then the sender's token bucket. A refused message never
+        // enters the kernel (journaled, never silent). The old code took
+        // this mutex up to four separate times per send; three of those
+        // acquisitions (and the refused-path's second and fourth) were
+        // pure churn.
         // NOTE: the guard must be scoped — a MutexGuard held by an
         // `if let` scrutinee lives to the end of the whole `if let`
         // statement, and re-locking inside the block self-deadlocks
         // (std Mutex is not reentrant; this hung the kernel once).
-        let admission = {
-            let mut d = self.delivery.lock().unwrap();
-            d.admit_bytes(from, bytes)
-        };
-        if let Err(reason) = admission {
-            self.delivery.lock().unwrap().record_denied();
-            self.ledger
-                .append(
-                    "admission_denied",
-                    json!({"from": from, "to": uin, "bytes": bytes, "reason": reason}),
-                )
-                .map_err(|e| e.to_string())?;
-            return Err(format!("admission: {reason}"));
+        enum Gate {
+            Denied(String),
+            Throttled,
+            Ok,
         }
-
-        // QoS gate: a rate-limited sender is throttled even when
-        // the destination is up — backpressure before entry, not after.
-        let allowed = { self.delivery.lock().unwrap().allow(from) };
-        if !allowed {
-            self.delivery.lock().unwrap().record_throttled();
-            self.ledger
-                .append(
-                    "qos_throttled",
-                    json!({"from": from, "to": uin, "body": body}),
-                )
-                .map_err(|e| e.to_string())?;
-            return Err(format!("qos: sender {from} over its rate limit"));
+        let gate = {
+            let mut d = self.delivery.lock().unwrap();
+            if let Err(reason) = d.admit_bytes(from, bytes) {
+                d.record_denied();
+                Gate::Denied(reason)
+            } else if !d.allow(from) {
+                d.record_throttled();
+                Gate::Throttled
+            } else {
+                Gate::Ok
+            }
+        };
+        match gate {
+            Gate::Denied(reason) => {
+                self.ledger
+                    .append(
+                        "admission_denied",
+                        json!({"from": from, "to": uin, "bytes": bytes, "reason": reason}),
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Err(format!("admission: {reason}"));
+            }
+            Gate::Throttled => {
+                self.ledger
+                    .append(
+                        "qos_throttled",
+                        json!({"from": from, "to": uin, "body": body}),
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Err(format!("qos: sender {from} over its rate limit"));
+            }
+            Gate::Ok => {}
         }
 
         let (wire, w, dest_priority, dest_dtn, deliverable): (Wire, Option<Peer>, u8, bool, bool) = {
@@ -851,20 +974,24 @@ impl Kernel {
             });
         }
 
-        // SCHEDULING: while the link is idle a connected destination is
-        // served straight through (work-conserving, zero added latency).
-        // Under contention the message joins the WFQ queue and the
-        // watchdog's tick serves it by virtual finish tag — weight, not
-        // arrival order, decides who gets the link.
-        let go_fast = {
+        // SCHEDULING in ONE locked pass: while the link is idle a connected
+        // destination is served straight through (work-conserving, zero
+        // added latency). Under contention the message joins the WFQ queue
+        // and the watchdog's tick serves it by virtual finish tag — weight,
+        // not arrival order, decides who gets the link. The old code took
+        // the delivery mutex twice here (check, then schedule).
+        let scheduled = {
             let mut d = self.delivery.lock().unwrap();
-            !d.link_busy() && d.link_ready(bytes)
+            if !d.link_busy() && d.link_ready(bytes) {
+                None
+            } else {
+                match d.schedule(from, uin, body.clone(), bytes) {
+                    Ok(()) => Some(()),
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
         };
-        if !go_fast {
-            let mut d = self.delivery.lock().unwrap();
-            d.schedule(from, uin, body.clone(), bytes)
-                .map_err(|e| e.to_string())?;
-            drop(d);
+        if scheduled.is_some() {
             self.ledger
                 .append(
                     "qos_scheduled",
@@ -875,9 +1002,24 @@ impl Kernel {
         }
 
         let mut w = w.ok_or_else(|| format!("agent '{to}' has no connection"))?;
-        let msg = json!({"kind": "msg", "from": from, "body": body});
         let w_ref: &mut dyn IoWrite = &mut w;
-        write_envelope(w_ref, wire, &msg).map_err(|e| e.to_string())?;
+        // JSON fast path: splice the envelope around the ALREADY-ENCODED
+        // body — no second serialization, no envelope-Value clone. Binary
+        // wires keep write_envelope (msgpack can't be spliced).
+        let write_res = if wire == Wire::Json && !body_encoded.is_empty() {
+            let mut frame = Vec::with_capacity(bytes + 48);
+            frame.extend_from_slice(b"{\"kind\":\"msg\",\"from\":");
+            frame.extend_from_slice(from.to_string().as_bytes());
+            frame.extend_from_slice(b",\"body\":");
+            frame.extend_from_slice(&body_encoded);
+            frame.push(b'}');
+            frame.push(b'\n');
+            w_ref.write_all(&frame).and_then(|_| w_ref.flush())
+        } else {
+            let msg = json!({"kind": "msg", "from": from, "body": body});
+            write_envelope(w_ref, wire, &msg)
+        };
+        write_res.map_err(|e| e.to_string())?;
         self.delivery
             .lock()
             .unwrap()
@@ -1692,7 +1834,7 @@ impl Router {
                 }
             }
         };
-        if std::env::var("AMA_DEBUG").is_ok() {
+        if debug_enabled() {
             eprintln!("[proto_loop] first frame: {v}");
         }
         loop {
@@ -1708,7 +1850,7 @@ impl Router {
             }
             match read_proto_frame(&mut peer) {
                 Ok(v2) => {
-                    if std::env::var("AMA_DEBUG").is_ok() {
+                    if debug_enabled() {
                         eprintln!("[proto_loop] next frame: {v2}");
                     }
                     v = v2;
@@ -1721,7 +1863,7 @@ impl Router {
 
     fn msgpack_loop(kernel: Arc<Kernel>, mut peer: Peer, _first_magic_seen: bool) -> Option<u64> {
         let mut my_uin: Option<u64> = None;
-        if std::env::var("AMA_DEBUG").is_ok() {
+        if debug_enabled() {
             eprintln!("[msgpack_loop] entered");
         }
         // first frame: the magic byte was already consumed
@@ -1760,7 +1902,7 @@ impl Router {
             }
             match read_msgpack_frame(&mut peer) {
                 Ok(v2) => {
-                    if std::env::var("AMA_DEBUG").is_ok() {
+                    if debug_enabled() {
                         eprintln!("[msgpack_loop] next frame: {v2}");
                     }
                     v = v2;
@@ -1784,12 +1926,12 @@ impl Router {
         // prepending a second brace produced `{{kind` → "key must be a
         // string" (caught by experiment 003)
         let first = line.trim_end().to_string();
-        if std::env::var("AMA_DEBUG_JSON").is_ok() {
+        if debug_json_enabled() {
             eprintln!("[json_loop] first line = {first:?}");
         }
         let mut v = match serde_json::from_str::<Value>(&first) {
             Ok(v) => {
-                if std::env::var("AMA_DEBUG").is_ok() {
+                if debug_enabled() {
                     eprintln!("[json_loop] first frame: {v}");
                 }
                 v
@@ -1821,12 +1963,12 @@ impl Router {
                 Ok(true) => {}
                 _ => break, // EOF: process gone
             }
-            if std::env::var("AMA_DEBUG_JSON").is_ok() {
+            if debug_json_enabled() {
                 eprintln!("[json_loop] line = {:?}", line.trim_end());
             }
             match serde_json::from_str::<Value>(line.trim_end()) {
                 Ok(v2) => {
-                    if std::env::var("AMA_DEBUG").is_ok() {
+                    if debug_enabled() {
                         eprintln!("[json_loop] frame: {v2}");
                     }
                     v = v2;
@@ -1869,7 +2011,7 @@ impl Router {
                     "ctl_ps" => {
                         let dump = kernel.ps_dump();
                         let reply = json!({"kind": "ps", "agents": dump});
-                        if std::env::var("AMA_DEBUG_JSON").is_ok() {
+                        if debug_json_enabled() {
                             eprintln!("[ctl_ps] reply = {reply}");
                         }
                         write_envelope(writer, wire, &reply).map_err(|e| e.to_string())?;
@@ -2463,5 +2605,103 @@ mod json_peer_tests {
         line.clear();
         assert!(peer.read_line_after(&mut line).unwrap());
         assert_eq!(line, "{\"y\": 2}");
+    }
+}
+
+#[cfg(test)]
+mod ledger_perf_tests {
+    use super::*;
+
+    #[test]
+    fn append_roundtrip_and_persistent_handle() {
+        let dir = std::env::temp_dir().join(format!("ama-ledger-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.jsonl");
+        let ledger = Ledger::open(&path).unwrap();
+        for i in 0..100 {
+            ledger.append("event", json!({"i": i})).unwrap();
+        }
+        // reopen from scratch: seq continues past the persisted lines
+        let ledger2 = Ledger::open(&path).unwrap();
+        let e = ledger2.append("event", json!({"i": 100})).unwrap();
+        assert_eq!(e.seq, 101); // 100 persisted lines, this is the 101st event
+        // all 101 events parse back
+        let all = ledger2.read_all();
+        assert_eq!(all.len(), 101);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_survives_parent_dir_removal_midflight() {
+        // the documented contract: the ledger must survive its parent dir
+        // being removed mid-flight. The persistent handle makes this a
+        // reopen-on-write-error path — this test IS the contract.
+        let dir = std::env::temp_dir().join(format!("ama-ledger-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.jsonl");
+        let ledger = Ledger::open(&path).unwrap();
+        ledger.append("warmup", json!({"n": 0})).unwrap();
+        // the handle is now open and cached; destroy the directory anyway
+        std::fs::remove_dir_all(&dir).unwrap();
+        let e = ledger.append("after_removal", json!({"n": 1})).unwrap();
+        assert!(e.seq >= 1);
+        // the file is back, and the event is IN it
+        let all = Ledger::open(&path).unwrap().read_all();
+        assert!(all.iter().any(|x| x.ev == "after_removal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_checkpoint_matches_full_scan() {
+        // the tail-scan must agree with a brute-force reverse scan for
+        // LAST-wins semantics, across sizes that cross the 8 KB chunk
+        let dir = std::env::temp_dir().join(format!("ama-ledger-cp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n_events in [5usize, 300, 1200] {
+            let path = dir.join(format!("cp{n_events}.jsonl"));
+            let ledger = Ledger::open(&path).unwrap();
+            // checkpoints interleaved with noise; uin 3 checkpoints BEFORE uin 7
+            for i in 0..n_events {
+                ledger
+                    .append("noise", json!({"i": i}))
+                    .unwrap();
+                if i == n_events / 3 {
+                    ledger
+                        .append("checkpoint", json!({"uin": 3, "state": {"v": "old"}}))
+                        .unwrap();
+                }
+                if i == n_events - 2 {
+                    ledger
+                        .append("checkpoint", json!({"uin": 3, "state": {"v": "latest"}}))
+                        .unwrap();
+                    ledger
+                        .append("checkpoint", json!({"uin": 9, "state": {"v": "other"}}))
+                        .unwrap();
+                }
+            }
+            let got = ledger.last_checkpoint(3).unwrap();
+            assert_eq!(got, json!({"v": "latest"}), "n_events={n_events}");
+            assert_eq!(
+                ledger.last_checkpoint(7),
+                None,
+                "uin without a checkpoint must be None, n_events={n_events}"
+            );
+        }
+        // torn final line (crash mid-write): the tail-scan must skip it
+        let path = dir.join("torn.jsonl");
+        let ledger = Ledger::open(&path).unwrap();
+        ledger
+            .append("checkpoint", json!({"uin": 1, "state": {"v": "good"}}))
+            .unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"{\"seq\":99,\"ts_ms\":1,\"ev\":\"checkpo").unwrap(); // torn
+        }
+        assert_eq!(ledger.last_checkpoint(1).unwrap(), json!({"v": "good"}));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
