@@ -35,6 +35,9 @@ jobs:
       - run: bash experiments/experiment_007_qos_suite.sh
       - run: pkill -9 -x ama || true; pkill -9 -x ama-agentd || true; sleep 1
       - run: bash experiments/experiment_008_dtn_routing.sh
+      - run: pkill -9 -x ama || true; pkill -9 -x ama-agentd || true; sleep 1
+      # release gates cover the same security contract as PR CI (F10)
+      - run: bash experiments/experiment_009_authority.sh
 
   dist:
     name: dist (${{ matrix.target }})

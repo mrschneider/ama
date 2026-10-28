@@ -60,8 +60,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
       # Kernel behaviour (isolation, watchdog, recovery, hot caps, seccomp
-      # jails, TCP transports, three wire formats) — needs a real Linux
-      # process model and seccomp, so these only run on ubuntu runners.
+      # jails, TCP transports, three wire formats, AUTHORITY) — needs a
+      # real Linux process model and seccomp, so these only run on ubuntu
+      # runners. 009 is the security contract: operator credential, the
+      # ctl door's pid gate, per-instance registration tokens, and the
+      # omitted-policy default — every check fails closed.
       - run: bash experiments/experiment_001_isolation.sh
       - run: bash experiments/experiment_002_caps_seccomp.sh
       - run: bash experiments/experiment_003_transports.sh
@@ -81,5 +84,13 @@ jobs:
           pkill -9 -x ama-agentd || true
           sleep 1
           bash experiments/experiment_008_dtn_routing.sh
+      # F10: the authority contract runs against the BUILT binaries like
+      # every other experiment — a deliberately introduced authorization
+      # bypass (skip the token check, drop the pid gate) fails here
+      - run: |
+          pkill -9 -x ama || true
+          pkill -9 -x ama-agentd || true
+          sleep 1
+          bash experiments/experiment_009_authority.sh
       # experiment_005_microvm is intentionally excluded: it requires
       # /dev/kvm, which GitHub-hosted runners do not expose.
