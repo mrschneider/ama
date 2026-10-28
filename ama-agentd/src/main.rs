@@ -274,7 +274,11 @@ fn main() {
         let mut deferred: Vec<Value> = Vec::new();
         let mut polls: u64 = 0;
         let w = loop {
-            match inbox.lock().unwrap().pop_front() {
+            // pop into a local: the guard drops at the end of THIS
+            // statement, never during the sleep below (holding it across
+            // the sleep starved the reader thread — see header comment)
+            let got = inbox.lock().unwrap().pop_front();
+            match got {
                 Some(v) => {
                     if v.get("kind").and_then(Value::as_str) == Some("welcome") {
                         break v;
@@ -408,7 +412,8 @@ fn main() {
                 let deadline = std::time::Instant::now() + Duration::from_millis(*timeout_ms);
                 let mut bundle: Option<Value> = None;
                 while std::time::Instant::now() < deadline {
-                    if let Some(v) = inbox.lock().unwrap().pop_front() {
+                    let got = inbox.lock().unwrap().pop_front();
+                    if let Some(v) = got {
                         if v.get("kind").and_then(Value::as_str) == Some("bundle") {
                             bundle = Some(v);
                             break;
@@ -459,7 +464,8 @@ fn main() {
             Step::Wait => {
                 phase.store(1, Ordering::SeqCst);
                 loop {
-                    if let Some(v) = inbox.lock().unwrap().pop_front() {
+                    let got = inbox.lock().unwrap().pop_front();
+                    if let Some(v) = got {
                         if v.get("kind").and_then(Value::as_str) == Some("msg") {
                             break;
                         }
