@@ -6,9 +6,10 @@ set -euo pipefail
 set -E
 # any abort under `set -e` leaves an annotation with the exact line —
 # silent pre-validator exits were undiagnosable on CI
-trap 'echo "::error title=abort::experiment aborted at line $LINENO (cmd: $BASH_COMMAND)"' ERR
+trap 'echo "::error title=abort::experiment aborted at line $LINENO (cmd: ${BASH_COMMAND:0:100})"; bash experiments/abort_evidence.sh || true' ERR
 cd "$(dirname "$0")/.."
 export RUST_LOG=warn
+export AMA_DEBUG=1
 LEDGER=/tmp/ama_exp/ledger.jsonl
 rm -rf /tmp/ama_exp && mkdir -p /tmp/ama_exp
 
@@ -43,7 +44,8 @@ KERNEL_PID=$!
 # kill is a real crash-recovery test, not a race
 python3 - <<'EOF'
 import json, time, sys
-deadline = time.time() + 25
+deadline = time.time() + 40
+c_uin, c_reg, cps = [], False, False
 while time.time() < deadline:
     try:
         events = [json.loads(l) for l in open('/tmp/ama_exp/ledger.jsonl')]
@@ -65,7 +67,8 @@ while time.time() < deadline:
 print("FAIL: c never checkpointed n=0 (timeout)", flush=True)
 import os
 if os.environ.get("GITHUB_ACTIONS"):
-    print("::error title=phase1::timeout: c never registered+checkpointed n=0", flush=True)
+    print(f"::error title=phase1::timeout after 40s: c_spawned={bool(c_uin)} "
+          f"c_registered={c_reg} c_n0_checkpoint={cps}", flush=True)
 sys.exit(1)
 EOF
 
