@@ -870,6 +870,12 @@ impl Ledger {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProcState {
+    /// F05(item 5): a launch is PENDING — spawned (initially or as a
+    /// replacement) but not yet registered. Only `Starting` and
+    /// `Registered` are subject to the registration deadline, and a
+    /// pending entry never counts as "live" for connection-close
+    /// purposes (that is what prevents the duplicate-respawn race).
+    Starting,
     Registered,
     Running,
     Completed,
@@ -1300,7 +1306,7 @@ impl Kernel {
             spawned_at: Instant::now(),
             granted: Vec::new(),
             revoked: Vec::new(),
-            state: ProcState::Registered,
+            state: ProcState::Starting,
             last_hb: Instant::now(),
             last_step: String::new(),
             last_phase: "executing".into(),
@@ -1923,6 +1929,7 @@ impl Kernel {
                 json!({
                     "uin": e.uin, "name": e.name, "pid": e.pid,
                     "state": match &e.state {
+                        ProcState::Starting => "starting",
                         ProcState::Registered => "registered",
                         ProcState::Running => "running",
                         ProcState::Completed => "completed",
@@ -1965,11 +1972,16 @@ impl Kernel {
                 None => return,
             }
         };
-        let _ = Command::new("kill")
-            .args(["-9", &child_pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // A valid PID to signal must be strictly positive and fit in a signed 32-bit pid_t.
+        // Signaling 0 kills the process group; signaling -1 (or u32::MAX which wraps to -1 as pid_t)
+        // broadcasts SIGKILL to all processes belonging to the user slice.
+        if child_pid > 0 && (child_pid as i32) > 0 && child_pid != u32::MAX {
+            let _ = Command::new("kill")
+                .args(["-9", &child_pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         self.ledger
             .append(
                 "killed",
@@ -2081,9 +2093,17 @@ impl Kernel {
             if self.apply_cgroups {
                 let _ = sandbox::apply_cgroup(pid, &name);
             }
-            // KEEP the state (Killed) until the fresh instance registers —
-            // resetting to Registered here let the OLD process's EOF race
-            // in and trigger a SECOND respawn (seen in the 003 ledger)
+            // F05(item 5): the replacement is an explicit PENDING
+            // launch — `Starting` is covered by the registration
+            // deadline (keeping `Killed` here let a replacement that
+            // never registers escape it forever) and is NOT "live" for
+            // connection-close, which is what actually prevented the
+            // duplicate-respawn race the old hack was guarding (the
+            // stale EOF of the OLD instance now hits the live-set check
+            // and does nothing). Clearing `out` says the same thing:
+            // a pending launch has no connection.
+            e.state = ProcState::Starting;
+            e.out = None;
             e.last_hb = Instant::now();
             e.last_step = String::new();
             e.stuck_sweeps = 0;
@@ -2100,6 +2120,36 @@ impl Kernel {
         self.ledger
             .append("respawned", json!({"uin": uin, "name": name, "pid": pid}))
             .ok();
+    }
+
+    /// F05(item 5): one connection went away. The judgement is an
+    /// EXPLICIT live-set (Registered | Running), not a negated
+    /// judged-set: a PENDING launch (`Starting`) is the OLD instance's
+    /// closing connection racing its own replacement, and reacting to
+    /// it would trigger the duplicate respawn this state exists to
+    /// prevent (the 003-ledger race).
+    fn connection_closed(&self, my_uin: Option<u64>) {
+        let Some(uin) = my_uin else {
+            return;
+        };
+        let live = {
+            let agents = self.agents.lock().unwrap();
+            match agents.get(&uin) {
+                Some(e) => {
+                    let mut e = e.lock().unwrap();
+                    let was_live = matches!(e.state, ProcState::Registered | ProcState::Running);
+                    if was_live {
+                        e.state = ProcState::Killed("process exited".into());
+                    }
+                    was_live
+                }
+                None => false,
+            }
+        };
+        if live {
+            self.ledger.append("crashed", json!({"uin": uin})).ok();
+            self.respawn(uin);
+        }
     }
 
     /// F10: operator-authorized restart of an entry that is NOT live.
@@ -2129,7 +2179,7 @@ impl Kernel {
             drop(agents);
             // a stale process must not survive into the new launch: two
             // processes for one uin is exactly what the table forbids
-            if !judged && stale_pid != 0 {
+            if !judged && stale_pid > 0 && (stale_pid as i32) > 0 && stale_pid != u32::MAX {
                 let _ = Command::new("kill")
                     .args(["-9", &stale_pid.to_string()])
                     .stdout(Stdio::null())
@@ -2158,7 +2208,10 @@ impl Kernel {
                     if e.out.is_none() {
                         let reg_ms =
                             (self.hb_timeout_ms * REGISTRATION_DEADLINE_FACTOR).max(10_000);
-                        if matches!(e.state, ProcState::Registered)
+                        // F05(item 5): BOTH the initial launch and a
+                        // replacement are `Starting` — the deadline is
+                        // per-launch (spawned_at is reset on respawn)
+                        if matches!(e.state, ProcState::Starting | ProcState::Registered)
                             && e.spawned_at.elapsed().as_millis() as u64 > reg_ms
                         {
                             return Some((
@@ -2531,31 +2584,9 @@ impl Router {
         // reader gone: stop feeding the writer (queued frames are dropped
         // with the connection)
         out.close();
-        // EOF: if this connection belonged to a live agent, the process is
-        // gone — fail fast, respawn from the ledger.
-        if let Some(uin) = my_uin {
-            let live = {
-                let agents = kernel.agents.lock().unwrap();
-                match agents.get(&uin) {
-                    Some(e) => {
-                        let mut e = e.lock().unwrap();
-                        let was_live = !matches!(
-                            e.state,
-                            ProcState::Killed(_) | ProcState::Dead | ProcState::Completed
-                        );
-                        if was_live {
-                            e.state = ProcState::Killed("process exited".into());
-                        }
-                        was_live
-                    }
-                    None => false,
-                }
-            };
-            if live {
-                kernel.ledger.append("crashed", json!({"uin": uin})).ok();
-                kernel.respawn(uin);
-            }
-        }
+        // EOF: if this connection belonged to a live agent, the process
+        // is gone — fail fast, respawn from the ledger.
+        kernel.connection_closed(my_uin);
     }
 
     fn proto_loop(kernel: Arc<Kernel>, mut peer: Peer, out: &Arc<Outbound>) -> Option<u64> {
@@ -3282,7 +3313,7 @@ impl Router {
                 e.last_step = step;
                 e.last_phase = phase;
                 e.last_hb = Instant::now();
-                if e.state == ProcState::Registered {
+                if matches!(e.state, ProcState::Starting | ProcState::Registered) {
                     e.state = ProcState::Running;
                 }
                 Ok(())
@@ -4370,5 +4401,247 @@ mod f04_ledger_tail_tests {
         let res = Ledger::open(&dir);
         assert!(res.is_err(), "a failed repair must be an Err, not Ok");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod f05_launch_deadline_tests {
+    //! Item 5 gates: a pending launch (initial OR replacement) that
+    //! never registers is judged by the deadline, and a stale
+    //! connection close cannot restart a pending launch.
+
+    use super::*;
+
+    fn temp_kernel(tag: &str) -> (Kernel, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ama-f05-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let k = Kernel::new(
+            &dir.join("k.sock"),
+            &dir.join("ledger.jsonl"),
+            "/bin/true", // respawn's spawn "succeeds" without real agents
+            150,
+            5000,
+            2,
+        )
+        .unwrap();
+        (k, dir)
+    }
+
+    /// A pending entry: no connection, a pid that cannot signal
+    /// anything real (u32::MAX is outside the default pid_max), and a
+    /// launch time the test controls.
+    fn pending(state: ProcState, spawned_ago: Duration) -> ProcEntry {
+        ProcEntry {
+            uin: 7,
+            name: "wedged".into(),
+            pid: u32::MAX,
+            caps: Vec::new(),
+            tcp_addr: None,
+            spawned_at: Instant::now() - spawned_ago,
+            manifest_caps: Some(Vec::new()),
+            auth_token: Some("tok".into()),
+            granted: Vec::new(),
+            revoked: Vec::new(),
+            state,
+            last_hb: Instant::now(),
+            last_step: String::new(),
+            last_phase: String::new(),
+            stuck_sweeps: 0,
+            respawns: 0,
+            last_checkpoint: None,
+            task_path: "tasks/wedged.json".into(),
+            out: None,
+            wire: Wire::Json,
+            isolation: None,
+            priority: 5,
+            dtn: false,
+        }
+    }
+
+    fn insert(k: &Kernel, e: ProcEntry) {
+        let uin = e.uin;
+        k.agents
+            .lock()
+            .unwrap()
+            .insert(uin, Arc::new(Mutex::new(e)));
+        k.by_name.lock().unwrap().insert("wedged".into(), uin);
+    }
+
+    fn kinds(k: &Kernel) -> Vec<String> {
+        k.ledger.read_all().iter().map(|e| e.ev.clone()).collect()
+    }
+
+    fn reason_of(k: &Kernel, ev: &str) -> Option<String> {
+        k.ledger.read_all().iter().find(|e| e.ev == ev).map(|e| {
+            e.detail
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+    }
+
+    /// Grace first: a fresh pending launch is NOT judged before its
+    /// per-launch deadline (spawned_at + 3x hb, floor 10s).
+    #[test]
+    fn a_fresh_pending_launch_is_not_judged() {
+        let (k, _dir) = temp_kernel("grace");
+        insert(&k, pending(ProcState::Starting, Duration::from_millis(0)));
+        k.sweep();
+        let _agents = k.agents.lock().unwrap();
+        let e = _agents[&7].lock().unwrap();
+        assert!(
+            matches!(e.state, ProcState::Starting),
+            "untouched: {:?}",
+            e.state
+        );
+        assert_eq!(e.respawns, 0);
+        assert!(
+            kinds(&k).is_empty(),
+            "no judgement journaled: {:?}",
+            kinds(&k)
+        );
+    }
+
+    /// THE FIX: a REPLACEMENT launch (state `Starting`, no connection,
+    /// spawned_at reset by respawn) that never registers hits the SAME
+    /// deadline the initial launch does — killed with the reason and
+    /// respawned within budget. Before this change respawn left the
+    /// entry in `Killed`, whose branch the deadline never matched: the
+    /// replacement escaped it forever.
+    #[test]
+    fn a_replacement_that_never_registers_hits_the_deadline() {
+        let (k, _dir) = temp_kernel("replacement");
+        insert(&k, pending(ProcState::Starting, Duration::from_secs(60)));
+        k.sweep();
+        let ks = kinds(&k);
+        assert!(ks.contains(&"killed".to_string()), "journaled: {ks:?}");
+        assert!(
+            reason_of(&k, "killed")
+                .unwrap()
+                .contains("registration deadline"),
+            "reason: {:?}",
+            reason_of(&k, "killed")
+        );
+        // the failed launch CONSUMED budget and the retry is pending
+        let _agents = k.agents.lock().unwrap();
+        let e = _agents[&7].lock().unwrap();
+        assert_eq!(e.respawns, 1, "each failed launch counts once");
+        assert!(
+            matches!(e.state, ProcState::Starting),
+            "retry is pending: {:?}",
+            e.state
+        );
+        assert!(e.out.is_none(), "a pending launch has no connection");
+    }
+
+    /// The initial launch takes the same path (both pending kinds are
+    /// covered by one branch — this pins the OTHER caller of it).
+    #[test]
+    fn an_initial_launch_that_never_registers_hits_the_deadline() {
+        let (k, _dir) = temp_kernel("initial");
+        // spawn_agent_opts starts entries at Starting; age it as if the
+        // boot wedged for a minute
+        insert(&k, pending(ProcState::Starting, Duration::from_secs(60)));
+        k.sweep();
+        assert!(
+            kinds(&k).contains(&"killed".to_string())
+                && kinds(&k).contains(&"respawned".to_string()),
+            "killed + respawned: {:?}",
+            kinds(&k)
+        );
+    }
+
+    /// End-to-end through the REAL respawn path (not a hand-built
+    /// state): respawn produces a pending launch, and only after the
+    /// deadline does the sweep judge it.
+    #[test]
+    fn respawn_output_is_pending_until_its_deadline() {
+        let (k, _dir) = temp_kernel("respawn");
+        let mut e = pending(
+            ProcState::Killed("process exited".into()),
+            Duration::from_secs(60),
+        );
+        e.out = None;
+        insert(&k, e);
+
+        k.respawn(7); // the real replacement launch
+        {
+            let _agents = k.agents.lock().unwrap();
+            let e = _agents[&7].lock().unwrap();
+            assert!(
+                matches!(e.state, ProcState::Starting),
+                "respawn is PENDING: {:?}",
+                e.state
+            );
+            assert!(e.out.is_none(), "pending launches hold no connection");
+            assert_eq!(e.respawns, 1);
+        }
+        // fresh launch time: not judged yet
+        k.agents.lock().unwrap()[&7].lock().unwrap().spawned_at = Instant::now();
+        k.sweep();
+        assert!(
+            !kinds(&k).contains(&"killed".to_string()),
+            "grace: {:?}",
+            kinds(&k)
+        );
+        // ...and judged once the deadline passes
+        k.agents.lock().unwrap()[&7].lock().unwrap().spawned_at =
+            Instant::now() - Duration::from_secs(60);
+        k.sweep();
+        assert!(
+            kinds(&k).contains(&"killed".to_string()),
+            "deadline: {:?}",
+            kinds(&k)
+        );
+    }
+
+    /// Stale-EOF protection (the reason the old code kept `Killed`):
+    /// the OLD instance's connection closing while its replacement is
+    /// pending must NOT journal a crash or trigger a second respawn.
+    #[test]
+    fn a_stale_connection_close_does_not_restart_a_pending_launch() {
+        let (k, _dir) = temp_kernel("stale-eof");
+        insert(&k, pending(ProcState::Starting, Duration::from_millis(0)));
+        k.connection_closed(Some(7));
+        let ks = kinds(&k);
+        assert!(ks.is_empty(), "no crash, no respawn: {ks:?}");
+        let _agents = k.agents.lock().unwrap();
+        let e = _agents[&7].lock().unwrap();
+        assert!(
+            matches!(e.state, ProcState::Starting),
+            "untouched: {:?}",
+            e.state
+        );
+        assert_eq!(e.respawns, 0, "no duplicate respawn");
+    }
+
+    /// ...while a LIVE agent's connection closing still fails fast.
+    #[test]
+    fn a_live_connection_close_fails_fast_to_a_respawn() {
+        let (k, _dir) = temp_kernel("live-eof");
+        insert(&k, pending(ProcState::Running, Duration::from_secs(60)));
+        k.connection_closed(Some(7));
+        let ks = kinds(&k);
+        assert!(ks.contains(&"crashed".to_string()), "journaled: {ks:?}");
+        assert!(ks.contains(&"respawned".to_string()), "respawned: {ks:?}");
+        let _agents = k.agents.lock().unwrap();
+        let e = _agents[&7].lock().unwrap();
+        assert!(
+            matches!(e.state, ProcState::Starting),
+            "retry pending: {:?}",
+            e.state
+        );
+        assert_eq!(e.respawns, 1);
+    }
+
+    /// The process table tells the operator a launch is pending.
+    #[test]
+    fn ps_reports_a_pending_launch_as_starting() {
+        let (k, _dir) = temp_kernel("ps");
+        insert(&k, pending(ProcState::Starting, Duration::from_millis(0)));
+        let dump = k.ps_dump();
+        assert_eq!(dump[0]["state"], "starting");
     }
 }
