@@ -114,10 +114,39 @@ all_pass = (
 )
 print("EXPERIMENT_006:", "PASS" if all_pass else "FAIL")
 if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
+    # ONE annotation: GitHub drops workflow commands beyond 10/step
+    parts = []
     try:
-        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-40:]
-        for line in tail:
-            print(f"::error::ledger: {line}", flush=True)
+        import os as _os
+        _lp = _os.environ.get("LEDGER", "/tmp/ama_exp/ledger.jsonl")
+        lines = open(_lp).read().splitlines()
+        parts.append(f"LEDGER {len(lines)} events: first 8")
+        parts.extend(l[:340] for l in lines[:8])
+        if len(lines) > 8:
+            parts.append("last 16:")
+            parts.extend(l[:340] for l in lines[-16:])
+    except Exception as e:
+        parts.append(f"LEDGER unreadable: {e}")
+    try:
+        parts.append("PS: " + open("/tmp/ama_exp/ps.json").read().replace(" ", "")[:600])
+    except Exception:
+        pass
+    import glob as _g
+    for f in sorted(_g.glob("/tmp/ama_dbg_agent_*.stderr")):
+        try:
+            tail = [l for l in open(f).read().splitlines() if l.strip()][-3:]
+            for l in tail:
+                parts.append(f"{f.split('/')[-1]}: {l[:250]}")
+        except Exception:
+            pass
+    try:
+        kl = open("/tmp/ama_exp/kernel.err").read().splitlines()[-4:]
+        parts.extend(f"k: {l[:250]}" for l in kl)
+    except Exception:
+        pass
+    print("::error title=evidence::" + "%0A".join(parts), flush=True)
+    try:
+        open(_os.path.join(_os.path.dirname(_lp), ".evidence_printed"), "w").write("1")
     except Exception:
         pass
 sys.exit(0 if all_pass and all(results) else 1)
