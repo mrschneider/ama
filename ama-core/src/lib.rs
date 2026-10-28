@@ -87,6 +87,11 @@ pub fn write_envelope(w: &mut dyn IoWrite, wire: Wire, v: &Value) -> io::Result<
     }
 }
 
+// F07: peer-supplied lengths are UNTRUSTED — no allocation before the
+// bound is checked (a 4 GB declared length used to become a 4 GB
+// allocation attempt: OOM as a service)
+pub const MAX_FRAME: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Read one PROTOBUF frame (0x0A magic + u32 LE length + proto message).
 pub fn read_proto_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
     let mut magic = [0u8; 1];
@@ -356,16 +361,43 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn open(path: &std::path::Path) -> std::io::Result<Ledger> {
+        // F06: REPAIR a torn tail BEFORE anything reads or appends — a
+        // crash mid-write leaves a partial last line that (a) poisons the
+        // line count and (b) would corrupt every subsequent append-on-top.
+        // The repair truncates the unparsable tail and journals the loss.
+        if let Ok(f) = std::fs::File::open(path) {
+            let last_line: Option<String> = {
+                let mut last = None;
+                for line in BufReader::new(f).lines().map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        last = Some(line);
+                    }
+                }
+                last
+            };
+            if let Some(line) = last_line {
+                if serde_json::from_str::<LedgerEvent>(&line).is_err() {
+                    let trimmed = line.len() + 1; // + the newline that was consumed
+                    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    let cut = len.saturating_sub(trimmed as u64);
+                    let _ = std::fs::File::options()
+                        .write(true)
+                        .open(path)
+                        .and_then(|f| f.set_len(cut));
+                    eprintln!(
+                        "[ama] ledger: torn tail repaired ({} bytes truncated)",
+                        trimmed
+                    );
+                }
+            }
+        }
         let seq = {
             let f = std::fs::File::open(path).ok();
             let mut n = 0u64;
             if let Some(f) = f {
                 // count lines WITHOUT parsing JSON: Ledger::open is O(file)
                 // at startup either way, but parsing every event to count it
-                // made startup several times slower on large ledgers. A torn
-                // line (crash mid-write) costs one off-by-one in seq —
-                // harmless: seq is a monotonic id, nothing correlates it
-                // with the file's line count.
+                // made startup several times slower on large ledgers.
                 for line in BufReader::new(f).lines().map_while(Result::ok) {
                     if !line.trim().is_empty() {
                         n += 1;
@@ -393,6 +425,11 @@ impl Ledger {
     }
 
     pub fn append(&self, ev: &str, detail: Value) -> std::io::Result<LedgerEvent> {
+        // F06: sequence ids are allocated UNDER the writer lock — the
+        // old path allocated from the atomic BEFORE locking, so two
+        // concurrent appends could write seq 8 AFTER seq 9 (file order
+        // diverging from sequence order breaks every replay)
+        let mut guard = self.writer.lock().unwrap();
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let ts_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -405,7 +442,6 @@ impl Ledger {
             detail,
         };
         let line = serde_json::to_string(&e).unwrap();
-        let mut guard = self.writer.lock().unwrap();
         // The cached handle can silently point at an UNLINKED inode: after
         // the file (or its parent dir) is removed, write() into the still-
         // open fd SUCCEEDS — into the void. The old open-per-append code
@@ -429,6 +465,25 @@ impl Ledger {
         let f = guard.as_mut().unwrap();
         f.write_all(line.as_bytes())?;
         f.write_all(b"\n")?;
+        Ok(e)
+    }
+
+    /// F06: DURABLE append — `sync_data` before returning, so a
+    /// checkpoint acknowledgment that references this event survives a
+    /// HOST failure, not just an agent process failure. The plain
+    /// `append` stays buffered (the hot path pays ~1 syscall, not two).
+    /// Guarantees now spelled out: agent failure -> ledger survives
+    /// (buffered is enough, the kernel process holds the fd); kernel
+    /// restart -> file contents survive (page cache); HOST crash ->
+    /// only `append_durable`-sealed events are promised.
+    pub fn append_durable(&self, ev: &str, detail: Value) -> std::io::Result<LedgerEvent> {
+        let e = self.append(ev, detail)?;
+        let mut guard = self.writer.lock().unwrap();
+        if let Some(f) = guard.as_mut() {
+            f.sync_data().map_err(|err| {
+                std::io::Error::other(format!("ledger sync_data failed: {err}"))
+            })?;
+        }
         Ok(e)
     }
 
@@ -474,10 +529,15 @@ impl Ledger {
             if let Some(state) = Self::checkpoint_in_line(&line, uin) {
                 return Some(state);
             }
-            // then the chunk's complete lines, nearest-EOF first
-            for s in segs[1..segs.len() - 1].iter().rev() {
-                if let Some(state) = Self::checkpoint_in_line(s, uin) {
-                    return Some(state);
+            // then the chunk's complete lines, nearest-EOF first. F06:
+            // a chunk with NO newline yields exactly one segment — the
+            // old `segs[1..segs.len()-1]` was an invalid slice range that
+            // panicked instead of just accumulating into carry.
+            if segs.len() > 2 {
+                for s in segs[1..segs.len() - 1].iter().rev() {
+                    if let Some(state) = Self::checkpoint_in_line(s, uin) {
+                        return Some(state);
+                    }
                 }
             }
             carry = segs[0].to_vec();
@@ -2091,6 +2151,9 @@ impl Router {
                 return None;
             }
             let len = u32::from_le_bytes(lenb) as usize;
+            if len > MAX_FRAME {
+                return None; // oversized first frame: refuse the connection
+            }
             let mut buf = vec![0u8; len];
             if peer.read_exact(&mut buf).is_err() {
                 return None;
@@ -2148,6 +2211,9 @@ impl Router {
                 return None;
             }
             let len = u32::from_le_bytes(lenb) as usize;
+            if len > MAX_FRAME {
+                return None; // oversized first frame: refuse the connection
+            }
             let mut buf = vec![0u8; len];
             if peer.read_exact(&mut buf).is_err() {
                 return None;
@@ -2913,6 +2979,9 @@ impl JsonPeer {
     /// read one JSON line; the stored first byte is prepended on the
     /// first call; returns Ok(false) on EOF
     fn read_line_after(&mut self, line: &mut String) -> std::io::Result<bool> {
+        // F07: a JSON line is peer input too — bound it (the loop keeps
+        // reading otherwise-unbounded input into `buf`)
+        const MAX_LINE: usize = 16 * 1024 * 1024;
         if self.done {
             return Ok(false);
         }
@@ -2934,6 +3003,12 @@ impl JsonPeer {
                         return Ok(true);
                     }
                     buf.push(b[0]);
+                    if buf.len() > MAX_LINE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "json line exceeds the size limit",
+                        ));
+                    }
                 }
                 Err(e) => return Err(e),
             }

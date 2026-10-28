@@ -136,8 +136,9 @@ fn main() {
         let inbox = inbox.clone();
         let alive = alive.clone();
         let mut r = writer.lock().unwrap().try_clone().expect("reader clone");
-        std::thread::spawn(move || match wire {
-            Wire::Json => {
+        std::thread::spawn(move || {
+            match wire {
+                Wire::Json => {
                 let mut r = BufReader::new(r);
                 let mut line = String::new();
                 while alive.load(Ordering::SeqCst) {
@@ -153,25 +154,31 @@ fn main() {
                 }
                 alive.store(false, Ordering::SeqCst);
             }
-            Wire::Msgpack => loop {
-                if !alive.load(Ordering::SeqCst) {
-                    break;
+                Wire::Msgpack => loop {
+                    if !alive.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match read_msgpack_frame(&mut r) {
+                        Ok(v) => inbox.lock().unwrap().push_back(v),
+                        Err(_) => break,
+                    }
                 }
-                match read_msgpack_frame(&mut r) {
-                    Ok(v) => inbox.lock().unwrap().push_back(v),
-                    Err(_) => break,
+                Wire::Proto => loop {
+                    if !alive.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match read_proto_frame(&mut r) {
+                        Ok(v) => inbox.lock().unwrap().push_back(v),
+                        Err(_) => break,
+                    }
                 }
-            },
-            Wire::Proto => loop {
-                if !alive.load(Ordering::SeqCst) {
-                    break;
-                }
-                match read_proto_frame(&mut r) {
-                    Ok(v) => inbox.lock().unwrap().push_back(v),
-                    Err(_) => break,
-                }
-            },
-        });
+            }
+            // F08: DISCONNECT is a signal — poison the inbox so every wait
+        // loop terminates instead of hanging forever (all three wire
+        // arms converge here)
+        alive.store(false, Ordering::SeqCst);
+        inbox.lock().unwrap().push_back(json!({"kind": "__disconnected"}));
+    });
     }
 
     // heartbeat thread: the watchdog's only view of this process. Gated on
@@ -279,23 +286,50 @@ fn main() {
         );
     }
 
-    let drain_acks = |inbox: &Arc<Mutex<VecDeque<Value>>>| {
+    // F08: the reply is TYPED — `sent`/`acked` are success, an `error`
+    // reply is surfaced to the caller (the old drain_acks treated them
+    // ALL as completion, so a rejected operation silently ADVANCED the
+    // task). A timeout bounds every wait; a poisoned inbox (disconnect)
+    // ends the process — the kernel's watchdog owns what happens next.
+    const REPLY_TIMEOUT_MS: u64 = 10_000;
+    let await_reply = |inbox: &Arc<Mutex<VecDeque<Value>>>| -> Result<Value, String> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(REPLY_TIMEOUT_MS);
         loop {
+            if std::time::Instant::now() > deadline {
+                return Err("reply timeout".to_string());
+            }
             let mut q = inbox.lock().unwrap();
-            let mut acked = false;
+            let mut reply: Option<Value> = None;
             q.retain(|v| {
                 let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
-                if matches!(kind, "sent" | "acked" | "error") {
-                    acked = true;
+                if reply.is_none() && matches!(kind, "sent" | "acked" | "error") {
+                    reply = Some(v.clone());
                     return false; // consumed
                 }
                 true
             });
             drop(q);
-            if acked {
-                return;
+            if let Some(r) = reply {
+                if r.get("kind").and_then(Value::as_str) == Some("error") {
+                    return Err(
+                        r.get("reason").and_then(Value::as_str).unwrap_or("error").to_string()
+                    );
+                }
+                return Ok(r);
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // explicit outcome policy: a failed operation is LOGGED LOUDLY (the
+    // step still advances — the historical scripted-task contract — but
+    // the failure is visible on stderr and the journal instead of being
+    // conflated with success)
+    let drain_acks = |inbox: &Arc<Mutex<VecDeque<Value>>>| {
+        match await_reply(inbox) {
+            Ok(_) => {}
+            Err(reason) => {
+                eprintln!("[agentd {}] OPERATION FAILED: {reason}", task.name);
+            }
         }
     };
 
