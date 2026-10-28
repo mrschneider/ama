@@ -94,6 +94,11 @@ fn main() {
         &std::fs::read(&task_path).unwrap_or_else(|e| panic!("task {task_path}: {e}")),
     )
     .expect("task schema");
+    eprintln!(
+        "[agentd {}] task loaded ({} steps)",
+        task.name,
+        task.steps.len()
+    );
 
     // §2: the agent jails ITSELF before doing any work — no_new_privs +
     // seccomp denylist (mount/ptrace/module-load/bpf/… return EPERM).
@@ -121,6 +126,8 @@ fn main() {
         }
     }
 
+    eprintln!("[agentd {}] seccomp applied", task.name);
+
     // §3: connect over the transport this agent was configured for —
     // UDS (local) or TCP (network-remote). Same contract either way.
     let peer = match &tcp {
@@ -131,7 +138,12 @@ fn main() {
             );
             std::net::TcpStream::connect(addr).expect("connect to kernel over TCP")
         }),
-        None => Peer::Unix(UnixStream::connect(&socket).expect("connect to kernel")),
+        None => {
+            eprintln!("[agentd {}] connecting over UDS: {socket}", task.name);
+            let st = UnixStream::connect(&socket).expect("connect to kernel");
+            eprintln!("[agentd {}] connected", task.name);
+            Peer::Unix(st)
+        }
     };
     // §3: ONE shared writer, Mutex-serialized — the heartbeat thread and
     // the task loop write to the SAME fd; unsynchronized writes interleave
@@ -246,6 +258,8 @@ fn main() {
                 "token": std::env::var("AMA_REGISTER_TOKEN").ok()}),
     );
 
+    eprintln!("[agentd {}] register sent", task.name);
+
     // process welcome (and any recover state) first
     let mut uin: u64 = 0;
     let mut recovered_from: Option<Value> = None;
@@ -258,6 +272,7 @@ fn main() {
     // welcome at the tail would never be reached.
     let welcome = {
         let mut deferred: Vec<Value> = Vec::new();
+        let mut polls: u64 = 0;
         let w = loop {
             match inbox.lock().unwrap().pop_front() {
                 Some(v) => {
@@ -266,7 +281,16 @@ fn main() {
                     }
                     deferred.push(v);
                 }
-                None => std::thread::sleep(Duration::from_millis(5)),
+                None => {
+                    polls += 1;
+                    if polls.is_multiple_of(1000) {
+                        eprintln!(
+                            "[agentd {}] still waiting for welcome ({} polls)",
+                            task.name, polls
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
         };
         if !deferred.is_empty() {
