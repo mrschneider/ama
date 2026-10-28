@@ -31,11 +31,25 @@ fetch() { # fetch <url> <dest>
 }
 
 # --- firecracker v1.17.0 ---
+# F09: downloaded binaries are VERIFIED against a pinned sha256 — a
+# supply-chain silent skip is how a hostile mirror becomes the isolation
+# boundary. AMA_ALLOW_UNVERIFIED=1 is the explicit, journaled escape hatch
+# for offline development.
 FC_VERSION="v1.17.0"
-FC_SHA="SKIP" # pin: verify with `sha256sum` against the release page
+FC_SHA="${FC_SHA:-}"
 if [ ! -s "$BIN/firecracker" ]; then
     TGZ=$(mktemp /tmp/fc.tgz.XXXXXX)
     fetch "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz" "$TGZ"
+    if [ -z "$FC_SHA" ] || [ "$FC_SHA" = "SKIP" ]; then
+        if [ "${AMA_ALLOW_UNVERIFIED:-0}" != "1" ]; then
+            echo "ERROR: set FC_SHA=<sha256 of the firecracker tgz> before downloading" >&2
+            echo "       (or AMA_ALLOW_UNVERIFIED=1 to accept an UNVERIFIED download)" >&2
+            exit 1
+        fi
+        echo "WARNING: firecracker downloaded WITHOUT integrity verification (AMA_ALLOW_UNVERIFIED=1)" >&2
+    else
+        echo "$FC_SHA  $TGZ" | sha256sum -c - || { echo "firecracker checksum MISMATCH" >&2; exit 1; }
+    fi
     tar xzf "$TGZ" -C /tmp
     cp "/tmp/release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" "$BIN/firecracker"
     rm -f "$TGZ" "/tmp/release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}"
@@ -43,7 +57,19 @@ fi
 chmod +x "$BIN/firecracker"
 
 # --- busybox 1.35.0 (musl static) ---
-fetch "https://busybox.net/downloads/binaries/1.35.0-${ARCH}-linux-musl/busybox" "$BIN/busybox"
+BUSYBOX_SHA="${BUSYBOX_SHA:-}"
+if [ ! -s "$BIN/busybox" ]; then
+    fetch "https://busybox.net/downloads/binaries/1.35.0-${ARCH}-linux-musl/busybox" "$BIN/busybox"
+    if [ -z "$BUSYBOX_SHA" ] || [ "$BUSYBOX_SHA" = "SKIP" ]; then
+        if [ "${AMA_ALLOW_UNVERIFIED:-0}" != "1" ]; then
+            echo "ERROR: set BUSYBOX_SHA=<sha256> before downloading" >&2
+            exit 1
+        fi
+        echo "WARNING: busybox downloaded WITHOUT integrity verification (AMA_ALLOW_UNVERIFIED=1)" >&2
+    else
+        echo "$BUSYBOX_SHA  $BIN/busybox" | sha256sum -c - || { echo "busybox checksum MISMATCH" >&2; exit 1; }
+    fi
+fi
 chmod +x "$BIN/busybox"
 
 # --- guest kernel from the Firecracker CI artifacts bucket ---

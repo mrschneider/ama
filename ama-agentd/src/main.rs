@@ -102,8 +102,22 @@ fn main() {
     // denies socket(AF_INET) kills PID 1 BEFORE it can connect (exit code
     // 0x6500 = panic "Attempted to kill init", experiment 005)
     if std::env::var("AMA_VM").is_err() {
+        // F09: isolation fails CLOSED — an agent does NOT run unprotected
+        // because a filter failed to install. AMA_ALLOW_NO_SECCOMP=1 is
+        // the explicit downgrade, announced loudly.
         if let Err(e) = ama_core::seccomp::apply_seccomp_self() {
-            eprintln!("[agentd {}] seccomp jail unavailable: {e}", task.name);
+            if std::env::var("AMA_ALLOW_NO_SECCOMP").is_ok() {
+                eprintln!(
+                    "[agentd {}] WARNING: running WITHOUT the seccomp jail (AMA_ALLOW_NO_SECCOMP=1): {e}",
+                    task.name
+                );
+            } else {
+                eprintln!(
+                    "[agentd {}] FATAL: seccomp jail unavailable: {e} — refusing to run unprotected (set AMA_ALLOW_NO_SECCOMP=1 to downgrade explicitly)",
+                    task.name
+                );
+                std::process::exit(2);
+            }
         }
     }
 
@@ -139,21 +153,21 @@ fn main() {
         std::thread::spawn(move || {
             match wire {
                 Wire::Json => {
-                let mut r = BufReader::new(r);
-                let mut line = String::new();
-                while alive.load(Ordering::SeqCst) {
-                    line.clear();
-                    match r.read_line(&mut line) {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
+                    let mut r = BufReader::new(r);
+                    let mut line = String::new();
+                    while alive.load(Ordering::SeqCst) {
+                        line.clear();
+                        match r.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                        if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+                            inbox.lock().unwrap().push_back(v);
+                        }
                     }
-                    if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
-                        inbox.lock().unwrap().push_back(v);
-                    }
+                    alive.store(false, Ordering::SeqCst);
                 }
-                alive.store(false, Ordering::SeqCst);
-            }
                 Wire::Msgpack => loop {
                     if !alive.load(Ordering::SeqCst) {
                         break;
@@ -162,7 +176,7 @@ fn main() {
                         Ok(v) => inbox.lock().unwrap().push_back(v),
                         Err(_) => break,
                     }
-                }
+                },
                 Wire::Proto => loop {
                     if !alive.load(Ordering::SeqCst) {
                         break;
@@ -171,14 +185,17 @@ fn main() {
                         Ok(v) => inbox.lock().unwrap().push_back(v),
                         Err(_) => break,
                     }
-                }
+                },
             }
             // F08: DISCONNECT is a signal — poison the inbox so every wait
-        // loop terminates instead of hanging forever (all three wire
-        // arms converge here)
-        alive.store(false, Ordering::SeqCst);
-        inbox.lock().unwrap().push_back(json!({"kind": "__disconnected"}));
-    });
+            // loop terminates instead of hanging forever (all three wire
+            // arms converge here)
+            alive.store(false, Ordering::SeqCst);
+            inbox
+                .lock()
+                .unwrap()
+                .push_back(json!({"kind": "__disconnected"}));
+        });
     }
 
     // heartbeat thread: the watchdog's only view of this process. Gated on
@@ -311,9 +328,11 @@ fn main() {
             drop(q);
             if let Some(r) = reply {
                 if r.get("kind").and_then(Value::as_str) == Some("error") {
-                    return Err(
-                        r.get("reason").and_then(Value::as_str).unwrap_or("error").to_string()
-                    );
+                    return Err(r
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("error")
+                        .to_string());
                 }
                 return Ok(r);
             }
@@ -324,12 +343,10 @@ fn main() {
     // step still advances — the historical scripted-task contract — but
     // the failure is visible on stderr and the journal instead of being
     // conflated with success)
-    let drain_acks = |inbox: &Arc<Mutex<VecDeque<Value>>>| {
-        match await_reply(inbox) {
-            Ok(_) => {}
-            Err(reason) => {
-                eprintln!("[agentd {}] OPERATION FAILED: {reason}", task.name);
-            }
+    let drain_acks = |inbox: &Arc<Mutex<VecDeque<Value>>>| match await_reply(inbox) {
+        Ok(_) => {}
+        Err(reason) => {
+            eprintln!("[agentd {}] OPERATION FAILED: {reason}", task.name);
         }
     };
 

@@ -84,8 +84,11 @@ detail — lives in the [kernel reference](docs/architecture/kernel-reference.md
 
 ## Proven results
 
-Eight end-to-end experiments run in CI on every push; every assertion
-comes from the ledger.
+Seven end-to-end experiments run in CI on every push (`005_microvm` is
+excluded — it needs `/dev/kvm`, which hosted runners do not expose);
+every validator **fails closed**: a FAIL line exits nonzero (guarded by
+`tests/validators_fail_closed.py`), and every assertion comes from the
+ledger.
 
 | Experiment | Proves |
 |---|---|
@@ -97,6 +100,7 @@ comes from the ledger.
 | `006_qos_dtn` | rate limits + custody taken and drained for an offline agent |
 | `007_qos_suite` | WFQ weights under contention, admission control, accounting |
 | `008_dtn_routing` | multi-hop relays, custody acks, fragmentation |
+| `009_authority` | NEGATIVE tests: session identity (no cross-agent impersonation), registration tokens, task caps do not become grants, operator socket separation, revocations survive re-registration, custody ownership |
 
 Sample: `EXPERIMENT_001: PASS` — 13 assertions in 14 s across 5 distinct
 OS processes. Full transcripts: [kernel reference](docs/architecture/kernel-reference.md);

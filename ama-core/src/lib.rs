@@ -480,9 +480,8 @@ impl Ledger {
         let e = self.append(ev, detail)?;
         let mut guard = self.writer.lock().unwrap();
         if let Some(f) = guard.as_mut() {
-            f.sync_data().map_err(|err| {
-                std::io::Error::other(format!("ledger sync_data failed: {err}"))
-            })?;
+            f.sync_data()
+                .map_err(|err| std::io::Error::other(format!("ledger sync_data failed: {err}")))?;
         }
         Ok(e)
     }
@@ -993,7 +992,14 @@ impl Kernel {
             dtn,
         }));
         if self.apply_cgroups {
-            let _ = sandbox::apply_cgroup(pid, name);
+            // F09: a REQUESTED resource limit that silently fails means the
+            // effective protection differs from the requested one — journal
+            // it (the spawn result never carries the cgroup outcome)
+            if let Err(e) = sandbox::apply_cgroup(pid, name) {
+                self.ledger
+                    .append("cgroup_failed", json!({"uin": uin, "name": name, "err": e}))
+                    .ok();
+            }
         }
         self.agents.lock().unwrap().insert(uin, entry);
         self.by_name.lock().unwrap().insert(name.into(), uin);
