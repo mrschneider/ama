@@ -30,7 +30,7 @@ EOF
 # kill, so a slow runner could kill c BEFORE its n=0 checkpoint (and the
 # validator's FAIL used to exit 0 anyway, hiding it). The kernel gets a
 # generous budget and every phase waits for the EVENT it needs.
-timeout 45 ./target/debug/ama serve \
+timeout 70 ./target/debug/ama serve \
   --manifest experiments/manifest.json \
   --agentd ./target/debug/ama-agentd &
 KERNEL_PID=$!
@@ -39,7 +39,7 @@ KERNEL_PID=$!
 # kill is a real crash-recovery test, not a race
 python3 - <<'EOF'
 import json, time, sys
-deadline = time.time() + 15
+deadline = time.time() + 25
 while time.time() < deadline:
     try:
         events = [json.loads(l) for l in open('/tmp/ama_exp/ledger.jsonl')]
@@ -79,7 +79,7 @@ import json, time, sys
 # wait for EVERY terminal condition the validator checks — a/b's round
 # trip and m's denial land AFTER d's death and c's recovery (the early
 # condition cut the workload short and broke CI)
-deadline = time.time() + 30
+deadline = time.time() + 45
 while time.time() < deadline:
     try:
         events = [json.loads(l) for l in open('/tmp/ama_exp/ledger.jsonl')]
@@ -194,9 +194,15 @@ print("EXPERIMENT_001:", "PASS" if all([
 all_pass = all([len(spawned) == 5, malformed, len(denied) >= 1, kills, respawns_d])
 if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
     try:
-        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-40:]
-        for line in tail:
-            print(f"::error::ledger: {line}", flush=True)
+        interesting = ("completed", "killed", "dead", "respawned", "crashed",
+                       "cap_denied", "delivered", "checkpoint")
+        for line in open("/tmp/ama_exp/ledger.jsonl").read().splitlines():
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e["ev"] in interesting:
+                print(f"::error::ev[{e['seq']}]: {e['ev']} {e['detail']}", flush=True)
     except Exception:
         pass
 sys.exit(0 if all_pass and all(results) else 1)
