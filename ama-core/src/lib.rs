@@ -92,6 +92,10 @@ pub fn write_envelope(w: &mut dyn IoWrite, wire: Wire, v: &Value) -> io::Result<
 // allocation attempt: OOM as a service)
 pub const MAX_FRAME: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// F05/F07: how long a spawned agent may take to register before the
+/// watchdog kills and respawns it.
+pub const REGISTRATION_DEADLINE_FACTOR: u64 = 3;
+
 /// Read one PROTOBUF frame (0x0A magic + u32 LE length + proto message).
 pub fn read_proto_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
     let mut magic = [0u8; 1];
@@ -1801,7 +1805,8 @@ impl Kernel {
                     // so a wedged boot left a zombie-shaped entry outside
                     // every timeout path.
                     if e.out.is_none() {
-                        let reg_ms = self.hb_timeout_ms.max(1000) * 3;
+                        let reg_ms =
+                            (self.hb_timeout_ms * REGISTRATION_DEADLINE_FACTOR).max(10_000);
                         if matches!(e.state, ProcState::Registered)
                             && e.spawned_at.elapsed().as_millis() as u64 > reg_ms
                         {
