@@ -35,9 +35,10 @@ JAIL_UID=$(timeout 5 ./target/debug/ama jail --userns -- /bin/sh -c 'id -u' 2>&1
 echo "host uid: $HOST_UID | jailed uid: $JAIL_UID"
 [ "$JAIL_UID" = "0" ] && echo "PASS: userns: the jailed tool runs as uid 0 INSIDE a fresh user+mount namespace (host ownership unchanged)" || echo "SKIP (host policy): userns tier implemented but this host forbids unprivileged user namespaces (jailed uid seen: $JAIL_UID)"
 
+export AMA_DEBUG=1
 timeout 40 ./target/debug/ama serve \
   --manifest experiments/manifest_003.json \
-  --agentd ./target/debug/ama-agentd &
+  --agentd ./target/debug/ama-agentd 2>/tmp/ama_exp/kernel.err &
 KERNEL_PID=$!
 python3 experiments/wait_ledger_quiet.py 3 35
 ./target/debug/ama ps --socket /tmp/ama_exp.sock > /tmp/ama_exp/ps.json 2>/dev/null || true
@@ -88,9 +89,21 @@ all_pass = len(ping) >= 1 and len(pong) >= 1 and {'a', 'b'} <= completed
 print("EXPERIMENT_003:", "PASS" if all_pass else "FAIL")
 if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
     try:
-        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-40:]
-        for line in tail:
-            print(f"::error::ledger: {line}", flush=True)
+        ps_raw = open("/tmp/ama_exp/ps.json").read().replace(" ", "")
+        print(f"::error title=ps::{' | '.join(ps_raw.splitlines())}", flush=True)
+    except Exception as e:
+        print(f"::error title=ps::unreadable: {e}", flush=True)
+    import glob as _g
+    for f in sorted(_g.glob("/tmp/ama_dbg_agent_*.stderr")):
+        try:
+            lines = [l for l in open(f).read().splitlines() if l.strip()][-8:]
+            for line in lines:
+                print(f"::error title={f.split('/')[-1]}::{line[:400]}", flush=True)
+        except Exception:
+            pass
+    try:
+        for line in open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[:20]:
+            print(f"::error title=ledger::{line}", flush=True)
     except Exception:
         pass
 sys.exit(0 if all_pass and all(results) else 1)
