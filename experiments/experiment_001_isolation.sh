@@ -3,6 +3,10 @@
 # Architecture: process isolation, capability-gated IPC, schema validation,
 # watchdog respawn, and ledger-based recovery.
 set -euo pipefail
+set -E
+# any abort under `set -e` leaves an annotation with the exact line —
+# silent pre-validator exits were undiagnosable on CI
+trap 'echo "::error title=abort::experiment aborted at line $LINENO (cmd: $BASH_COMMAND)"' ERR
 cd "$(dirname "$0")/.."
 export RUST_LOG=warn
 LEDGER=/tmp/ama_exp/ledger.jsonl
@@ -59,6 +63,9 @@ while time.time() < deadline:
         sys.exit(0)
     time.sleep(0.2)
 print("FAIL: c never checkpointed n=0 (timeout)", flush=True)
+import os
+if os.environ.get("GITHUB_ACTIONS"):
+    print("::error title=phase1::timeout: c never registered+checkpointed n=0", flush=True)
 sys.exit(1)
 EOF
 
@@ -76,7 +83,8 @@ if [ -z "$C_PID" ]; then
   echo "FAIL: agent c never spawned" >&2; exit 1
 fi
 echo "== killing agent c (pid $C_PID) externally =="
-kill -9 "$C_PID" && echo "KILL: sent -9 to $C_PID"
+# a vanished pid must NOT abort the run silently (set -e) — annotate it
+kill -9 "$C_PID" 2>/dev/null && echo "KILL: sent -9 to $C_PID" || echo "::error title=kill::kill -9 $C_PID failed (already gone?)"
 
 # phase 2: wait for the terminal evidence instead of sleeping 12 s
 python3 - <<'EOF'
