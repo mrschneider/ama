@@ -13,14 +13,14 @@
 //! retry on WouldBlock instead of breaking — otherwise the socket buffer
 //! (~212 KB) fills, the kernel blocks in write, and the benchmark hangs.
 
-use ama_core::{Kernel, Ledger, Peer, ProcEntry, ProcState, Wire};
+use ama_core::{spawn_writer, Kernel, Ledger, Peer, ProcEntry, ProcState, Wire};
 use serde_json::json;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-fn fake_entry(uin: u64, name: &str, out: UnixStream) -> Arc<Mutex<ProcEntry>> {
+fn fake_entry(uin: u64, name: &str, out: UnixStream, ledger: Arc<Ledger>) -> Arc<Mutex<ProcEntry>> {
     Arc::new(Mutex::new(ProcEntry {
         uin,
         name: name.into(),
@@ -40,7 +40,7 @@ fn fake_entry(uin: u64, name: &str, out: UnixStream) -> Arc<Mutex<ProcEntry>> {
         respawns: 0,
         last_checkpoint: None,
         task_path: "/dev/null".into(),
-        out: Some(Arc::new(Mutex::new(Peer::Unix(out)))),
+        out: Some(spawn_writer(ledger, Peer::Unix(out), Wire::Json)),
         wire: Wire::Json,
         isolation: None,
         priority: 5,
@@ -71,11 +71,11 @@ fn main() {
     k.agents
         .lock()
         .unwrap()
-        .insert(1, fake_entry(1, "perf-a", a_tx));
+        .insert(1, fake_entry(1, "perf-a", a_tx, k.ledger.clone()));
     k.agents
         .lock()
         .unwrap()
-        .insert(2, fake_entry(2, "perf-b", b_tx));
+        .insert(2, fake_entry(2, "perf-b", b_tx, k.ledger.clone()));
     k.bind_name("perf-a", 1);
     k.bind_name("perf-b", 2);
 

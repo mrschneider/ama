@@ -114,39 +114,193 @@ pub fn credential_eq(a: &str, b: &str) -> bool {
 }
 
 /// Serialize + frame an envelope in the connection's wire format.
-pub fn write_envelope(w: &mut dyn IoWrite, wire: Wire, v: &Value) -> io::Result<()> {
+/// F03: encode to bytes FIRST. The dedicated per-connection writer owns
+/// every byte that reaches a socket, so a frame is built completely
+/// off-socket and handed over as one buffer — nothing can interleave
+/// mid-payload on any wire.
+pub fn encode_envelope(wire: Wire, v: &Value) -> io::Result<Vec<u8>> {
     match wire {
         Wire::Json => {
-            // ONE write() syscall (writeln! fragments the Display output
-            // byte-by-byte, and two threads sharing one stream interleave
-            // fragments MID-LINE — experiment 003) AND one serialization:
-            // to_writer straight into the frame buffer replaces
-            // format!("{v}\n"), which paid a full Display pass plus a
-            // String allocation per message.
+            // ONE serialization: to_writer straight into the frame buffer
+            // replaces format!("{v}\n"), which paid a full Display pass
+            // plus a String allocation per message.
             let mut buf = Vec::with_capacity(256);
             serde_json::to_writer(&mut buf, v)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             buf.push(b'\n');
-            w.write_all(&buf)?;
-            w.flush()
+            Ok(buf)
         }
         Wire::Msgpack => {
             let bytes = rmp_serde::to_vec_named(v)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            w.write_all(&[0xFF])?;
-            w.write_all(&(bytes.len() as u32).to_le_bytes())?;
-            w.write_all(&bytes)?;
-            w.flush()
+            let mut buf = Vec::with_capacity(bytes.len() + 5);
+            buf.push(0xFF);
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&bytes);
+            Ok(buf)
         }
         Wire::Proto => {
             let bytes = proto::encode_value(v)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            w.write_all(&[0x0A])?;
-            w.write_all(&(bytes.len() as u32).to_le_bytes())?;
-            w.write_all(&bytes)?;
-            w.flush()
+            let mut buf = Vec::with_capacity(bytes.len() + 5);
+            buf.push(0x0A);
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&bytes);
+            Ok(buf)
         }
     }
+}
+
+/// Direct single-writer helper — used by the agentd (its socket has one
+/// writer thread too). The kernel never writes a socket directly
+/// anymore; it ENQUEUES (see `Outbound`).
+pub fn write_envelope(w: &mut dyn IoWrite, wire: Wire, v: &Value) -> io::Result<()> {
+    let buf = encode_envelope(wire, v)?;
+    w.write_all(&buf)?;
+    w.flush()
+}
+
+// ------------------------------------------------------------- F03: Outbound
+/// Per-connection outbound queue cap. The kernel holds AT MOST this many
+/// bytes per connection no matter what the peer does — memory stays
+/// bounded under sustained contention.
+pub const OUTBOUND_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+/// How long ONE write may block on a peer that stopped reading before
+/// the connection is judged (the deadline lives on the writer's socket).
+pub const OUTBOUND_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+struct OutboundState {
+    frames: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+/// F03 (review item 3): ONE writer per connection, fed by a BOUNDED
+/// queue. Properties this buys, in the order the review asks for:
+///   * framing — the writer thread is the ONLY code that touches the
+///     socket, so concurrent deliveries, welcome messages, acks and
+///     errors can never interleave (json/msgpack/proto alike);
+///   * isolation — `push` NEVER blocks and never allocates past the
+///     byte cap, so a peer that stops reading cannot stall an unrelated
+///     agent, `ama ps`, or the watchdog's sweep;
+///   * bounded memory — queue-full is a DEFINED behavior: the frame is
+///     refused, the connection is closed, the event is journaled, and
+///     the normal EOF path judges the agent;
+///   * deadline — the writer's socket carries a write timeout, so a
+///     half-dead peer releases the writer thread instead of parking it.
+pub struct Outbound {
+    wire: Wire,
+    cap: usize,
+    state: Mutex<OutboundState>,
+    idle: std::sync::Condvar,
+    closed: std::sync::atomic::AtomicBool,
+    ledger: Arc<Ledger>,
+}
+
+impl Outbound {
+    pub fn wire(&self) -> Wire {
+        self.wire
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Stop feeding the writer and drop whatever is still queued (the
+    /// connection is gone — pending frames go with it).
+    pub fn close(&self) {
+        self.closed.swap(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut st = self.state.lock().unwrap();
+            st.frames.clear();
+            st.bytes = 0;
+        }
+        self.idle.notify_all();
+    }
+
+    /// Enqueue one ALREADY-ENCODED frame. Never blocks; the only
+    /// failure modes are "closed" and "queue full" — both of which
+    /// close the connection rather than growing memory.
+    pub fn push(&self, frame: Vec<u8>) -> Result<(), String> {
+        if self.is_closed() {
+            return Err("connection closed".to_string());
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.bytes + frame.len() > self.cap {
+                drop(st);
+                self.ledger
+                    .append(
+                        "outbound_queue_full",
+                        json!({"wire": format!("{:?}", self.wire), "cap": self.cap}),
+                    )
+                    .ok();
+                self.close();
+                return Err(
+                    "outbound queue full (peer stopped reading) — connection closed".to_string(),
+                );
+            }
+            st.bytes += frame.len();
+            st.frames.push_back(frame);
+        }
+        self.idle.notify_one();
+        Ok(())
+    }
+
+    /// Encode with THIS connection's wire and enqueue.
+    pub fn send(&self, v: &Value) -> Result<(), String> {
+        let frame = encode_envelope(self.wire, v).map_err(|e| e.to_string())?;
+        self.push(frame)
+    }
+
+    fn pop(&self) -> Option<Vec<u8>> {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if let Some(f) = st.frames.pop_front() {
+                st.bytes -= f.len();
+                return Some(f);
+            }
+            if self.is_closed() {
+                return None;
+            }
+            st = self.idle.wait(st).unwrap();
+        }
+    }
+}
+
+/// Spawn the ONE thread allowed to write to `writer`, and return the
+/// handle every kernel path enqueues through. Public: it is how any
+/// connection (kernel, integration test, benchmark) obtains its
+/// `Outbound`.
+pub fn spawn_writer(ledger: Arc<Ledger>, writer: Peer, wire: Wire) -> Arc<Outbound> {
+    let out = Arc::new(Outbound {
+        wire,
+        cap: OUTBOUND_QUEUE_BYTES,
+        state: Mutex::new(OutboundState {
+            frames: std::collections::VecDeque::new(),
+            bytes: 0,
+        }),
+        idle: std::sync::Condvar::new(),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        ledger,
+    });
+    let o = Arc::clone(&out);
+    std::thread::spawn(move || {
+        let mut w = writer;
+        let _ = w.set_write_timeout(Some(OUTBOUND_WRITE_DEADLINE));
+        while let Some(frame) = o.pop() {
+            if w.write_all(&frame).is_err() || w.flush().is_err() {
+                o.ledger
+                    .append(
+                        "outbound_write_failed",
+                        json!({"wire": format!("{:?}", o.wire)}),
+                    )
+                    .ok();
+                o.close();
+                return;
+            }
+        }
+    });
+    out
 }
 
 // F07: peer-supplied lengths are UNTRUSTED — no allocation before the
@@ -682,7 +836,7 @@ pub struct ProcEntry {
     /// Mutex-serialized: route_send (sender's thread) and this agent's
     /// own ack replies write the SAME fd concurrently — unsynchronized
     /// writes interleave msgpack frames mid-payload
-    pub out: Option<Arc<Mutex<Peer>>>,
+    pub out: Option<Arc<Outbound>>,
     pub wire: Wire,
     /// "microvm" = the watched PID is a Firecracker VM, not an OS
     /// process; respawn must re-boot the VM, not the agentd binary
@@ -808,32 +962,28 @@ impl Kernel {
         }
     }
 
-    /// F04: acquire the connection's WRITE LOCK — every kernel->agent write
-    /// happens under the connection's own mutex. The old pattern locked, took
-    /// `try_clone()` of the fd, released the lock and wrote on the clone:
-    /// concurrent senders (routing, QoS pump, DTN flush, ack replies) wrote
-    /// the SAME stream simultaneously and interleaved frames mid-payload —
-    /// binary framing (magic/length/payload) is especially exposed.
-    fn with_peer<T>(&self, uin: u64, f: impl FnOnce(Wire, &mut Peer) -> T) -> Result<T, String> {
-        // clone the Arc out from under the table/entry locks, then take the
-        // PEER lock with nothing else held; the guard NEVER escapes this
-        // scope — the closure writes under it
-        let (wire, out) = {
-            let agents = self.agents.lock().unwrap();
-            let entry = agents.get(&uin).ok_or("no process table entry")?;
-            let e = entry.lock().unwrap();
-            let wire = e.wire;
-            let out = e.out.as_ref().ok_or("no connection")?.clone();
-            (wire, out)
-        };
-        let mut guard = out.lock().unwrap();
-        Ok(f(wire, &mut guard))
+    /// F03: resolve the destination's OUTBOUND QUEUE under the table
+    /// locks and return it — the caller then enqueues with NOTHING
+    /// held. (This replaces `with_peer`, which wrote the socket while
+    /// holding the process-table entry lock: a peer that stopped
+    /// reading stalled `ama ps`, routing and the watchdog behind it.)
+    fn resolve_out(&self, uin: u64) -> Result<Arc<Outbound>, String> {
+        let agents = self.agents.lock().unwrap();
+        let entry = agents.get(&uin).ok_or("no process table entry")?;
+        let e = entry.lock().unwrap();
+        e.out.clone().ok_or_else(|| "no connection".to_string())
     }
 
-    /// Write a kernel->agent frame to a connected agent (serialized, F04).
+    /// Enqueue a kernel->agent frame: encoded off-socket, handed to the
+    /// connection's single writer. NEVER blocks, never interleaves.
+    fn enqueue_to(&self, uin: u64, msg: &Value) -> Result<(), String> {
+        self.resolve_out(uin)?.send(msg)
+    }
+
+    /// Write a kernel->agent frame to a connected agent (F03: enqueued,
+    /// the dedicated writer owns the socket).
     fn write_to(&self, uin: u64, msg: &Value) -> Result<(), String> {
-        self.with_peer(uin, |wire, w| write_envelope(w, wire, msg))
-            .and_then(|r| r.map_err(|e| e.to_string()))
+        self.enqueue_to(uin, msg)
     }
 
     /// Reverse lookup: the destination's NAME — what a relay echoes back
@@ -1271,29 +1421,29 @@ impl Kernel {
             return Ok(());
         }
 
-        // F04: the WHOLE framed write holds the destination connection's
-        // write lock — a cloned fd would interleave with concurrent
-        // senders (routing, QoS pump, DTN flush, ack replies)
-        self.with_peer(uin, |wire, w_ref| {
-            // JSON fast path: splice the envelope around the
-            // ALREADY-ENCODED body — no second serialization, no
-            // envelope-Value clone. Binary wires keep write_envelope
-            // (msgpack can't be spliced).
-            if wire == Wire::Json && !body_encoded.is_empty() {
-                let mut frame = Vec::with_capacity(bytes + 48);
-                frame.extend_from_slice(b"{\"kind\":\"msg\",\"from\":");
-                frame.extend_from_slice(from.to_string().as_bytes());
-                frame.extend_from_slice(b",\"body\":");
-                frame.extend_from_slice(&body_encoded);
-                frame.push(b'}');
-                frame.push(b'\n');
-                w_ref.write_all(&frame).and_then(|_| w_ref.flush())
-            } else {
-                let msg = json!({"kind": "msg", "from": from, "body": body});
-                write_envelope(w_ref, wire, &msg)
-            }
-        })
-        .and_then(|r| r.map_err(|e| e.to_string()))?;
+        // F03: resolve the destination OUT of the tables, then enqueue
+        // — the connection's writer thread is the only code that
+        // touches the socket, so a reply, the QoS pump and this routing
+        // path can never interleave, and nothing here can block on a
+        // peer that stopped reading.
+        let out = self.resolve_out(uin)?;
+        // JSON fast path: splice the envelope around the
+        // ALREADY-ENCODED body — no second serialization, no
+        // envelope-Value clone. Binary wires encode whole (msgpack
+        // can't be spliced).
+        if out.wire() == Wire::Json && !body_encoded.is_empty() {
+            let mut frame = Vec::with_capacity(bytes + 48);
+            frame.extend_from_slice(b"{\"kind\":\"msg\",\"from\":");
+            frame.extend_from_slice(from.to_string().as_bytes());
+            frame.extend_from_slice(b",\"body\":");
+            frame.extend_from_slice(&body_encoded);
+            frame.push(b'}');
+            frame.push(b'\n');
+            out.push(frame)?;
+        } else {
+            let msg = json!({"kind": "msg", "from": from, "body": body});
+            out.send(&msg)?;
+        }
         self.delivery
             .lock()
             .unwrap()
@@ -1327,37 +1477,26 @@ impl Kernel {
                     _ => break,
                 }
             };
-            // F04: resolve AND write under the destination's connection
-            // lock — no cloned fds, no guard escaping the scope
-            let target: Option<Result<(), String>> = {
+            // F03: resolve the destination under the table lock, DROP
+            // every lock, then enqueue. The old code wrote the socket
+            // while holding agents+entry — a stalled peer parked the
+            // sweep (and everything waiting on the table) behind it.
+            let resolved: Option<Option<Arc<Outbound>>> = {
                 let agents = self.agents.lock().unwrap();
-                match agents.get(&next.to) {
-                    Some(entry) => {
-                        let e = entry.lock().unwrap();
-                        let deliverable =
-                            matches!(e.state, ProcState::Running | ProcState::Registered)
-                                && e.out.is_some();
-                        if !deliverable {
-                            None
-                        } else {
-                            match e.out.as_ref() {
-                                Some(p) => {
-                                    let mut guard = p.lock().unwrap();
-                                    let msg = json!({"kind": "msg", "from": next.from,
-                                                     "body": next.body});
-                                    let w_ref: &mut dyn IoWrite = &mut *guard;
-                                    Some(
-                                        write_envelope(w_ref, e.wire, &msg)
-                                            .map_err(|err| err.to_string()),
-                                    )
-                                }
-                                None => None,
-                            }
-                        }
+                agents.get(&next.to).map(|entry| {
+                    let e = entry.lock().unwrap();
+                    let deliverable = matches!(e.state, ProcState::Running | ProcState::Registered)
+                        && e.out.is_some();
+                    if deliverable {
+                        e.out.clone()
+                    } else {
+                        None
                     }
-                    None => None,
-                }
+                })
             };
+            let target: Option<Result<(), String>> = resolved
+                .flatten()
+                .map(|out| out.send(&json!({"kind": "msg", "from": next.from, "body": next.body})));
             match target {
                 Some(res) => match res {
                     Ok(()) => {
@@ -1654,23 +1793,20 @@ impl Kernel {
                 .ok();
         }
         let count = bundles.len();
-        // F04: one lock acquisition covers the whole flush — the backlog
-        // arrives as an uninterleaved sequence
-        self.with_peer(uin, |wire, w| {
-            for b in &bundles {
-                let msg = json!({"kind": "msg", "from": b.from, "body": b.body});
-                let w_ref: &mut dyn IoWrite = w;
-                write_envelope(w_ref, wire, &msg).map_err(|e| e.to_string())?;
-                self.ledger
-                    .append(
-                        "dtn_delivered",
-                        json!({"from": b.from, "to": uin, "priority": b.priority, "body": b.body}),
-                    )
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        })
-        .and_then(|r: Result<(), String>| r)?;
+        // F03: resolve once, enqueue the whole backlog — the FIFO queue
+        // keeps the backlog in order with NO table lock held while the
+        // frames travel (and a stalled peer cannot stall the flusher)
+        let out = self.resolve_out(uin)?;
+        for b in &bundles {
+            let msg = json!({"kind": "msg", "from": b.from, "body": b.body});
+            out.send(&msg)?;
+            self.ledger
+                .append(
+                    "dtn_delivered",
+                    json!({"from": b.from, "to": uin, "priority": b.priority, "body": b.body}),
+                )
+                .map_err(|e| e.to_string())?;
+        }
         if count > 0 {
             self.ledger
                 .append(
@@ -1957,6 +2093,15 @@ impl Kernel {
                     ) {
                         return None; // already judged — never re-kill, never re-journal
                     }
+                    // F03: the writer already gave up on this peer
+                    // (queue full or write deadline) — the connection is
+                    // dead even though the reader half may still be open
+                    if e.out.as_ref().is_some_and(|o| o.is_closed()) {
+                        return Some((
+                            e.uin,
+                            "outbound writer closed (peer stopped reading)".to_string(),
+                        ));
+                    }
                     let hb_age = e.last_hb.elapsed().as_millis() as u64;
                     if hb_age > self.hb_timeout_ms {
                         return Some((e.uin, format!("heartbeat timeout ({} ms)", hb_age)));
@@ -2234,10 +2379,16 @@ impl Router {
     }
 
     /// The operator control connection: JSON lines, ctl verbs ONLY.
-    fn ctl_connection(kernel: Arc<Kernel>, mut peer: Peer) {
+    fn ctl_connection(kernel: Arc<Kernel>, peer: Peer) {
         // plain JSON lines from the FIRST byte — no wire-format magic on
-        // the operator socket (F02)
-        let mut reader = JsonPeer::new_raw(peer.try_clone().expect("ctl peer clone"));
+        // the operator socket (F02). F03: replies go through the same
+        // bounded-writer machinery as agent connections, so process
+        // inspection can never block on a stalled reader either.
+        let out = match peer.try_clone() {
+            Ok(w) => spawn_writer(kernel.ledger.clone(), w, Wire::Json),
+            Err(_) => return,
+        };
+        let mut reader = JsonPeer::new_raw(peer);
         let mut line = String::new();
         while reader.read_line_after(&mut line).unwrap_or(false) {
             let trimmed = line.trim().to_string();
@@ -2247,23 +2398,17 @@ impl Router {
             }
             match serde_json::from_str::<Value>(&trimmed) {
                 Ok(v) => {
-                    if let Err(e) = Router::handle_ctl_value(&kernel, &mut peer, &v, Wire::Json) {
-                        let _ = write_envelope(
-                            &mut peer,
-                            Wire::Json,
-                            &json!({"kind": "error", "reason": e}),
-                        );
+                    if let Err(e) = Router::handle_ctl_value(&kernel, &out, &v, Wire::Json) {
+                        let _ = out.send(&json!({"kind": "error", "reason": e}));
                     }
                 }
                 Err(e) => {
-                    let _ = write_envelope(
-                        &mut peer,
-                        Wire::Json,
-                        &json!({"kind": "error", "reason": format!("invalid json: {e}")}),
-                    );
+                    let _ =
+                        out.send(&json!({"kind": "error", "reason": format!("invalid json: {e}")}));
                 }
             }
         }
+        out.close();
     }
 
     /// One connection, any transport, both wire formats. The FIRST byte
@@ -2274,10 +2419,10 @@ impl Router {
         if peer.read(&mut first).unwrap_or(0) == 0 {
             return;
         }
-        let my_uin = match first[0] {
-            b'{' => Router::json_loop(kernel.clone(), &mut JsonPeer::new(peer, first[0])),
-            0xFF => Router::msgpack_loop(kernel.clone(), peer, true),
-            0x0A => Router::proto_loop(kernel.clone(), peer),
+        let wire = match first[0] {
+            b'{' => Wire::Json,
+            0xFF => Wire::Msgpack,
+            0x0A => Wire::Proto,
             _ => {
                 // a payload that does not even carry the schema magic is a
                 // violation — journal it (never silently drop a rejected
@@ -2286,9 +2431,25 @@ impl Router {
                     .ledger
                     .append("malformed", json!({"reason": "invalid json: first byte is not '{' or 0xFF (schema violation)", "seen": first[0]}))
                     .ok();
-                None
+                return;
             }
         };
+        // F03: the dedicated writer owns every byte this connection
+        // sends — the reader half never writes the socket again
+        let out = match peer.try_clone() {
+            Ok(w) => spawn_writer(kernel.ledger.clone(), w, wire),
+            Err(_) => return,
+        };
+        let my_uin = match wire {
+            Wire::Json => {
+                Router::json_loop(kernel.clone(), &mut JsonPeer::new(peer, first[0]), &out)
+            }
+            Wire::Msgpack => Router::msgpack_loop(kernel.clone(), peer, true, &out),
+            Wire::Proto => Router::proto_loop(kernel.clone(), peer, &out),
+        };
+        // reader gone: stop feeding the writer (queued frames are dropped
+        // with the connection)
+        out.close();
         // EOF: if this connection belonged to a live agent, the process is
         // gone — fail fast, respawn from the ledger.
         if let Some(uin) = my_uin {
@@ -2316,7 +2477,7 @@ impl Router {
         }
     }
 
-    fn proto_loop(kernel: Arc<Kernel>, mut peer: Peer) -> Option<u64> {
+    fn proto_loop(kernel: Arc<Kernel>, mut peer: Peer, out: &Arc<Outbound>) -> Option<u64> {
         let mut my_uin: Option<u64> = None;
         // first frame: the 0x0A magic byte was already consumed
         let mut v = {
@@ -2350,14 +2511,10 @@ impl Router {
             eprintln!("[proto_loop] first frame: {v}");
         }
         loop {
-            match Router::handle_value(&kernel, &mut peer, &v, &mut my_uin, Wire::Proto) {
+            match Router::handle_value(&kernel, out, &v, &mut my_uin, Wire::Proto) {
                 Ok(()) => {}
                 Err(e) => {
-                    let _ = write_envelope(
-                        &mut peer,
-                        Wire::Proto,
-                        &json!({"kind": "error", "reason": e}),
-                    );
+                    let _ = out.send(&json!({"kind": "error", "reason": e}));
                 }
             }
             match read_proto_frame(&mut peer) {
@@ -2373,7 +2530,12 @@ impl Router {
         my_uin
     }
 
-    fn msgpack_loop(kernel: Arc<Kernel>, mut peer: Peer, _first_magic_seen: bool) -> Option<u64> {
+    fn msgpack_loop(
+        kernel: Arc<Kernel>,
+        mut peer: Peer,
+        _first_magic_seen: bool,
+        out: &Arc<Outbound>,
+    ) -> Option<u64> {
         let mut my_uin: Option<u64> = None;
         if debug_enabled() {
             eprintln!("[msgpack_loop] entered");
@@ -2405,14 +2567,10 @@ impl Router {
         };
         let last_wire = Wire::Msgpack;
         loop {
-            match Router::handle_value(&kernel, &mut peer, &v, &mut my_uin, last_wire) {
+            match Router::handle_value(&kernel, out, &v, &mut my_uin, last_wire) {
                 Ok(()) => {}
                 Err(e) => {
-                    let _ = write_envelope(
-                        &mut peer,
-                        Wire::Msgpack,
-                        &json!({"kind": "error", "reason": e}),
-                    );
+                    let _ = out.send(&json!({"kind": "error", "reason": e}));
                 }
             }
             match read_msgpack_frame(&mut peer) {
@@ -2429,7 +2587,7 @@ impl Router {
         my_uin
     }
 
-    fn json_loop(kernel: Arc<Kernel>, reader: &mut JsonPeer) -> Option<u64> {
+    fn json_loop(kernel: Arc<Kernel>, reader: &mut JsonPeer, out: &Arc<Outbound>) -> Option<u64> {
         let mut my_uin: Option<u64> = None;
         let mut line = String::new();
         // the first '{' was already consumed by the mode detector
@@ -2463,14 +2621,10 @@ impl Router {
             }
         };
         loop {
-            match Router::handle_value(&kernel, reader.peer_mut(), &v, &mut my_uin, Wire::Json) {
+            match Router::handle_value(&kernel, out, &v, &mut my_uin, Wire::Json) {
                 Ok(()) => {}
                 Err(e) => {
-                    let _ = write_envelope(
-                        reader.peer_mut(),
-                        Wire::Json,
-                        &json!({"kind": "error", "reason": format!("rejected: {e}")}),
-                    );
+                    let _ = out.send(&json!({"kind": "error", "reason": format!("rejected: {e}")}));
                 }
             }
             line.clear();
@@ -2490,9 +2644,7 @@ impl Router {
                 }
                 Err(e) => {
                     kernel.ledger.append("malformed", json!({"reason": format!("invalid json: {e}"), "line": line.trim_end()})).ok();
-                    let _ = write_envelope(
-                        reader.peer_mut(),
-                        Wire::Json,
+                    let _ = out.send(
                         &json!({"kind": "error", "reason": format!("rejected: invalid json: {e}")}),
                     );
                     continue;
@@ -2508,9 +2660,9 @@ impl Router {
     /// refuses every ctl verb and journals it.
     fn handle_ctl_value(
         kernel: &Kernel,
-        writer: &mut Peer,
+        out: &Arc<Outbound>,
         v: &Value,
-        wire: Wire,
+        _wire: Wire,
     ) -> Result<(), String> {
         let kind = v
             .get("kind")
@@ -2528,12 +2680,8 @@ impl Router {
                     json!({"kind": kind, "reason": "operator token missing or wrong"}),
                 )
                 .ok();
-            write_envelope(
-                writer,
-                wire,
-                &json!({"kind": "error", "reason": "operator token required"}),
-            )
-            .map_err(|e| e.to_string())?;
+            out.send(&json!({"kind": "error", "reason": "operator token required"}))
+                .map_err(|e| e.to_string())?;
             return Ok(());
         }
         match kind {
@@ -2541,7 +2689,7 @@ impl Router {
                 // bandwidth accounting + queue state, operator-only
                 let stats = kernel.delivery.lock().unwrap().stats();
                 let reply = json!({"kind": "qos", "stats": stats});
-                write_envelope(writer, wire, &reply).map_err(|e| e.to_string())?;
+                out.send(&reply).map_err(|e| e.to_string())?;
                 Ok(())
             }
             "ctl_ps" => {
@@ -2550,7 +2698,7 @@ impl Router {
                 if debug_json_enabled() {
                     eprintln!("[ctl_ps] reply = {reply}");
                 }
-                write_envelope(writer, wire, &reply).map_err(|e| e.to_string())?;
+                out.send(&reply).map_err(|e| e.to_string())?;
                 Ok(())
             }
             "ctl_grant" | "ctl_revoke" => {
@@ -2608,7 +2756,7 @@ impl Router {
                     } else {
                         "revoked"
                     };
-                    write_envelope(writer, wire, &json!({"kind": ack, "name": name}))
+                    out.send(&json!({"kind": ack, "name": name}))
                         .map_err(|e| e.to_string())?;
                     Ok(())
                 } else {
@@ -2633,7 +2781,7 @@ impl Router {
                     .append("restart_authorized", json!({"uin": uin, "name": name}))
                     .ok();
                 kernel.restart_authorized(uin)?;
-                write_envelope(writer, wire, &json!({"kind": "restarted", "name": name}))
+                out.send(&json!({"kind": "restarted", "name": name}))
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
@@ -2644,7 +2792,7 @@ impl Router {
     /// Handle ONE decoded envelope (transport- and format-agnostic).
     fn handle_value(
         kernel: &Kernel,
-        writer: &mut Peer,
+        out: &Arc<Outbound>,
         v: &Value,
         my_uin: &mut Option<u64>,
         wire: Wire,
@@ -2663,9 +2811,7 @@ impl Router {
                                "reason": "control verbs are only served on the operator socket"}),
                     )
                     .ok();
-                write_envelope(
-                    writer,
-                    wire,
+                out.send(
                     &json!({"kind": "error", "reason": "control verbs are only served on the operator socket"}),
                 )
                 .map_err(|e| e.to_string())?;
@@ -2773,12 +2919,8 @@ impl Router {
                             }
                             // the relay's own ack contract: confirm the
                             // hand-off, otherwise drain_acks blocks forever
-                            write_envelope(
-                                writer,
-                                wire,
-                                &json!({"kind": "acked", "bundle_id": bundle_id}),
-                            )
-                            .map_err(|e| e.to_string())?;
+                            out.send(&json!({"kind": "acked", "bundle_id": bundle_id}))
+                                .map_err(|e| e.to_string())?;
                             return Ok(());
                         }
                         if kernel.agent_ready(target) {
@@ -2803,12 +2945,8 @@ impl Router {
                                 orig, to_name, target, body, 5, hops, bundle_id, false, frag_meta,
                             )?;
                         }
-                        write_envelope(
-                            writer,
-                            wire,
-                            &json!({"kind": "acked", "bundle_id": bundle_id}),
-                        )
-                        .map_err(|e| e.to_string())?;
+                        out.send(&json!({"kind": "acked", "bundle_id": bundle_id}))
+                            .map_err(|e| e.to_string())?;
                         return Ok(());
                     }
                     "custody_ack" => {
@@ -2850,9 +2988,7 @@ impl Router {
                                        "by": me, "released": released}),
                             )
                             .map_err(|e| e.to_string())?;
-                        write_envelope(
-                            writer,
-                            wire,
+                        out.send(
                             &json!({"kind": "acked", "bundle_id": bundle_id, "custody": true}),
                         )
                         .map_err(|e| e.to_string())?;
@@ -3028,9 +3164,9 @@ impl Router {
                     merged.retain(|c| !e.revoked.contains(c));
                     e.caps = merged;
                     e.state = ProcState::Running;
-                    e.out = Some(Arc::new(Mutex::new(
-                        writer.try_clone().map_err(|e| e.to_string())?,
-                    )));
+                    // F03: the entry holds the connection's QUEUE — the
+                    // writer thread behind it is the only socket writer
+                    e.out = Some(Arc::clone(out));
                     e.wire = wire;
                     e.last_hb = Instant::now();
                     e.stuck_sweeps = 0;
@@ -3051,12 +3187,8 @@ impl Router {
                     )
                     .map_err(|e| e.to_string())?;
                 let recover = kernel.ledger.last_checkpoint(uin);
-                write_envelope(
-                    writer,
-                    wire,
-                    &json!({"kind": "welcome", "uin": uin, "recover": recover}),
-                )
-                .map_err(|e| e.to_string())?;
+                out.send(&json!({"kind": "welcome", "uin": uin, "recover": recover}))
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Envelope::Heartbeat { uin, step, phase } => {
@@ -3077,7 +3209,7 @@ impl Router {
             Envelope::Send { uin, to, body } => {
                 kernel.check_cap(uin, "send", &to)?;
                 kernel.route_send(uin, &to, &body)?;
-                write_envelope(writer, wire, &json!({"kind": "sent", "to": to}))
+                out.send(&json!({"kind": "sent", "to": to}))
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
@@ -3091,7 +3223,7 @@ impl Router {
                     entry.lock().unwrap().last_checkpoint = Some(state.clone());
                 }
                 drop(agents);
-                write_envelope(writer, wire, &json!({"kind": "acked", "seq": e.seq}))
+                out.send(&json!({"kind": "acked", "seq": e.seq}))
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
@@ -3114,7 +3246,7 @@ impl Router {
                     .map_err(|e| e.to_string())?;
                 // ACK: the agent's drain_acks blocks until one arrives — an
                 // unacked note looked like a stalled process to the watchdog
-                write_envelope(writer, wire, &json!({"kind": "acked", "note": true}))
+                out.send(&json!({"kind": "acked", "note": true}))
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
@@ -3182,6 +3314,15 @@ impl Peer {
             Peer::Tcp(s) => Ok(Peer::Tcp(s.try_clone()?)),
         }
     }
+
+    /// F03: the writer half carries a deadline so a peer that stopped
+    /// reading releases the writer thread instead of parking it.
+    pub fn set_write_timeout(&self, t: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            Peer::Unix(s) => s.set_write_timeout(t),
+            Peer::Tcp(s) => s.set_write_timeout(t),
+        }
+    }
 }
 
 /// A JSON peer whose first byte was consumed by the mode detector.
@@ -3245,9 +3386,6 @@ impl JsonPeer {
                 Err(e) => return Err(e),
             }
         }
-    }
-    fn peer_mut(&mut self) -> &mut Peer {
-        &mut self.peer
     }
 }
 
@@ -3614,10 +3752,10 @@ mod f10_authority_tests {
 
         // wrong credential: refused, and NOTHING changes
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
-        let mut w = Peer::Unix(server);
+        let out = spawn_writer(k.ledger.clone(), Peer::Unix(server), Wire::Json);
         let v = json!({"kind": "ctl_grant", "name": "alice", "caps": ["send:x"],
                        "token": "wrong"});
-        Router::handle_ctl_value(&k, &mut w, &v, Wire::Json).unwrap();
+        Router::handle_ctl_value(&k, &out, &v, Wire::Json).unwrap();
         let r = read_reply(&client);
         assert_eq!(r["kind"], "error", "wrong token must be refused: {r}");
         assert!(
@@ -3637,10 +3775,10 @@ mod f10_authority_tests {
 
         // correct credential: the same verb is served
         let (client2, server2) = std::os::unix::net::UnixStream::pair().unwrap();
-        let mut w2 = Peer::Unix(server2);
+        let out2 = spawn_writer(k.ledger.clone(), Peer::Unix(server2), Wire::Json);
         let v2 = json!({"kind": "ctl_grant", "name": "alice", "caps": ["send:x"],
                         "token": "s3cret-operator"});
-        Router::handle_ctl_value(&k, &mut w2, &v2, Wire::Json).unwrap();
+        Router::handle_ctl_value(&k, &out2, &v2, Wire::Json).unwrap();
         let r2 = read_reply(&client2);
         assert_eq!(r2["kind"], "granted", "valid token must be served: {r2}");
         assert!(k.agents.lock().unwrap()[&7]
@@ -3653,14 +3791,14 @@ mod f10_authority_tests {
 
     fn try_register(k: &Kernel, token: Option<&str>, caps: &[&str]) -> Result<(), String> {
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
-        // keep `client` alive: a successful register writes the welcome
-        // before returning, and a dropped peer is EPIPE
-        let mut w = Peer::Unix(server);
+        let out = spawn_writer(k.ledger.clone(), Peer::Unix(server), Wire::Json);
+        // keep `client` alive: a successful register enqueues the welcome
+        // and the writer thread must be able to deliver it
         let _keep = client;
         let v = json!({"kind": "register", "name": "alice",
                        "caps": caps, "pid": 9999, "token": token});
         let mut my_uin: Option<u64> = None;
-        Router::handle_value(k, &mut w, &v, &mut my_uin, Wire::Json)
+        Router::handle_value(k, &out, &v, &mut my_uin, Wire::Json)
     }
 
     #[test]
@@ -3789,5 +3927,195 @@ mod f10_authority_tests {
         assert!(!credential_eq("abc", "abcd"));
         assert!(!credential_eq("", "x"));
         assert!(credential_eq("", ""));
+    }
+}
+
+#[cfg(test)]
+mod f03_outbound_tests {
+    //! Item 3 gates: one writer per connection, bounded queue, framing
+    //! preserved under concurrency, and a peer that stops reading can
+    //! never stall the kernel.
+
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    fn temp_ledger(tag: &str) -> (Arc<Ledger>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ama-f03-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = Arc::new(Ledger::open(&dir.join("l.jsonl")).unwrap());
+        (ledger, dir)
+    }
+
+    fn outbound_no_writer(ledger: Arc<Ledger>, wire: Wire, cap: usize) -> Arc<Outbound> {
+        Arc::new(Outbound {
+            wire,
+            cap,
+            state: Mutex::new(OutboundState {
+                frames: std::collections::VecDeque::new(),
+                bytes: 0,
+            }),
+            idle: std::sync::Condvar::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            ledger,
+        })
+    }
+
+    /// The queue is a BOUND, not a wish: pushes stop (with an error)
+    /// instead of growing memory, and they never block the caller —
+    /// that is what keeps a stalled peer out of the sweep's way.
+    #[test]
+    fn outbound_queue_is_bounded_and_push_never_blocks() {
+        let (ledger, _dir) = temp_ledger("bound");
+        let out = outbound_no_writer(ledger.clone(), Wire::Json, 1024);
+        let frame = vec![b'x'; 200];
+        let started = Instant::now();
+        let mut accepted = 0usize;
+        for _ in 0..100 {
+            if out.push(frame.clone()).is_ok() {
+                accepted += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            accepted > 0 && accepted <= 5,
+            "cap 1024 / 200B frames => at most 5 accepted, got {accepted}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "push must never block on a slow peer (took {elapsed:?})"
+        );
+        // queue-full is DEFINED: refuse, close, journal
+        assert!(out.is_closed(), "queue-full closes the connection");
+        assert!(out.push(frame).is_err(), "closed queue refuses frames");
+        let kinds: Vec<String> = ledger.read_all().iter().map(|e| e.ev.clone()).collect();
+        assert!(
+            kinds.contains(&"outbound_queue_full".to_string()),
+            "journal: {kinds:?}"
+        );
+    }
+
+    /// Concurrent producers (routing, QoS pump, replies, DTN flush — the
+    /// real kernel callers) never interleave: every frame decodes on its
+    /// own wire and per-producer order is preserved (FIFO queue).
+    fn framing_case(wire: Wire, tag: &str) {
+        let (ledger, _dir) = temp_ledger(tag);
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let out = spawn_writer(ledger, Peer::Unix(server), wire);
+
+        let mut producers = Vec::new();
+        for t in 0..4u64 {
+            let o = Arc::clone(&out);
+            producers.push(std::thread::spawn(move || {
+                for i in 0..25u64 {
+                    // `text` (not `i`): the proto encoder only knows the
+                    // envelope's real fields and refuses unknown ones
+                    o.send(&json!({"kind": "note", "from": t, "text": i.to_string()}))
+                        .expect("enqueue must succeed well under the cap");
+                }
+            }));
+        }
+        for h in producers {
+            h.join().unwrap();
+        }
+
+        let mut per_producer: HashMap<u64, Vec<u64>> = HashMap::new();
+        // ONE reader per wire for the whole session: a fresh BufReader
+        // per line would swallow (and discard) the bytes buffered
+        // beyond it — a classic self-inflicted hang
+        let mut collect = |v: Value| {
+            assert_eq!(v["kind"], "note");
+            let from = v["from"].as_u64().unwrap();
+            let i: u64 = v["text"].as_str().unwrap().parse().unwrap();
+            per_producer.entry(from).or_default().push(i);
+        };
+        match wire {
+            Wire::Json => {
+                let mut reader = BufReader::new(client);
+                for _ in 0..100 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("JSON line");
+                    collect(serde_json::from_str(line.trim()).expect("JSON line must parse whole"));
+                }
+            }
+            Wire::Msgpack => {
+                let mut r = client;
+                for _ in 0..100 {
+                    collect(read_msgpack_frame(&mut r).expect("msgpack frame intact"));
+                }
+            }
+            Wire::Proto => {
+                let mut r = client;
+                for _ in 0..100 {
+                    collect(read_proto_frame(&mut r).expect("proto frame intact"));
+                }
+            }
+        }
+        for (producer, seq) in &per_producer {
+            let mut sorted = seq.clone();
+            sorted.sort();
+            assert_eq!(
+                seq, &sorted,
+                "producer {producer}: FIFO order must survive concurrency"
+            );
+        }
+        assert_eq!(per_producer.len(), 4, "all producers' frames arrived");
+    }
+
+    #[test]
+    fn json_frames_never_interleave_under_concurrency() {
+        framing_case(Wire::Json, "json");
+    }
+
+    #[test]
+    fn msgpack_frames_never_interleave_under_concurrency() {
+        framing_case(Wire::Msgpack, "msgpack");
+    }
+
+    #[test]
+    fn proto_frames_never_interleave_under_concurrency() {
+        framing_case(Wire::Proto, "proto");
+    }
+
+    /// A peer that stops reading: the socket buffer fills, the writer
+    /// hits its deadline, and the connection is closed — while every
+    /// kernel-side push in the meantime returned immediately. Nothing
+    /// about this peer reaches the sweep, `ama ps`, or other agents.
+    #[test]
+    fn a_peer_that_stops_reading_is_disconnected_without_stalling_the_kernel() {
+        let (ledger, _dir) = temp_ledger("slow");
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let out = spawn_writer(ledger.clone(), Peer::Unix(server), Wire::Json);
+
+        // 128 x 8 KiB = 1 MiB queued: over the socket buffer, under the
+        // 4 MiB cap — the writer will block on write and hit the deadline
+        let frame = json!({"kind": "note", "text": "x".repeat(8 * 1024)});
+        let started = Instant::now();
+        for _ in 0..128 {
+            out.send(&frame).expect("under cap: must not block");
+        }
+        let enqueue_time = started.elapsed();
+        assert!(
+            enqueue_time < Duration::from_millis(200),
+            "kernel-side enqueue must not wait on the stalled peer ({enqueue_time:?})"
+        );
+
+        // the writer's deadline closes it (the client never reads)
+        let deadline = Instant::now() + Duration::from_millis(3000);
+        while !out.is_closed() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            out.is_closed(),
+            "write deadline must release the writer and close the connection"
+        );
+        let kinds: Vec<String> = ledger.read_all().iter().map(|e| e.ev.clone()).collect();
+        assert!(
+            kinds.contains(&"outbound_write_failed".to_string()),
+            "journal must record why: {kinds:?}"
+        );
+        drop(client);
     }
 }
