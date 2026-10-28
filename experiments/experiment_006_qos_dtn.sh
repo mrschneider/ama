@@ -54,7 +54,7 @@ sleep 5
   --task experiments/tasks_006/dtn.json &
 DTN_RESTART_PID=$!
 
-python3 experiments/wait_ledger_quiet.py 2 35
+python3 experiments/wait_ledger_quiet.py 3 35
 kill $DTN_RESTART_PID 2>/dev/null || true
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true

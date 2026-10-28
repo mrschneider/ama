@@ -39,7 +39,7 @@ timeout 40 ./target/debug/ama serve \
   --manifest experiments/manifest_003.json \
   --agentd ./target/debug/ama-agentd &
 KERNEL_PID=$!
-python3 experiments/wait_ledger_quiet.py 2 35
+python3 experiments/wait_ledger_quiet.py 3 35
 ./target/debug/ama ps --socket /tmp/ama_exp.sock > /tmp/ama_exp/ps.json 2>/dev/null || true
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true

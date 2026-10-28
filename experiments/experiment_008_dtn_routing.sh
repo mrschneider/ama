@@ -53,7 +53,7 @@ sleep 7
   --task experiments/tasks_008/far.json &
 FAR2=$!
 
-python3 experiments/wait_ledger_quiet.py 2 35
+python3 experiments/wait_ledger_quiet.py 3 35
 kill $FAR2 2>/dev/null || true
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true

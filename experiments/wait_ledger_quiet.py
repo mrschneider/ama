@@ -23,13 +23,17 @@ last_change = time.time()
 while time.time() < deadline:
     try:
         with open(ledger) as f:
-            n = sum(1 for _ in f)
+            lines = f.readlines()
+        n = len(lines)
+        has_registered = any('"registered"' in l for l in lines)
     except FileNotFoundError:
-        n = -1
+        n, has_registered = -1, False
     if n != last_count:
         last_count = n
         last_change = time.time()
-    elif time.time() - last_change >= quiet_s:
+    # the boot gap (spawned -> registered) must NOT count as quiet: no
+    # registration yet means the workload has not started
+    elif has_registered and time.time() - last_change >= quiet_s:
         print(f"== ledger quiet for {quiet_s}s ({max(0, n)} events); validating ==", flush=True)
         sys.exit(0)
     time.sleep(0.3)

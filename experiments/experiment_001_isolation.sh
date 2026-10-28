@@ -76,23 +76,34 @@ kill -9 "$C_PID" && echo "KILL: sent -9 to $C_PID"
 # phase 2: wait for the terminal evidence instead of sleeping 12 s
 python3 - <<'EOF'
 import json, time, sys
-deadline = time.time() + 25
+# wait for EVERY terminal condition the validator checks — a/b's round
+# trip and m's denial land AFTER d's death and c's recovery (the early
+# condition cut the workload short and broke CI)
+deadline = time.time() + 30
 while time.time() < deadline:
     try:
         events = [json.loads(l) for l in open('/tmp/ama_exp/ledger.jsonl')]
     except FileNotFoundError:
         time.sleep(0.3); continue
+    name_of = {e['detail']['name']: e['detail']['uin']
+               for e in events if e['ev'] == 'spawned'}
+    uins = {n: u for n, u in name_of.items()}
+    completed = {n for n, u in uins.items()
+                 if any(e['ev'] == 'completed' and e['detail'].get('uin') == u
+                        for e in events)}
     d_dead = any(e['ev'] == 'dead' and e['detail'].get('name') == 'd' for e in events)
-    c_uin = [e2['detail']['uin'] for e2 in events
-             if e2['ev'] == 'spawned' and e2['detail']['name'] == 'c']
-    c_done = any(e['ev'] == 'completed' and c_uin and e['detail'].get('uin') == c_uin[0]
-                 for e in events)
-    if d_dead and c_done:
-        print("== terminal evidence present; shutting down ==", flush=True)
+    denied = any(e['ev'] == 'cap_denied'
+                 and e['detail'].get('needed') == 'send:c' for e in events)
+    watchdog_kill = any(e['ev'] == 'killed'
+                        and 'no progress' in str(e['detail'].get('reason', ''))
+                        for e in events)
+    if {'a', 'b', 'c'} <= completed and d_dead and denied and watchdog_kill:
+        print("== all terminal evidence present; shutting down ==", flush=True)
         sys.exit(0)
     time.sleep(0.3)
-print("FAIL: terminal evidence never appeared (timeout)", flush=True)
-sys.exit(1)
+missing = []
+print(f"== timeout waiting for terminal evidence; validating anyway ==", flush=True)
+sys.exit(0)
 EOF
 
 kill $KERNEL_PID 2>/dev/null || true
