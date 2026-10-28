@@ -580,37 +580,118 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    pub fn open(path: &std::path::Path) -> std::io::Result<Ledger> {
-        // F06: REPAIR a torn tail BEFORE anything reads or appends — a
-        // crash mid-write leaves a partial last line that (a) poisons the
-        // line count and (b) would corrupt every subsequent append-on-top.
-        // The repair truncates the unparsable tail and journals the loss.
-        if let Ok(f) = std::fs::File::open(path) {
-            let last_line: Option<String> = {
-                let mut last = None;
-                for line in BufReader::new(f).lines().map_while(Result::ok) {
-                    if !line.trim().is_empty() {
-                        last = Some(line);
+    /// F10(item 4): repair a crash-torn tail at EXACT byte boundaries.
+    ///
+    /// Records are newline-terminated by `append` (one write for the
+    /// line, then one for the newline), so the legal endings are:
+    ///   * `<complete record>\n`                       — validate it and stop;
+    ///   * `<complete record>` with the newline missing  — crash between
+    ///     the two writes: RECOVER it by appending the newline;
+    ///   * anything else after the last `\n`             — a partial
+    ///     write: cut EXACTLY at that boundary.
+    ///
+    /// The old repair computed `line.len() + 1` from the parsed line —
+    /// for the common no-trailing-newline case that overshot by one
+    /// byte and deleted the PREVIOUS record's newline, letting the next
+    /// append concatenate two records onto one line. It also ignored
+    /// set_len's result and printed "torn tail repaired" unconditionally.
+    ///
+    /// Memory stays bounded: the file is scanned backwards in 8 KiB
+    /// chunks (a 1 GiB ledger must not become a 1 GiB allocation); only
+    /// the single last record is read whole, bounded by the largest
+    /// record ever written.
+    fn repair_tail(path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let len = f.metadata()?.len();
+        if len == 0 {
+            return Ok(());
+        }
+        // offset just after the newline at-or-before `from` (exclusive);
+        // 0 when there is none. Backward 8 KiB chunks: bounded memory.
+        let mut prev_newline = |from: u64| -> std::io::Result<u64> {
+            let mut pos = from;
+            let mut chunk = [0u8; 8192];
+            while pos > 0 {
+                let take = (chunk.len() as u64).min(pos) as usize;
+                pos -= take as u64;
+                f.seek(SeekFrom::Start(pos))?;
+                f.read_exact(&mut chunk[..take])?;
+                for (i, &b) in chunk[..take].iter().enumerate().rev() {
+                    if b == b'\n' {
+                        return Ok(pos + i as u64 + 1);
                     }
                 }
-                last
-            };
-            if let Some(line) = last_line {
-                if serde_json::from_str::<LedgerEvent>(&line).is_err() {
-                    let trimmed = line.len() + 1; // + the newline that was consumed
-                    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                    let cut = len.saturating_sub(trimmed as u64);
-                    let _ = std::fs::File::options()
-                        .write(true)
-                        .open(path)
-                        .and_then(|f| f.set_len(cut));
-                    eprintln!(
-                        "[ama] ledger: torn tail repaired ({} bytes truncated)",
-                        trimmed
-                    );
-                }
+            }
+            Ok(0)
+        };
+
+        let boundary = prev_newline(len)?;
+        let (seg_start, seg_end) = if boundary < len {
+            // does NOT end with a newline: the tail after the last one
+            (boundary, len)
+        } else {
+            // ends with a newline: the last RECORD is [prev, len);
+            // validate it — garbage that happens to end in a newline
+            // must not survive into replay either
+            let prev = prev_newline(len - 1)?;
+            (prev, len)
+        };
+        if seg_start == seg_end {
+            return Ok(()); // empty file edge already handled above
+        }
+        let mut seg = vec![0u8; (seg_end - seg_start) as usize];
+        f.seek(SeekFrom::Start(seg_start))?;
+        f.read_exact(&mut seg)?;
+        if seg.last() == Some(&b'\n') {
+            seg.pop(); // the terminating newline is not part of the record
+        }
+        // the file ends exactly on a record boundary iff the scan's
+        // boundary reached EOF; otherwise the tail has NO newline and a
+        // valid parse means only the terminator is missing
+        let ends_with_newline = boundary == len;
+        match serde_json::from_slice::<LedgerEvent>(&seg) {
+            Ok(_) if ends_with_newline => Ok(()),
+            Ok(_) => {
+                // complete record, its final newline never landed:
+                // recover it so every future append starts on a fresh line
+                let mut w = std::fs::File::options().append(true).open(path)?;
+                w.write_all(b"\n")?;
+                w.flush()?;
+                eprintln!(
+                    "[ama] ledger: recovered a record missing its final newline ({} bytes)",
+                    seg.len()
+                );
+                Ok(())
+            }
+            Err(_) => {
+                // partial/garbage tail: cut EXACTLY at the record start;
+                // every preceding record stays byte-for-byte intact
+                let mut w = std::fs::File::options().write(true).open(path)?;
+                w.set_len(seg_start)?;
+                w.flush()?;
+                eprintln!(
+                    "[ama] ledger: torn tail repaired ({} bytes truncated)",
+                    len - seg_start
+                );
+                Ok(())
             }
         }
+    }
+
+    pub fn open(path: &std::path::Path) -> std::io::Result<Ledger> {
+        // F06/F10(item 4): repair a torn tail BEFORE anything reads or
+        // appends — a crash mid-write leaves a partial last line that
+        // (a) poisons the line count and (b) would corrupt every
+        // subsequent append-on-top. Every failure here propagates: the
+        // old code ignored set_len's error and printed "repaired" no
+        // matter what, i.e. a failed repair reported success.
+        Self::repair_tail(path)?;
+
         let seq = {
             let f = std::fs::File::open(path).ok();
             let mut n = 0u64;
@@ -4117,5 +4198,177 @@ mod f03_outbound_tests {
             "journal must record why: {kinds:?}"
         );
         drop(client);
+    }
+}
+
+#[cfg(test)]
+mod f04_ledger_tail_tests {
+    //! Item 4 gates: a crash-torn tail is repaired at EXACT byte
+    //! boundaries — with or without a trailing newline — valid records
+    //! are preserved, a repair failure is an error (never a silent
+    //! "repaired"), and replay still finds the last checkpoint.
+
+    use super::*;
+    use std::io::Write;
+
+    const VALID1: &str = r#"{"seq":1,"ts_ms":10,"ev":"spawned","detail":{"uin":7}}"#;
+    const VALID2: &str = r#"{"seq":2,"ts_ms":20,"ev":"completed","detail":{"uin":7}}"#;
+
+    fn mk(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ama-f04-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("l.jsonl");
+        std::fs::write(&path, bytes).unwrap();
+        (path, dir)
+    }
+
+    fn text(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// The case the old repair got wrong: a torn record WITHOUT a
+    /// trailing newline. `line.len() + 1` overshot and deleted the
+    /// PREVIOUS record's newline; the exact-boundary cut keeps it, so
+    /// the next append cannot concatenate two records on one line.
+    #[test]
+    fn torn_tail_without_newline_cuts_exactly_at_the_boundary() {
+        let bytes = format!("{VALID1}\n{{\"seq\":2,\"ts_ms\":20,\"ev\":\"checkp").into_bytes();
+        let (path, dir) = mk("no-nl", &bytes);
+
+        Ledger::open(&path).expect("repair must succeed");
+        assert_eq!(
+            text(&path),
+            format!("{VALID1}\n"),
+            "valid record + its newline intact"
+        );
+
+        let l = Ledger::open(&path).expect("reopen after repair");
+        let e = l.append("x", json!({"i": 9})).expect("append works");
+        assert_eq!(e.seq, 2, "the repaired ledger counts ONE surviving record");
+        let all = l.read_all();
+        assert_eq!(all.len(), 2, "both records parse independently: {all:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Defensive case the review also asks for: garbage that DOES end in
+    /// a newline (something wrote a non-record line) is cut at ITS start.
+    #[test]
+    fn tail_with_trailing_newline_is_cut_at_the_record_start() {
+        let bytes = format!("{VALID1}\nP@RTIAL-GARBAGE\n").into_bytes();
+        let (path, dir) = mk("with-nl", &bytes);
+        Ledger::open(&path).expect("repair must succeed");
+        assert_eq!(text(&path), format!("{VALID1}\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_ledger_is_a_noop() {
+        let (path, dir) = mk("empty", b"");
+        let l = Ledger::open(&path).expect("empty ledger opens");
+        let e = l.append("x", json!({})).unwrap();
+        assert_eq!(e.seq, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash mid-first-record: nothing is valid, the file becomes
+    /// empty rather than keeping one unparseable line.
+    #[test]
+    fn single_partial_record_truncates_to_empty() {
+        let (path, dir) = mk("single", b"{\"seq\":1,\"ts_ms\":1,\"ev\":");
+        Ledger::open(&path).expect("repair must succeed");
+        assert_eq!(text(&path), "", "no valid prefix survives");
+        let l = Ledger::open(&path).unwrap();
+        let e = l.append("x", json!({})).unwrap();
+        assert_eq!(e.seq, 1, "seq counting restarts from the empty file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The crash landed BETWEEN the line write and the newline write:
+    /// the record itself is complete and must be KEPT (with its newline
+    /// restored) — dropping it would lose a committed event.
+    #[test]
+    fn complete_record_missing_final_newline_is_recovered() {
+        let bytes = format!("{VALID1}\n{VALID2}").into_bytes();
+        let (path, dir) = mk("reco", &bytes);
+        Ledger::open(&path).expect("repair must succeed");
+        assert_eq!(
+            text(&path),
+            format!("{VALID1}\n{VALID2}\n"),
+            "the complete record is kept and its newline restored"
+        );
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(l.read_all().len(), 2, "both records parse independently");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The backward scan reads 8 KiB chunks — a record far larger than
+    /// one chunk must still have its boundary found exactly.
+    #[test]
+    fn large_record_crossing_the_scan_chunk_is_cut_exactly() {
+        let big = format!(
+            r#"{{"seq":1,"ts_ms":10,"ev":"note","detail":{{"blob":"{}"}}}}"#,
+            "y".repeat(40_000)
+        );
+        let bytes = format!("{big}\n{{\"seq\":2,\"ev\":torn").into_bytes();
+        let (path, dir) = mk("large", &bytes);
+        Ledger::open(&path).expect("repair must succeed");
+        assert_eq!(
+            text(&path).len(),
+            big.len() + 1,
+            "boundary exactly after the 40 KiB record"
+        );
+        let l = Ledger::open(&path).unwrap();
+        assert_eq!(l.read_all().len(), 1, "the large record survives whole");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Replay after a torn tail: the last committed checkpoint must
+    /// still be the one recovery resumes from.
+    #[test]
+    fn replay_after_repair_finds_the_last_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("ama-f04-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("l.jsonl");
+        {
+            let l = Ledger::open(&path).unwrap();
+            l.append("checkpoint", json!({"uin": 7, "state": {"n": 0}}))
+                .unwrap();
+            l.append("checkpoint", json!({"uin": 7, "state": {"n": 1}}))
+                .unwrap();
+        }
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            write!(f, "{{\"seq\":3,\"ts_ms\":99,\"ev\":\"checkp").unwrap();
+        }
+        let l = Ledger::open(&path).expect("repair before replay");
+        let last = l
+            .last_checkpoint(7)
+            .expect("checkpoint survives the repair");
+        let n = last["state"]["n"].as_u64().or(last["n"].as_u64());
+        assert_eq!(n, Some(1), "replay resumes from n=1, got {last}");
+        let all = l.read_all();
+        assert_eq!(all.len(), 2, "every retained record parses: {all:?}");
+        assert_eq!(all.last().unwrap().ev, "checkpoint");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repair that cannot be performed must FAIL the open — the old
+    /// code ignored set_len's result and printed "torn tail repaired"
+    /// unconditionally, i.e. a no-op failure reported success.
+    #[test]
+    fn repair_failure_is_an_error_never_a_silent_success() {
+        let dir = std::env::temp_dir().join(format!("ama-f04-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // a DIRECTORY as the ledger: scanning it cannot succeed, so the
+        // open must surface the error instead of pretending to repair
+        let res = Ledger::open(&dir);
+        assert!(res.is_err(), "a failed repair must be an Err, not Ok");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
