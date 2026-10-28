@@ -21,7 +21,7 @@ echo "$OUT" | grep -q "1 ptrace-inside" && echo "PASS: seccomp: ptrace refused (
 # hot renegotiation scenario: agent m tries to reach c — denied — the
 # operator grants send:c — the same send is delivered — the operator
 # revokes it — the send is refused again. a/b/c complete in parallel.
-timeout 20 ./target/debug/ama serve \
+timeout 40 ./target/debug/ama serve \
   --manifest experiments/manifest_002.json \
   --agentd ./target/debug/ama-agentd &
 KERNEL_PID=$!
@@ -31,7 +31,7 @@ echo "== grant sent at t~1.0s; m's second send reaches c =="
 sleep 1.5
 ./target/debug/ama revoke --socket /tmp/ama_exp.sock --name m --caps "send:c" || true
 echo "== revoke sent at t~2.6s; m's third send is refused again =="
-sleep 7
+python3 experiments/wait_ledger_quiet.py 2 35
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 

@@ -25,7 +25,7 @@ pkill -9 -x ama 2>/dev/null || true
 pkill -9 -x ama-agentd 2>/dev/null || true
 sleep 1
 
-timeout 20 ./target/debug/ama serve \
+timeout 40 ./target/debug/ama serve \
   --manifest experiments/manifest_007.json \
   --agentd ./target/debug/ama-agentd &
 KERNEL_PID=$!
@@ -33,7 +33,7 @@ KERNEL_PID=$!
 sleep 6
 ./target/debug/ama qos --socket /tmp/ama_exp.sock > /tmp/ama_qos_cli.json 2>/dev/null || true
 
-sleep 7
+python3 experiments/wait_ledger_quiet.py 2 35
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 

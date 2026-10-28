@@ -35,11 +35,11 @@ JAIL_UID=$(timeout 5 ./target/debug/ama jail --userns -- /bin/sh -c 'id -u' 2>&1
 echo "host uid: $HOST_UID | jailed uid: $JAIL_UID"
 [ "$JAIL_UID" = "0" ] && echo "PASS: userns: the jailed tool runs as uid 0 INSIDE a fresh user+mount namespace (host ownership unchanged)" || echo "SKIP (host policy): userns tier implemented but this host forbids unprivileged user namespaces (jailed uid seen: $JAIL_UID)"
 
-timeout 20 ./target/debug/ama serve \
+timeout 40 ./target/debug/ama serve \
   --manifest experiments/manifest_003.json \
   --agentd ./target/debug/ama-agentd &
 KERNEL_PID=$!
-sleep 8
+python3 experiments/wait_ledger_quiet.py 2 35
 ./target/debug/ama ps --socket /tmp/ama_exp.sock > /tmp/ama_exp/ps.json 2>/dev/null || true
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true

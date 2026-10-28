@@ -73,8 +73,18 @@ def send(s, obj):
     s.sendall((json.dumps(obj) + "\n").encode())
 
 
-# the two REAL agents (manifest spawns them; give them a beat)
-time.sleep(1.0)
+# the two REAL agents: poll until both REGISTERED (F03 — readiness
+# polling, not a fixed sleep; a slow runner needs longer than 1 s)
+deadline = time.time() + 15
+while time.time() < deadline:
+    evs = [json.loads(l) for l in open("/tmp/ama_exp9/ledger.jsonl")] \
+        if os.path.exists("/tmp/ama_exp9/ledger.jsonl") else []
+    if {"a", "b"} <= {e["detail"].get("name") for e in evs if e["ev"] == "registered"}:
+        break
+    time.sleep(0.2)
+else:
+    print("FAIL: agents a/b never registered", flush=True)
+    sys.exit(1)
 
 events = [json.loads(l) for l in open("/tmp/ama_exp9/ledger.jsonl")]
 uin_of = {e["detail"]["name"]: e["detail"]["uin"] for e in events if e["ev"] == "spawned"}
@@ -134,16 +144,27 @@ a_sock.close()
 # claimable by a fresh process (operator-driven restarts) — but the
 # session still cannot act as agent A, and caps stay manifest-bound
 subprocess.run(["pkill", "-9", "-f", "tasks_009/b.json"], check=False)
-time.sleep(2.0)
 
+# retry the dead-claim register until the kernel notices the EOF (a slow
+# runner needs more than a fixed 2 s — F03 polling)
 b2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 b2.connect(SOCK)
-# 4: the TASK asks for extra caps — the manifest's trusted caps win
-send(b2, {"kind": "register", "name": "b",
-          "caps": ["send:a", "send:c", "send:sneaky"], "pid": os.getpid()})  # no token: DEAD instance
-r = json.loads(line(b2))
+r = None
+for _ in range(30):
+    send(b2, {"kind": "register", "name": "b",
+              "caps": ["send:a", "send:c", "send:sneaky"],
+              "pid": os.getpid()})  # no token: DEAD instance claim
+    r = json.loads(line(b2))
+    if r.get("kind") == "welcome":
+        break
+    if "token" not in r.get("reason", ""):
+        break  # unexpected refusal — report it as a failure
+    time.sleep(0.5)
+    b2.close()
+    b2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    b2.connect(SOCK)
 ok("identity: a DEAD agent's identity may be claimed by a fresh process",
-   r.get("kind") == "welcome", f"got {r.get('kind')}")
+   r.get("kind") == "welcome", f"got {r.get('kind')} {r.get('reason', '')}")
 uin_b2 = r.get("uin")
 
 # the claimed extra caps are NOT granted: b2 sends to c -> refused

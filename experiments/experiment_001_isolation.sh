@@ -25,11 +25,38 @@ print("MALFORMED_REPLY:", s.recv(4096).decode().strip())
 EOF
 ) &
 
-timeout 20 ./target/debug/ama serve \
+# F03: readiness polling instead of fixed sleeps — the kernel used to
+# live a fixed 20 s and the experiment slept a fixed 1.5 s before the
+# kill, so a slow runner could kill c BEFORE its n=0 checkpoint (and the
+# validator's FAIL used to exit 0 anyway, hiding it). The kernel gets a
+# generous budget and every phase waits for the EVENT it needs.
+timeout 45 ./target/debug/ama serve \
   --manifest experiments/manifest.json \
   --agentd ./target/debug/ama-agentd &
 KERNEL_PID=$!
-sleep 1.5
+
+# phase 1: wait until c exists AND checkpointed n=0 — then the external
+# kill is a real crash-recovery test, not a race
+python3 - <<'EOF'
+import json, time, sys
+deadline = time.time() + 15
+while time.time() < deadline:
+    try:
+        events = [json.loads(l) for l in open('/tmp/ama_exp/ledger.jsonl')]
+    except FileNotFoundError:
+        time.sleep(0.2); continue
+    spawned = any(e['ev'] == 'spawned' and e['detail']['name'] == 'c' for e in events)
+    cps = any(e['ev'] == 'checkpoint'
+              and e['detail'].get('state', {}).get('state', {}).get('n') == 0
+              for e in events)
+    if spawned and cps:
+        print("== c checkpointed n=0; ready to kill ==", flush=True)
+        sys.exit(0)
+    time.sleep(0.2)
+print("FAIL: c never checkpointed n=0 (timeout)", flush=True)
+sys.exit(1)
+EOF
+
 # EXTERNAL kill of agent c (the real fail-fast path: the operator/OOM/
 # supervisor kills the PID — the kernel must detect the EOF and respawn
 # the agent FROM ITS LEDGER CHECKPOINT while everyone else keeps running)
@@ -40,9 +67,34 @@ for l in open('$LEDGER'):
     if e['ev'] == 'spawned' and e['detail']['name'] == 'c':
         print(e['detail']['pid']); break
 ")
+if [ -z "$C_PID" ]; then
+  echo "FAIL: agent c never spawned" >&2; exit 1
+fi
 echo "== killing agent c (pid $C_PID) externally =="
 kill -9 "$C_PID" && echo "KILL: sent -9 to $C_PID"
-sleep 12
+
+# phase 2: wait for the terminal evidence instead of sleeping 12 s
+python3 - <<'EOF'
+import json, time, sys
+deadline = time.time() + 25
+while time.time() < deadline:
+    try:
+        events = [json.loads(l) for l in open('/tmp/ama_exp/ledger.jsonl')]
+    except FileNotFoundError:
+        time.sleep(0.3); continue
+    d_dead = any(e['ev'] == 'dead' and e['detail'].get('name') == 'd' for e in events)
+    c_uin = [e2['detail']['uin'] for e2 in events
+             if e2['ev'] == 'spawned' and e2['detail']['name'] == 'c']
+    c_done = any(e['ev'] == 'completed' and c_uin and e['detail'].get('uin') == c_uin[0]
+                 for e in events)
+    if d_dead and c_done:
+        print("== terminal evidence present; shutting down ==", flush=True)
+        sys.exit(0)
+    time.sleep(0.3)
+print("FAIL: terminal evidence never appeared (timeout)", flush=True)
+sys.exit(1)
+EOF
+
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 

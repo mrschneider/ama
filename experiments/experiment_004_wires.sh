@@ -8,11 +8,11 @@ cd "$(dirname "$0")/.."
 rm -rf /tmp/ama_exp && mkdir -p /tmp/ama_exp
 rm -f /tmp/ama_exp.sock
 
-timeout 20 ./target/debug/ama serve \
+timeout 40 ./target/debug/ama serve \
   --manifest experiments/manifest_004.json \
   --agentd ./target/debug/ama-agentd &
 KERNEL_PID=$!
-sleep 9
+python3 experiments/wait_ledger_quiet.py 2 35
 ./target/debug/ama ps --socket /tmp/ama_exp.sock > /tmp/ama_exp/ps.json 2>/dev/null || true
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
