@@ -194,7 +194,7 @@ print("EXPERIMENT_001:", "PASS" if all([
 all_pass = all([len(spawned) == 5, malformed, len(denied) >= 1, kills, respawns_d])
 if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
     try:
-        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-40:]
         for line in tail:
             print(f"::error::ledger: {line}", flush=True)
     except Exception:

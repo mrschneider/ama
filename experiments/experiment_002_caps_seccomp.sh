@@ -98,7 +98,7 @@ all_pass = granted and revoked and len(denied_m) >= 1 and len(delivered_m) == 1 
 print("EXPERIMENT_002:", "PASS" if all_pass else "FAIL")
 if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
     try:
-        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-40:]
         for line in tail:
             print(f"::error::ledger: {line}", flush=True)
     except Exception:

@@ -63,7 +63,7 @@ all_pass = {('b','a'),('c','a')} <= ping_pair and {('a','b'),('a','c')} <= pong_
 print("EXPERIMENT_004:", "PASS" if all_pass else "FAIL")
 if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
     try:
-        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-40:]
         for line in tail:
             print(f"::error::ledger: {line}", flush=True)
     except Exception:

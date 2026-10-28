@@ -72,7 +72,7 @@ all_pass = ('a' in completed and 'vm1' in completed) and pings and pongs
 print("EXPERIMENT_005:", "PASS" if all_pass else "FAIL")
 if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
     try:
-        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-40:]
         for line in tail:
             print(f"::error::ledger: {line}", flush=True)
     except Exception:
