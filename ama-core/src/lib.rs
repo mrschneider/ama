@@ -522,6 +522,14 @@ pub struct ProcEntry {
     pub name: String,
     pub pid: u32,
     pub caps: Vec<String>,
+    /// F05: the network-remote transport address this agent was spawned
+    /// with — the RESTART path must restore it (respawn used to lose it)
+    pub tcp_addr: Option<String>,
+    /// F05: live child handles — reaped by the supervisor thread instead
+    /// of being dropped (a dropped Child never reports its exit)
+    /// measured from here (the watchdog used to skip never-registered
+    /// agents FOREVER)
+    pub spawned_at: Instant,
     /// F01: TRUSTED capability config from the manifest — when present,
     /// registration IGNORES the task-supplied caps entirely: the kernel,
     /// not the agent's task, owns the grant
@@ -575,6 +583,11 @@ pub struct Kernel {
     /// network-remote IPC (§3): agents may connect over TCP from other
     /// hosts; the envelope contract and capability checks are identical
     pub tcp_addr: Option<String>,
+    /// F05: live child handles — reaped by the supervisor thread instead
+    /// of being dropped (a dropped Child never reports its exit)
+    children: Arc<Mutex<HashMap<u32, std::process::Child>>>,
+    /// F05: live child handles — reaped by the supervisor thread instead
+    /// of being dropped (a dropped Child never reports its exit)
     /// per-agent Firecracker boot script (vm/boot_agent.sh) for the
     /// microVM isolation tier
     pub vm_boot: Option<String>,
@@ -600,6 +613,7 @@ impl Kernel {
     ) -> std::io::Result<Kernel> {
         Ok(Kernel {
             socket_path: socket_path.to_path_buf(),
+            children: Arc::new(Mutex::new(HashMap::new())),
             ledger: Arc::new(Ledger::open(ledger_path)?),
             agents: Arc::new(Mutex::new(HashMap::new())),
             by_name: Arc::new(Mutex::new(HashMap::new())),
@@ -763,44 +777,31 @@ impl Kernel {
     /// "microvm" boots the agent inside its own Firecracker microVM
     /// (see vm/boot_agent.sh) instead of an OS process
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_agent_opts(
+    /// F05 (AgentLaunchSpec): ONE launch builder shared by the initial
+    /// spawn and every respawn — transport, wire format, isolation tier,
+    /// env and forensics handling MUST be identical, or a restart silently
+    /// ships a different process shape than the policy that created it.
+    fn build_agent_command(
         &self,
+        uin: u64,
         name: &str,
         task_path: &str,
-        tcp: Option<&str>,
-        wire_opt: Option<Wire>,
+        wire: Wire,
         isolation: Option<&str>,
-        qos: Option<QosSpec>,
-        dtn: bool,
-        trusted_caps: Option<Vec<String>>,
-    ) -> std::io::Result<()> {
-        // 8 params by design: name/task/tcp/wire/isolation are the
-        // pre-existing spawn surface, qos+dtn are the delivery contract
-        let uin = self.next_uin.fetch_add(1, Ordering::SeqCst);
+        tcp_addr: Option<&str>,
+        token: &str,
+    ) -> Result<Command, String> {
         let microvm = isolation == Some("microvm");
         let mut cmd = if microvm {
             // the VM tier: the "agent process" IS a Firecracker microVM.
-            // The boot script assembles the per-agent initramfs (static
-            // agentd + task baked in), wires a private tap and execs
-            // firecracker — the PID we watch is the whole VM. The guest
-            // agentd connects back over TCP; the envelope contract and
-            // capability checks are byte-identical to the host tiers.
             let script = self.vm_boot.as_deref().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "isolation 'microvm' requires kernel.vm_boot (vm/boot_agent.sh)",
-                )
+                "isolation 'microvm' requires kernel.vm_boot (vm/boot_agent.sh)".to_string()
             })?;
             let port = self
                 .tcp_addr
                 .as_ref()
                 .and_then(|a| a.rsplit(':').next()?.parse::<u64>().ok())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "isolation 'microvm' requires kernel.tcp_port",
-                    )
-                })?;
+                .ok_or_else(|| "isolation 'microvm' requires kernel.tcp_port".to_string())?;
             let mut c = Command::new(script);
             c.args([uin.to_string(), task_path.into(), port.to_string()]);
             c
@@ -812,54 +813,31 @@ impl Kernel {
                 "--task",
                 task_path,
             ]);
+            if let Some(addr) = tcp_addr {
+                c.arg("--tcp").arg(addr); // F05: the restart RESTORES transport
+            }
+            let s = match wire {
+                Wire::Json => "json",
+                Wire::Msgpack => "msgpack",
+                Wire::Proto => "proto",
+            };
+            c.arg("--wire").arg(s);
+            c.env("AMA_UIN", uin.to_string());
+            // F01: the fresh instance gets a FRESH registration token
+            c.env("AMA_REGISTER_TOKEN", token);
             c
         };
-        if !microvm {
-            let tcp_addr = tcp.map(String::from).or_else(|| self.tcp_addr.clone());
-            if let Some(addr) = tcp_addr {
-                cmd.arg("--tcp").arg(addr);
-            }
-        }
-        if !microvm {
-            if let Some(w) = wire_opt {
-                let s = match w {
-                    Wire::Json => "json",
-                    Wire::Msgpack => "msgpack",
-                    Wire::Proto => "proto",
-                };
-                cmd.arg("--wire").arg(s);
-            }
-        }
-        cmd.env("AMA_UIN", uin.to_string());
-        // F01: per-instance REGISTRATION TOKEN — a random secret the kernel
-        // hands ONLY to the process it spawned; registration must present
-        // it. A pid read out of the (world-readable) ledger is NOT
-        // authentication.
-        let token = {
-            let mut f = std::fs::File::open("/dev/urandom")
-                .expect("open /dev/urandom for the registration token");
-            use std::io::Read;
-            let mut bytes = [0u8; 16];
-            f.read_exact(&mut bytes)
-                .expect("read /dev/urandom for the registration token");
-            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        };
-        cmd.env("AMA_REGISTER_TOKEN", &token);
         // microVM: the guest's SERIAL CONSOLE is firecracker's STDOUT —
-        // nulling it discards the only window into the VM (and the
-        // guest agentd's panics); capture it with the stderr file
+        // nulling it discards the only window into the VM
         if microvm && debug_enabled() {
-            // stdout follows the debug path chosen below (set after)
+            // stdout follows the debug path chosen below
         } else {
             cmd.stdout(Stdio::null());
         }
         // debug mode: keep agent stderr in a per-agent file (watchdog
         // forensics) instead of dropping it
         if debug_enabled() {
-            let p = std::path::PathBuf::from(format!(
-                "/tmp/ama_dbg_agent_{}.stderr",
-                self.next_uin.load(Ordering::SeqCst)
-            ));
+            let p = std::path::PathBuf::from(format!("/tmp/ama_dbg_agent_{}.stderr", uin));
             let f = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -878,8 +856,57 @@ impl Kernel {
         } else {
             cmd.stderr(Stdio::null());
         }
+        let _ = name;
+        Ok(cmd)
+    }
+
+    /// F01: a fresh per-instance registration token.
+    fn fresh_token(&self) -> String {
+        let mut f = std::fs::File::open("/dev/urandom")
+            .expect("open /dev/urandom for the registration token");
+        use std::io::Read;
+        let mut bytes = [0u8; 16];
+        f.read_exact(&mut bytes)
+            .expect("read /dev/urandom for the registration token");
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    }
+
+    // 9 params by design: the launch policy IS the parameter list —
+    // splitting it into a struct would not reduce the information carried
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_agent_opts(
+        &self,
+        name: &str,
+        task_path: &str,
+        tcp: Option<&str>,
+        wire_opt: Option<Wire>,
+        isolation: Option<&str>,
+        qos: Option<QosSpec>,
+        dtn: bool,
+        trusted_caps: Option<Vec<String>>,
+    ) -> std::io::Result<()> {
+        // 8 params by design: name/task/tcp/wire/isolation are the
+        // pre-existing spawn surface, qos+dtn are the delivery contract
+        let uin = self.next_uin.fetch_add(1, Ordering::SeqCst);
+        let microvm = isolation == Some("microvm");
+        let tcp_addr = tcp.map(String::from).or_else(|| self.tcp_addr.clone());
+        let wire = wire_opt.unwrap_or(Wire::Json);
+        let token = self.fresh_token();
+        let cmd = self
+            .build_agent_command(
+                uin,
+                name,
+                task_path,
+                wire,
+                isolation,
+                tcp_addr.as_deref(),
+                &token,
+            )
+            .map_err(std::io::Error::other)?;
+        let mut cmd = cmd;
         let child = cmd.spawn()?;
         let pid = child.id();
+        self.children.lock().unwrap().insert(pid, child); // F05: reaped, not dropped
         let entry = Arc::new(Mutex::new(ProcEntry {
             uin,
             name: name.into(),
@@ -887,6 +914,9 @@ impl Kernel {
             caps: Vec::new(),
             manifest_caps: trusted_caps,
             auth_token: if microvm { None } else { Some(token) },
+            wire, // the spawn declares the wire; register keeps it
+            tcp_addr: tcp.map(String::from).or_else(|| self.tcp_addr.clone()),
+            spawned_at: Instant::now(),
             granted: Vec::new(),
             revoked: Vec::new(),
             state: ProcState::Registered,
@@ -898,7 +928,6 @@ impl Kernel {
             last_checkpoint: None,
             task_path: task_path.into(),
             out: None,
-            wire: Wire::Json,
             isolation: isolation.map(String::from),
             priority: qos.and_then(|q| q.priority).unwrap_or(5).min(9),
             dtn,
@@ -1030,7 +1059,7 @@ impl Kernel {
             Gate::Ok => {}
         }
 
-        let (wire, dest_priority, dest_dtn, deliverable): (Wire, u8, bool, bool) = {
+        let (_wire, dest_priority, dest_dtn, deliverable): (Wire, u8, bool, bool) = {
             let agents = self.agents.lock().unwrap();
             let entry = agents.get(&uin).ok_or("no process table entry")?;
             let e = entry.lock().unwrap();
@@ -1088,27 +1117,26 @@ impl Kernel {
         // F04: the WHOLE framed write holds the destination connection's
         // write lock — a cloned fd would interleave with concurrent
         // senders (routing, QoS pump, DTN flush, ack replies)
-        let write_res = self
-            .with_peer(uin, |wire, w_ref| {
-                // JSON fast path: splice the envelope around the
-                // ALREADY-ENCODED body — no second serialization, no
-                // envelope-Value clone. Binary wires keep write_envelope
-                // (msgpack can't be spliced).
-                if wire == Wire::Json && !body_encoded.is_empty() {
-                    let mut frame = Vec::with_capacity(bytes + 48);
-                    frame.extend_from_slice(b"{\"kind\":\"msg\",\"from\":");
-                    frame.extend_from_slice(from.to_string().as_bytes());
-                    frame.extend_from_slice(b",\"body\":");
-                    frame.extend_from_slice(&body_encoded);
-                    frame.push(b'}');
-                    frame.push(b'\n');
-                    w_ref.write_all(&frame).and_then(|_| w_ref.flush())
-                } else {
-                    let msg = json!({"kind": "msg", "from": from, "body": body});
-                    write_envelope(w_ref, wire, &msg)
-                }
-            })
-            .and_then(|r| r.map_err(|e| e.to_string()))?;
+        self.with_peer(uin, |wire, w_ref| {
+            // JSON fast path: splice the envelope around the
+            // ALREADY-ENCODED body — no second serialization, no
+            // envelope-Value clone. Binary wires keep write_envelope
+            // (msgpack can't be spliced).
+            if wire == Wire::Json && !body_encoded.is_empty() {
+                let mut frame = Vec::with_capacity(bytes + 48);
+                frame.extend_from_slice(b"{\"kind\":\"msg\",\"from\":");
+                frame.extend_from_slice(from.to_string().as_bytes());
+                frame.extend_from_slice(b",\"body\":");
+                frame.extend_from_slice(&body_encoded);
+                frame.push(b'}');
+                frame.push(b'\n');
+                w_ref.write_all(&frame).and_then(|_| w_ref.flush())
+            } else {
+                let msg = json!({"kind": "msg", "from": from, "body": body});
+                write_envelope(w_ref, wire, &msg)
+            }
+        })
+        .and_then(|r| r.map_err(|e| e.to_string()))?;
         self.delivery
             .lock()
             .unwrap()
@@ -1581,7 +1609,18 @@ impl Kernel {
     /// defaults to json and re-registers under a different wire than the
     /// manifest asked for (experiment 004: proto agent reborn as json).
     pub fn respawn(&self, uin: u64) {
-        let (name, task, respawns, checkpoint, wire, isolation, priority, dtn) = {
+        let (
+            name,
+            task,
+            respawns,
+            checkpoint,
+            wire,
+            isolation,
+            priority,
+            dtn,
+            tcp_addr,
+            manifest_caps,
+        ) = {
             let agents = self.agents.lock().unwrap();
             let e = match agents.get(&uin) {
                 Some(e) => e.lock().unwrap(),
@@ -1595,7 +1634,12 @@ impl Kernel {
             let iso = e.isolation.clone();
             let pr = e.priority;
             let dn = e.dtn;
-            (n, t, r, c, w, iso, pr, dn)
+            // F05: the restart restores the FULL launch policy — transport
+            // included (respawn used to drop TCP and downgrade to UDS)
+            let tcp = e.tcp_addr.clone();
+            // F01: the manifest's trusted caps are launch policy too
+            let mc = e.manifest_caps.clone();
+            (n, t, r, c, w, iso, pr, dn, tcp, mc)
         };
         if respawns >= self.max_respawns {
             let agents = self.agents.lock().unwrap();
@@ -1612,39 +1656,26 @@ impl Kernel {
             return;
         }
         let microvm = isolation.as_deref() == Some("microvm");
-        let mut cmd = if microvm {
-            // the respawn of a VM agent re-boots the WHOLE microVM: a
-            // fresh initramfs is assembled (the ledger checkpoint rides
-            // inside the task file) and firecracker runs it again
-            let script = self.vm_boot.as_deref().unwrap_or("vm/boot_agent.sh");
-            let port = self
-                .tcp_addr
-                .as_ref()
-                .and_then(|a| a.rsplit(':').next()?.parse::<u64>().ok())
-                .unwrap_or(0);
-            let mut c = Command::new(script);
-            c.args([uin.to_string(), task.clone(), port.to_string()]);
-            c
-        } else {
-            let mut c = Command::new(&self.agentd_path);
-            c.args([
-                "--socket",
-                self.socket_path.to_str().unwrap_or("/tmp/ama.sock"),
-                "--task",
-                &task,
-            ])
-            .env("AMA_UIN", uin.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-            {
-                let s = match wire {
-                    Wire::Json => "json",
-                    Wire::Msgpack => "msgpack",
-                    Wire::Proto => "proto",
-                };
-                c.arg("--wire").arg(s);
+        // F01: a fresh token for the fresh instance — the OLD token is
+        // dead with the old process
+        let token = self.fresh_token();
+        let cmd = self.build_agent_command(
+            uin,
+            &name,
+            &task,
+            wire,
+            isolation.as_deref(),
+            tcp_addr.as_deref(),
+            &token,
+        );
+        let mut cmd = match cmd {
+            Ok(c) => c,
+            Err(e) => {
+                self.ledger
+                    .append("respawn_failed", json!({"uin": uin, "err": e}))
+                    .ok();
+                return;
             }
-            c
         };
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -1656,11 +1687,18 @@ impl Kernel {
             }
         };
         let pid = child.id();
+        self.children.lock().unwrap().insert(pid, child); // F05: reaped
         let agents = self.agents.lock().unwrap();
         if let Some(e) = agents.get(&uin) {
             let mut e = e.lock().unwrap();
             e.pid = pid;
             e.respawns += 1;
+            // F01: the fresh instance registers with the FRESH token
+            e.auth_token = if microvm { None } else { Some(token) };
+            // F05: restart fidelity — reapply the resource policy
+            if self.apply_cgroups {
+                let _ = sandbox::apply_cgroup(pid, &name);
+            }
             // KEEP the state (Killed) until the fresh instance registers —
             // resetting to Registered here let the OLD process's EOF race
             // in and trigger a SECOND respawn (seen in the 003 ledger)
@@ -1669,6 +1707,8 @@ impl Kernel {
             e.stuck_sweeps = 0;
             // the fresh instance inherits the ledger checkpoint on register
             e.last_checkpoint = checkpoint.or(e.last_checkpoint.clone());
+            e.spawned_at = Instant::now();
+            e.manifest_caps = manifest_caps;
             // delivery contract survives the respawn: a reborn agent keeps
             // its priority and its DTN custody role
             e.priority = priority;
@@ -1688,8 +1728,24 @@ impl Kernel {
                 .values()
                 .filter_map(|e| {
                     let mut e = e.lock().unwrap();
-                    // never connected — registration grace
-                    e.out.as_ref()?;
+                    // F05/F07: an agent that NEVER registers is not given
+                    // infinite grace — the registration deadline (spawn +
+                    // 3x heartbeat timeout) kills and respawns it. The old
+                    // sweep skipped entries without a connection FOREVER,
+                    // so a wedged boot left a zombie-shaped entry outside
+                    // every timeout path.
+                    if e.out.is_none() {
+                        let reg_ms = self.hb_timeout_ms.max(1000) * 3;
+                        if matches!(e.state, ProcState::Registered)
+                            && e.spawned_at.elapsed().as_millis() as u64 > reg_ms
+                        {
+                            return Some((
+                                e.uin,
+                                format!("registration deadline ({} ms, never registered)", reg_ms),
+                            ));
+                        }
+                        return None;
+                    }
                     if matches!(
                         e.state,
                         ProcState::Dead | ProcState::Completed | ProcState::Killed(_)
@@ -1810,6 +1866,32 @@ impl Router {
             std::thread::sleep(Duration::from_millis(200));
         });
         std::mem::forget(watchdog);
+        // F05: reap finished children — a dropped Child handle never
+        // reports its exit and the process table keeps a zombie-shaped
+        // entry
+        {
+            let k = kernel.clone();
+            std::thread::spawn(move || loop {
+                let mut finished = Vec::new();
+                {
+                    let mut kids = k.children.lock().unwrap();
+                    kids.retain(|pid, c| match c.try_wait() {
+                        Ok(Some(_)) => {
+                            finished.push(*pid);
+                            false
+                        }
+                        Ok(None) => true,
+                        Err(_) => true,
+                    });
+                }
+                if !finished.is_empty() {
+                    k.ledger
+                        .append("children_reaped", json!({"pids": finished}))
+                        .ok();
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            });
+        }
         // network-remote listener: SAME envelope contract over TCP (§3)
         if let Some(addr) = kernel.tcp_addr.clone() {
             let k = kernel.clone();

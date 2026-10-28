@@ -28,6 +28,8 @@ fn fake_entry(uin: u64, name: &str, out: UnixStream) -> Arc<Mutex<ProcEntry>> {
         caps: vec![],
         manifest_caps: None,
         auth_token: None,
+        tcp_addr: None,
+        spawned_at: std::time::Instant::now(),
         granted: vec![],
         revoked: vec![],
         state: ProcState::Running,
