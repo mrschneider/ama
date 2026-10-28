@@ -37,7 +37,7 @@ EOF
 # generous budget and every phase waits for the EVENT it needs.
 timeout 90 ./target/debug/ama serve \
   --manifest experiments/manifest.json \
-  --agentd ./target/debug/ama-agentd &
+  --agentd ./target/debug/ama-agentd 2>/tmp/ama_exp/kernel.err &
 KERNEL_PID=$!
 
 # phase 1: wait until c exists AND checkpointed n=0 — then the external

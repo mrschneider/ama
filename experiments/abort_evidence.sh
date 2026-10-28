@@ -11,6 +11,12 @@ if [ -f /tmp/ama_exp/ledger.jsonl ]; then
   done
 fi
 
+if [ -f /tmp/ama_exp/kernel.err ]; then
+  tail -6 /tmp/ama_exp/kernel.err | while IFS= read -r l; do
+    echo "::error title=kernel::${l:0:300}"
+  done
+fi
+
 for f in /tmp/ama_dbg_agent_*.stderr; do
   [ -f "$f" ] || continue
   tail -3 "$f" | while IFS= read -r l; do
