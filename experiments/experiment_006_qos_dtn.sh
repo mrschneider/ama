@@ -60,6 +60,9 @@ kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 
 python3 - <<'PYEOF'
+import sys
+
+results = []
 import json
 
 events = []
@@ -69,6 +72,7 @@ for l in open('/tmp/ama_exp/ledger.jsonl'):
     except json.JSONDecodeError:
         pass
 def ok(label, cond):
+    results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label)
 
 uin_of = {e['detail']['name']: e['detail']['uin']
@@ -107,4 +111,5 @@ all_pass = (
     and uin_of.get('dtn') in completed and uin_of.get('src') in completed
 )
 print("EXPERIMENT_006:", "PASS" if all_pass else "FAIL")
+sys.exit(0 if all_pass and all(results) else 1)
 PYEOF

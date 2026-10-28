@@ -60,6 +60,9 @@ wait $KERNEL_PID 2>/dev/null || true
 
 python3 - <<'PYEOF'
 import json
+import sys
+
+results = []
 
 events = []
 for l in open('/tmp/ama_exp/ledger.jsonl'):
@@ -69,6 +72,7 @@ for l in open('/tmp/ama_exp/ledger.jsonl'):
         pass
 
 def ok(label, cond, extra=""):
+    results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label + ((" | " + extra) if extra and not cond else ""))
 
 uin_of = {e['detail']['name']: e['detail']['uin']
@@ -122,4 +126,8 @@ all_pass = (
     and len(delivered) == 1 and pad_len == 600
 )
 print("EXPERIMENT_008:", "PASS" if all_pass else "FAIL")
+# a validator that PRINTS FAIL but exits 0 hides a broken guarantee from CI
+# (F03): the exit status accumulates every ok() check, which is strictly
+# stronger than the all_pass aggregate
+sys.exit(0 if all_pass and all(results) else 1)
 PYEOF

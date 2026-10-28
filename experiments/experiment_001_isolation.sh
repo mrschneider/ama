@@ -47,6 +47,9 @@ kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 
 python3 - <<'EOF'
+import sys
+
+results = []
 import json
 
 events = []
@@ -63,6 +66,7 @@ def find(ev, **match):
             out.append(e)
     return out
 def ok(label, cond):
+    results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label)
 
 # 1. isolation: every agent ran in its OWN process (distinct pids, != kernel pids)
@@ -122,4 +126,6 @@ ok("isolation: parallel agents unaffected by c's crash and d's loop",
 print(f"\nledger: {len(events)} events total")
 print("EXPERIMENT_001:", "PASS" if all([
     len(spawned) == 5, malformed, len(denied) >= 1, kills, respawns_d]) else "FAIL")
+all_pass = all([len(spawned) == 5, malformed, len(denied) >= 1, kills, respawns_d])
+sys.exit(0 if all_pass and all(results) else 1)
 EOF

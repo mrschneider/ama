@@ -45,6 +45,9 @@ kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 
 python3 - <<'EOF'
+import sys
+
+results = []
 import json
 
 events = []
@@ -54,6 +57,7 @@ for l in open('/tmp/ama_exp/ledger.jsonl'):
     except json.JSONDecodeError:
         pass
 def ok(label, cond):
+    results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label)
 
 name_of = {d['detail']['uin']: d['detail']['name'] for d in events if d['ev'] == 'spawned'}
@@ -80,4 +84,5 @@ except Exception as e:
 print(f"\nledger: {len(events)} events")
 all_pass = len(ping) >= 1 and len(pong) >= 1 and {'a', 'b'} <= completed
 print("EXPERIMENT_003:", "PASS" if all_pass else "FAIL")
+sys.exit(0 if all_pass and all(results) else 1)
 EOF

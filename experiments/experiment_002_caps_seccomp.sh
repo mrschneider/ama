@@ -36,6 +36,9 @@ kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 
 python3 - <<'EOF'
+import sys
+
+results = []
 import json
 
 events = []
@@ -54,6 +57,7 @@ def find(ev, uin=None, name=None, **match):
             out.append(e)
     return out
 def ok(label, cond):
+    results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label)
 
 uin_m = [d['detail']['uin'] for d in events if d['ev'] == 'spawned' and d['detail']['name'] == 'm'][0]
@@ -90,4 +94,5 @@ ok("seccomp: the jail executed the command inside the filter",
 print(f"\nledger: {len(events)} events")
 all_pass = granted and revoked and len(denied_m) >= 1 and len(delivered_m) == 1 and denied_after_revoke
 print("EXPERIMENT_002:", "PASS" if all_pass else "FAIL")
+sys.exit(0 if all_pass and all(results) else 1)
 EOF
