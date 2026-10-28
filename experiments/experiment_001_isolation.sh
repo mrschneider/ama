@@ -111,6 +111,12 @@ print(f"== timeout waiting for terminal evidence; validating anyway ==", flush=T
 sys.exit(0)
 EOF
 
+# diagnostics: was the kernel alive when phase 2 ended?
+if kill -0 $KERNEL_PID 2>/dev/null; then
+  echo "::notice title=phase2::kernel ALIVE at end of phase 2"
+else
+  echo "::notice title=phase2::kernel DEAD at end of phase 2"
+fi
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 
@@ -200,7 +206,9 @@ all_pass = all([len(spawned) == 5, malformed, len(denied) >= 1, kills, respawns_
 if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
     try:
         lines = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()
-        print("::error title=AMA ledger::" + "\n".join(lines), flush=True)
+        joined = " | ".join(l.replace(" ", "") for l in lines)
+        for i in range(0, len(joined), 3500):
+            print(f"::error title=ledger[{i//3500}]::{joined[i:i+3500]}", flush=True)
     except Exception:
         pass
 sys.exit(0 if all_pass and all(results) else 1)
