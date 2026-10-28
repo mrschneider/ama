@@ -664,18 +664,32 @@ impl Kernel {
         }
     }
 
-    /// Write a kernel->agent frame to a connected agent.
-    fn write_to(&self, uin: u64, msg: &Value) -> Result<(), String> {
-        let (wire, mut w) = {
+    /// F04: acquire the connection's WRITE LOCK — every kernel->agent write
+    /// happens under the connection's own mutex. The old pattern locked, took
+    /// `try_clone()` of the fd, released the lock and wrote on the clone:
+    /// concurrent senders (routing, QoS pump, DTN flush, ack replies) wrote
+    /// the SAME stream simultaneously and interleaved frames mid-payload —
+    /// binary framing (magic/length/payload) is especially exposed.
+    fn with_peer<T>(&self, uin: u64, f: impl FnOnce(Wire, &mut Peer) -> T) -> Result<T, String> {
+        // clone the Arc out from under the table/entry locks, then take the
+        // PEER lock with nothing else held; the guard NEVER escapes this
+        // scope — the closure writes under it
+        let (wire, out) = {
             let agents = self.agents.lock().unwrap();
             let entry = agents.get(&uin).ok_or("no process table entry")?;
             let e = entry.lock().unwrap();
-            let p = e.out.as_ref().ok_or("no connection")?;
-            let guard = p.lock().unwrap();
-            (e.wire, guard.try_clone().map_err(|e| e.to_string())?)
+            let wire = e.wire;
+            let out = e.out.as_ref().ok_or("no connection")?.clone();
+            (wire, out)
         };
-        let w_ref: &mut dyn IoWrite = &mut w;
-        write_envelope(w_ref, wire, msg).map_err(|e| e.to_string())
+        let mut guard = out.lock().unwrap();
+        Ok(f(wire, &mut guard))
+    }
+
+    /// Write a kernel->agent frame to a connected agent (serialized, F04).
+    fn write_to(&self, uin: u64, msg: &Value) -> Result<(), String> {
+        self.with_peer(uin, |wire, w| write_envelope(w, wire, msg))
+            .and_then(|r| r.map_err(|e| e.to_string()))
     }
 
     /// Reverse lookup: the destination's NAME — what a relay echoes back
@@ -1016,24 +1030,13 @@ impl Kernel {
             Gate::Ok => {}
         }
 
-        let (wire, w, dest_priority, dest_dtn, deliverable): (Wire, Option<Peer>, u8, bool, bool) = {
+        let (wire, dest_priority, dest_dtn, deliverable): (Wire, u8, bool, bool) = {
             let agents = self.agents.lock().unwrap();
             let entry = agents.get(&uin).ok_or("no process table entry")?;
             let e = entry.lock().unwrap();
             let deliverable =
                 matches!(e.state, ProcState::Running | ProcState::Registered) && e.out.is_some();
-            let w = if deliverable {
-                match e.out.as_ref() {
-                    Some(p) => {
-                        let guard = p.lock().unwrap();
-                        guard.try_clone().ok()
-                    }
-                    None => None,
-                }
-            } else {
-                None
-            };
-            (e.wire, w, e.priority, e.dtn, deliverable)
+            (e.wire, e.priority, e.dtn, deliverable)
         };
 
         if !deliverable {
@@ -1082,25 +1085,30 @@ impl Kernel {
             return Ok(());
         }
 
-        let mut w = w.ok_or_else(|| format!("agent '{to}' has no connection"))?;
-        let w_ref: &mut dyn IoWrite = &mut w;
-        // JSON fast path: splice the envelope around the ALREADY-ENCODED
-        // body — no second serialization, no envelope-Value clone. Binary
-        // wires keep write_envelope (msgpack can't be spliced).
-        let write_res = if wire == Wire::Json && !body_encoded.is_empty() {
-            let mut frame = Vec::with_capacity(bytes + 48);
-            frame.extend_from_slice(b"{\"kind\":\"msg\",\"from\":");
-            frame.extend_from_slice(from.to_string().as_bytes());
-            frame.extend_from_slice(b",\"body\":");
-            frame.extend_from_slice(&body_encoded);
-            frame.push(b'}');
-            frame.push(b'\n');
-            w_ref.write_all(&frame).and_then(|_| w_ref.flush())
-        } else {
-            let msg = json!({"kind": "msg", "from": from, "body": body});
-            write_envelope(w_ref, wire, &msg)
-        };
-        write_res.map_err(|e| e.to_string())?;
+        // F04: the WHOLE framed write holds the destination connection's
+        // write lock — a cloned fd would interleave with concurrent
+        // senders (routing, QoS pump, DTN flush, ack replies)
+        let write_res = self
+            .with_peer(uin, |wire, w_ref| {
+                // JSON fast path: splice the envelope around the
+                // ALREADY-ENCODED body — no second serialization, no
+                // envelope-Value clone. Binary wires keep write_envelope
+                // (msgpack can't be spliced).
+                if wire == Wire::Json && !body_encoded.is_empty() {
+                    let mut frame = Vec::with_capacity(bytes + 48);
+                    frame.extend_from_slice(b"{\"kind\":\"msg\",\"from\":");
+                    frame.extend_from_slice(from.to_string().as_bytes());
+                    frame.extend_from_slice(b",\"body\":");
+                    frame.extend_from_slice(&body_encoded);
+                    frame.push(b'}');
+                    frame.push(b'\n');
+                    w_ref.write_all(&frame).and_then(|_| w_ref.flush())
+                } else {
+                    let msg = json!({"kind": "msg", "from": from, "body": body});
+                    write_envelope(w_ref, wire, &msg)
+                }
+            })
+            .and_then(|r| r.map_err(|e| e.to_string()))?;
         self.delivery
             .lock()
             .unwrap()
@@ -1134,8 +1142,9 @@ impl Kernel {
                     _ => break,
                 }
             };
-            // resolve the destination's writer
-            let target: Option<(Wire, Peer)> = {
+            // F04: resolve AND write under the destination's connection
+            // lock — no cloned fds, no guard escaping the scope
+            let target: Option<Result<(), String>> = {
                 let agents = self.agents.lock().unwrap();
                 match agents.get(&next.to) {
                     Some(entry) => {
@@ -1143,51 +1152,56 @@ impl Kernel {
                         let deliverable =
                             matches!(e.state, ProcState::Running | ProcState::Registered)
                                 && e.out.is_some();
-                        if deliverable {
-                            e.out.as_ref().and_then(|p| {
-                                let guard = p.lock().unwrap();
-                                guard.try_clone().ok().map(|w| (e.wire, w))
-                            })
-                        } else {
+                        if !deliverable {
                             None
+                        } else {
+                            match e.out.as_ref() {
+                                Some(p) => {
+                                    let mut guard = p.lock().unwrap();
+                                    let msg = json!({"kind": "msg", "from": next.from,
+                                                     "body": next.body});
+                                    let w_ref: &mut dyn IoWrite = &mut *guard;
+                                    Some(
+                                        write_envelope(w_ref, e.wire, &msg)
+                                            .map_err(|err| err.to_string()),
+                                    )
+                                }
+                                None => None,
+                            }
                         }
                     }
                     None => None,
                 }
             };
             match target {
-                Some((wire, mut w)) => {
-                    let msg = json!({"kind": "msg", "from": next.from, "body": next.body});
-                    let w_ref: &mut dyn IoWrite = &mut w;
-                    match write_envelope(w_ref, wire, &msg) {
-                        Ok(()) => {
-                            served += 1;
-                            self.delivery.lock().unwrap().record_delivery(&next);
-                            self.ledger
-                                .append(
-                                    "qos_delivered",
-                                    json!({
-                                        "from": next.from,
-                                        "to": next.to,
-                                        "bytes": next.bytes,
-                                        "tag": next.tag,
-                                    }),
-                                )
-                                .ok();
-                        }
-                        Err(e) => {
-                            let mut d = self.delivery.lock().unwrap();
-                            d.record_queued_drop(next.bytes);
-                            drop(d);
-                            self.ledger
-                                .append(
-                                    "qos_dropped",
-                                    json!({"to": next.to, "bytes": next.bytes, "err": e.to_string()}),
-                                )
-                                .ok();
-                        }
+                Some(res) => match res {
+                    Ok(()) => {
+                        served += 1;
+                        self.delivery.lock().unwrap().record_delivery(&next);
+                        self.ledger
+                            .append(
+                                "qos_delivered",
+                                json!({
+                                    "from": next.from,
+                                    "to": next.to,
+                                    "bytes": next.bytes,
+                                    "tag": next.tag,
+                                }),
+                            )
+                            .ok();
                     }
-                }
+                    Err(e) => {
+                        let mut d = self.delivery.lock().unwrap();
+                        d.record_queued_drop(next.bytes);
+                        drop(d);
+                        self.ledger
+                            .append(
+                                "qos_dropped",
+                                json!({"to": next.to, "bytes": next.bytes, "err": e.to_string()}),
+                            )
+                            .ok();
+                    }
+                },
                 None => {
                     // destination vanished while queued: it loses the
                     // message, and the drop is journaled (never silent)
@@ -1431,18 +1445,14 @@ impl Kernel {
     /// every expiry. Runs BEFORE the welcome is written so the fresh
     /// agent sees its backlog as its first messages.
     pub fn dtn_flush(&self, uin: u64) -> Result<(), String> {
-        let (wire, writer, name) = {
+        let name = {
             let agents = self.agents.lock().unwrap();
             let entry = agents.get(&uin).ok_or("no process table entry")?;
             let e = entry.lock().unwrap();
-            let w = match e.out.as_ref() {
-                Some(p) => {
-                    let guard = p.lock().unwrap();
-                    guard.try_clone().map_err(|e| e.to_string())?
-                }
-                None => return Ok(()), // still no connection — nothing to flush into
-            };
-            (e.wire, w, e.name.clone())
+            if e.out.is_none() {
+                return Ok(()); // still no connection — nothing to flush into
+            }
+            e.name.clone()
         };
         let (bundles, expired) = {
             let mut d = self.delivery.lock().unwrap();
@@ -1459,18 +1469,23 @@ impl Kernel {
                 .ok();
         }
         let count = bundles.len();
-        for b in bundles {
-            let msg = json!({"kind": "msg", "from": b.from, "body": b.body});
-            let mut w = writer.try_clone().map_err(|e| e.to_string())?;
-            let w_ref: &mut dyn IoWrite = &mut w;
-            write_envelope(w_ref, wire, &msg).map_err(|e| e.to_string())?;
-            self.ledger
-                .append(
-                    "dtn_delivered",
-                    json!({"from": b.from, "to": uin, "priority": b.priority, "body": b.body}),
-                )
-                .map_err(|e| e.to_string())?;
-        }
+        // F04: one lock acquisition covers the whole flush — the backlog
+        // arrives as an uninterleaved sequence
+        self.with_peer(uin, |wire, w| {
+            for b in &bundles {
+                let msg = json!({"kind": "msg", "from": b.from, "body": b.body});
+                let w_ref: &mut dyn IoWrite = w;
+                write_envelope(w_ref, wire, &msg).map_err(|e| e.to_string())?;
+                self.ledger
+                    .append(
+                        "dtn_delivered",
+                        json!({"from": b.from, "to": uin, "priority": b.priority, "body": b.body}),
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .and_then(|r: Result<(), String>| r)?;
         if count > 0 {
             self.ledger
                 .append(
