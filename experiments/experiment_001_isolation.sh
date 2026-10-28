@@ -30,7 +30,7 @@ EOF
 # kill, so a slow runner could kill c BEFORE its n=0 checkpoint (and the
 # validator's FAIL used to exit 0 anyway, hiding it). The kernel gets a
 # generous budget and every phase waits for the EVENT it needs.
-timeout 70 ./target/debug/ama serve \
+timeout 90 ./target/debug/ama serve \
   --manifest experiments/manifest.json \
   --agentd ./target/debug/ama-agentd &
 KERNEL_PID=$!
@@ -45,11 +45,16 @@ while time.time() < deadline:
         events = [json.loads(l) for l in open('/tmp/ama_exp/ledger.jsonl')]
     except FileNotFoundError:
         time.sleep(0.2); continue
-    spawned = any(e['ev'] == 'spawned' and e['detail']['name'] == 'c' for e in events)
-    cps = any(e['ev'] == 'checkpoint'
-              and e['detail'].get('state', {}).get('state', {}).get('n') == 0
-              for e in events)
-    if spawned and cps:
+    c_uin = [e['detail']['uin'] for e in events
+             if e['ev'] == 'spawned' and e['detail']['name'] == 'c']
+    c_reg = bool(c_uin) and any(
+        e['ev'] == 'registered' and e['detail'].get('uin') == c_uin[0]
+        for e in events)
+    cps = bool(c_uin) and any(
+        e['ev'] == 'checkpoint' and e['detail'].get('uin') == c_uin[0]
+        and e['detail'].get('state', {}).get('state', {}).get('n') == 0
+        for e in events)
+    if c_uin and c_reg and cps:
         print("== c checkpointed n=0; ready to kill ==", flush=True)
         sys.exit(0)
     time.sleep(0.2)
@@ -194,15 +199,8 @@ print("EXPERIMENT_001:", "PASS" if all([
 all_pass = all([len(spawned) == 5, malformed, len(denied) >= 1, kills, respawns_d])
 if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
     try:
-        interesting = ("completed", "killed", "dead", "respawned", "crashed",
-                       "cap_denied", "delivered", "checkpoint")
-        for line in open("/tmp/ama_exp/ledger.jsonl").read().splitlines():
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            if e["ev"] in interesting:
-                print(f"::error::ev[{e['seq']}]: {e['ev']} {e['detail']}", flush=True)
+        lines = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()
+        print("::error title=AMA ledger::" + "\n".join(lines), flush=True)
     except Exception:
         pass
 sys.exit(0 if all_pass and all(results) else 1)
