@@ -227,6 +227,13 @@ ok("audit: identity refusals and ctl refusals are journaled",
 print(f"\nledger: {len(events)} events")
 all_pass = all(results)
 print("EXPERIMENT_009:", "PASS" if all_pass else "FAIL")
+if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
+    try:
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        for line in tail:
+            print(f"::error::ledger: {line}", flush=True)
+    except Exception:
+        pass
 sys.exit(0 if all_pass and all(results) else 1)
 PYEOF
 

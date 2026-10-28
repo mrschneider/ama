@@ -51,6 +51,9 @@ for l in open('/tmp/ama_exp/ledger.jsonl'):
         pass
 
 def ok(label, cond, extra=""):
+    if not cond and __import__("os").environ.get("GITHUB_ACTIONS"):
+        detail = f" | {extra}" if extra else ""
+        print(f"::error::FAIL: {label}{detail}", flush=True)
     results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label + ((" | " + extra) if extra and not cond else ""))
 
@@ -157,5 +160,12 @@ all_pass = (
     and cli.get('kind') == 'qos'
 )
 print("EXPERIMENT_007:", "PASS" if all_pass else "FAIL")
+if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
+    try:
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        for line in tail:
+            print(f"::error::ledger: {line}", flush=True)
+    except Exception:
+        pass
 sys.exit(0 if all_pass and all(results) else 1)
 PYEOF

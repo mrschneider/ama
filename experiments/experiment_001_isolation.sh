@@ -118,6 +118,8 @@ def find(ev, **match):
             out.append(e)
     return out
 def ok(label, cond):
+    if not cond and __import__("os").environ.get("GITHUB_ACTIONS"):
+        print(f"::error::FAIL: {label}", flush=True)
     results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label)
 
@@ -179,5 +181,12 @@ print(f"\nledger: {len(events)} events total")
 print("EXPERIMENT_001:", "PASS" if all([
     len(spawned) == 5, malformed, len(denied) >= 1, kills, respawns_d]) else "FAIL")
 all_pass = all([len(spawned) == 5, malformed, len(denied) >= 1, kills, respawns_d])
+if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
+    try:
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        for line in tail:
+            print(f"::error::ledger: {line}", flush=True)
+    except Exception:
+        pass
 sys.exit(0 if all_pass and all(results) else 1)
 EOF

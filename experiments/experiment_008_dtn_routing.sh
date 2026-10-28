@@ -72,6 +72,9 @@ for l in open('/tmp/ama_exp/ledger.jsonl'):
         pass
 
 def ok(label, cond, extra=""):
+    if not cond and __import__("os").environ.get("GITHUB_ACTIONS"):
+        detail = f" | {extra}" if extra else ""
+        print(f"::error::FAIL: {label}{detail}", flush=True)
     results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label + ((" | " + extra) if extra and not cond else ""))
 
@@ -129,5 +132,12 @@ print("EXPERIMENT_008:", "PASS" if all_pass else "FAIL")
 # a validator that PRINTS FAIL but exits 0 hides a broken guarantee from CI
 # (F03): the exit status accumulates every ok() check, which is strictly
 # stronger than the all_pass aggregate
+if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
+    try:
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        for line in tail:
+            print(f"::error::ledger: {line}", flush=True)
+    except Exception:
+        pass
 sys.exit(0 if all_pass and all(results) else 1)
 PYEOF

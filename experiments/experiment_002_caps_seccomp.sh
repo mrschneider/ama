@@ -57,6 +57,8 @@ def find(ev, uin=None, name=None, **match):
             out.append(e)
     return out
 def ok(label, cond):
+    if not cond and __import__("os").environ.get("GITHUB_ACTIONS"):
+        print(f"::error::FAIL: {label}", flush=True)
     results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label)
 
@@ -94,5 +96,12 @@ ok("seccomp: the jail executed the command inside the filter",
 print(f"\nledger: {len(events)} events")
 all_pass = granted and revoked and len(denied_m) >= 1 and len(delivered_m) == 1 and denied_after_revoke
 print("EXPERIMENT_002:", "PASS" if all_pass else "FAIL")
+if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
+    try:
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        for line in tail:
+            print(f"::error::ledger: {line}", flush=True)
+    except Exception:
+        pass
 sys.exit(0 if all_pass and all(results) else 1)
 EOF

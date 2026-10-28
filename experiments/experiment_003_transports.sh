@@ -57,6 +57,8 @@ for l in open('/tmp/ama_exp/ledger.jsonl'):
     except json.JSONDecodeError:
         pass
 def ok(label, cond):
+    if not cond and __import__("os").environ.get("GITHUB_ACTIONS"):
+        print(f"::error::FAIL: {label}", flush=True)
     results.append(bool(cond))
     print(("PASS: " if cond else "FAIL: ") + label)
 
@@ -84,5 +86,12 @@ except Exception as e:
 print(f"\nledger: {len(events)} events")
 all_pass = len(ping) >= 1 and len(pong) >= 1 and {'a', 'b'} <= completed
 print("EXPERIMENT_003:", "PASS" if all_pass else "FAIL")
+if not (all_pass and all(results)) and __import__("os").environ.get("GITHUB_ACTIONS"):
+    try:
+        tail = open("/tmp/ama_exp/ledger.jsonl").read().splitlines()[-12:]
+        for line in tail:
+            print(f"::error::ledger: {line}", flush=True)
+    except Exception:
+        pass
 sys.exit(0 if all_pass and all(results) else 1)
 EOF
