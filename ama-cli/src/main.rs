@@ -51,12 +51,16 @@ fn main() {
             }
         }
     }
+    // F02: operator verbs live on the DEDICATED control socket
+    // (<socket>.ctl, mode 0600, peer-credential checked) — never on the
+    // agent listener
+    let ctl_socket = format!("{socket}.ctl");
     match cmd.as_str() {
         "serve" => serve(&socket, &manifest, &agentd, cgroups),
-        "ps" => ps(&socket),
-        "qos" => ctl_qos(&socket),
-        "grant" => ctl_caps(&socket, "ctl_grant", &name, &caps),
-        "revoke" => ctl_caps(&socket, "ctl_revoke", &name, &caps),
+        "ps" => ps(&ctl_socket),
+        "qos" => ctl_qos(&ctl_socket),
+        "grant" => ctl_caps(&ctl_socket, "ctl_grant", &name, &caps),
+        "revoke" => ctl_caps(&ctl_socket, "ctl_revoke", &name, &caps),
         "jail" => {
             // Tool Execution Jail: run a command inside the seccomp filter
             // (--strict upgrades to the allowlist profile: default-DENY,
@@ -171,6 +175,7 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
                 a.isolation.clone(),
                 a.qos,
                 a.dtn,
+                a.caps.clone(),
             )
         })
         .collect();

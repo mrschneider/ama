@@ -140,6 +140,14 @@ pub enum Envelope {
     Register {
         name: String,
         caps: Vec<String>,
+        /// the registering process's own pid (telemetry; NOT auth — pids
+        /// are world-readable)
+        pid: u32,
+        /// F01: the registration token the kernel handed the spawned
+        /// process via AMA_REGISTER_TOKEN — required while the instance is
+        /// live; a DEAD instance's identity may be claimed without it
+        /// (operator-driven restarts)
+        token: Option<String>,
     },
     Heartbeat {
         uin: u64,
@@ -218,7 +226,18 @@ impl Envelope {
                 if let Some(extra) = v.get("uin") {
                     return Err(format!("register: unexpected field 'uin' = {extra}"));
                 }
-                Ok(Envelope::Register { name, caps })
+                let pid = v
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .ok_or("register: missing 'pid' (the kernel binds registration to the spawned instance)")?
+                    as u32;
+                let token = v.get("token").and_then(Value::as_str).map(String::from);
+                Ok(Envelope::Register {
+                    name,
+                    caps,
+                    pid,
+                    token,
+                })
             }
             "heartbeat" => Ok(Envelope::Heartbeat {
                 uin: take_u64("uin")?,
@@ -279,8 +298,17 @@ impl Envelope {
 
     pub fn to_line(&self) -> String {
         let v = match self {
-            Envelope::Register { name, caps } => {
-                json!({"kind": "register", "name": name, "caps": caps})
+            Envelope::Register {
+                name,
+                caps,
+                pid,
+                token,
+            } => {
+                let mut v = json!({"kind": "register", "name": name, "caps": caps, "pid": pid});
+                if let Some(t) = token {
+                    v["token"] = json!(t);
+                }
+                v
             }
             Envelope::Heartbeat { uin, step, phase } => {
                 json!({"kind": "heartbeat", "uin": uin, "step": step, "phase": phase})
@@ -494,6 +522,21 @@ pub struct ProcEntry {
     pub name: String,
     pub pid: u32,
     pub caps: Vec<String>,
+    /// F01: TRUSTED capability config from the manifest — when present,
+    /// registration IGNORES the task-supplied caps entirely: the kernel,
+    /// not the agent's task, owns the grant
+    pub manifest_caps: Option<Vec<String>>,
+    /// F01: the per-instance registration secret the kernel handed the
+    /// spawned process (None for microvm agents — the guest bootstrap
+    /// cannot receive it yet)
+    pub auth_token: Option<String>,
+    /// F01: operator capability policy (ctl_grant/ctl_revoke history) —
+    /// SURVIVES re-registration and respawn. Registration merges the
+    /// task-supplied caps with this policy instead of replacing it: an
+    /// operator revocation cannot be undone by the agent's own task, and
+    /// an operator grant cannot be silently dropped by a restart.
+    pub granted: Vec<String>,
+    pub revoked: Vec<String>,
     pub state: ProcState,
     pub last_hb: Instant,
     pub last_step: String,
@@ -689,7 +732,16 @@ impl Kernel {
     /// Spawn an agent process from a manifest entry. The process is the
     /// isolation unit: its own PID, its own ephemeral memory.
     pub fn spawn_agent(&self, name: &str, task_path: &str) -> std::io::Result<()> {
-        self.spawn_agent_opts(name, task_path, None, Some(Wire::Json), None, None, false)
+        self.spawn_agent_opts(
+            name,
+            task_path,
+            None,
+            Some(Wire::Json),
+            None,
+            None,
+            false,
+            None,
+        )
     }
 
     /// `tcp`: connect over the network-remote transport; `wire`: speak
@@ -706,6 +758,7 @@ impl Kernel {
         isolation: Option<&str>,
         qos: Option<QosSpec>,
         dtn: bool,
+        trusted_caps: Option<Vec<String>>,
     ) -> std::io::Result<()> {
         // 8 params by design: name/task/tcp/wire/isolation are the
         // pre-existing spawn surface, qos+dtn are the delivery contract
@@ -764,6 +817,20 @@ impl Kernel {
             }
         }
         cmd.env("AMA_UIN", uin.to_string());
+        // F01: per-instance REGISTRATION TOKEN — a random secret the kernel
+        // hands ONLY to the process it spawned; registration must present
+        // it. A pid read out of the (world-readable) ledger is NOT
+        // authentication.
+        let token = {
+            let mut f = std::fs::File::open("/dev/urandom")
+                .expect("open /dev/urandom for the registration token");
+            use std::io::Read;
+            let mut bytes = [0u8; 16];
+            f.read_exact(&mut bytes)
+                .expect("read /dev/urandom for the registration token");
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        cmd.env("AMA_REGISTER_TOKEN", &token);
         // microVM: the guest's SERIAL CONSOLE is firecracker's STDOUT —
         // nulling it discards the only window into the VM (and the
         // guest agentd's panics); capture it with the stderr file
@@ -804,6 +871,10 @@ impl Kernel {
             name: name.into(),
             pid,
             caps: Vec::new(),
+            manifest_caps: trusted_caps,
+            auth_token: if microvm { None } else { Some(token) },
+            granted: Vec::new(),
+            revoked: Vec::new(),
             state: ProcState::Registered,
             last_hb: Instant::now(),
             last_step: String::new(),
@@ -849,7 +920,15 @@ impl Kernel {
         let need = format!("{verb}:{target}");
         let agents = self.agents.lock().unwrap();
         let entry = agents.get(&uin).ok_or("unknown uin")?;
-        if entry.lock().unwrap().caps.iter().any(|c| c == &need) {
+        // a VERB-level grant (`relay`) covers every target of that verb; a
+        // TARGET-level grant (`send:b`) stays target-scoped
+        if entry
+            .lock()
+            .unwrap()
+            .caps
+            .iter()
+            .any(|c| c == &need || c == verb)
+        {
             Ok(())
         } else {
             drop(agents);
@@ -1668,6 +1747,9 @@ pub type AgentSpecTuple = (
     Option<String>,
     Option<QosSpec>,
     bool,
+    // F01: TRUSTED capability config from the manifest — the kernel owns
+    // the grant; the agent's task cannot add to it
+    Option<Vec<String>>,
 );
 
 pub struct Router {
@@ -1693,6 +1775,7 @@ impl Router {
                     None,
                     None,
                     false,
+                    None,
                 )
             })
             .collect();
@@ -1729,8 +1812,38 @@ impl Router {
                 Err(e) => eprintln!("[ama] tcp listener {addr}: {e}"),
             });
         }
+        // F02: dedicated OPERATOR control socket — restrictive file mode
+        // (0600) and a Unix peer-credential check (the peer must run as the
+        // same uid as the kernel). Control verbs are NEVER served on the
+        // agent listeners (UDS or TCP).
+        {
+            let ctl_path = control_socket_path(&kernel.socket_path);
+            let _ = std::fs::remove_file(&ctl_path);
+            let ctl_listener = std::os::unix::net::UnixListener::bind(&ctl_path)?;
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&ctl_path, std::fs::Permissions::from_mode(0o600));
+            eprintln!("[ama] operator control socket up on {}", ctl_path.display());
+            let k = kernel.clone();
+            std::thread::spawn(move || {
+                for conn in ctl_listener.incoming().flatten() {
+                    let k = k.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = Router::check_peer_credentials(&conn) {
+                            k.ledger
+                                .append(
+                                    "ctl_refused",
+                                    json!({"reason": format!("operator socket peer credential rejected: {e}")}),
+                                )
+                                .ok();
+                            return;
+                        }
+                        Router::ctl_connection(k, Peer::Unix(conn));
+                    });
+                }
+            });
+        }
         // bind is live now — spawn the manifest's agents
-        for (name, task, tcp, wire, iso, qos, dtn) in agents {
+        for (name, task, tcp, wire, iso, qos, dtn, caps) in agents {
             if let Err(e) = kernel.spawn_agent_opts(
                 name,
                 task,
@@ -1739,6 +1852,7 @@ impl Router {
                 iso.as_deref(),
                 *qos,
                 *dtn,
+                caps.clone(),
             ) {
                 eprintln!("[ama] spawn {name}: {e}");
             }
@@ -1757,6 +1871,68 @@ impl Router {
             }
         });
         Ok(handle)
+    }
+
+    /// Unix peer-credential check: the connecting process must run as the
+    /// SAME uid as the kernel. (SO_PEERCRED via libc.)
+    fn check_peer_credentials(sock: &std::os::unix::net::UnixStream) -> Result<(), String> {
+        use std::os::unix::io::AsRawFd;
+        let mut cred: libc::ucred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let r = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut libc::ucred as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if r != 0 {
+            return Err("SO_PEERCRED unavailable".to_string());
+        }
+        let my_uid = unsafe { libc::getuid() };
+        if cred.uid != my_uid {
+            return Err(format!("peer uid {} != kernel uid {}", cred.uid, my_uid));
+        }
+        Ok(())
+    }
+
+    /// The operator control connection: JSON lines, ctl verbs ONLY.
+    fn ctl_connection(kernel: Arc<Kernel>, mut peer: Peer) {
+        // plain JSON lines from the FIRST byte — no wire-format magic on
+        // the operator socket (F02)
+        let mut reader = JsonPeer::new_raw(peer.try_clone().expect("ctl peer clone"));
+        let mut line = String::new();
+        while reader.read_line_after(&mut line).unwrap_or(false) {
+            let trimmed = line.trim().to_string();
+            line.clear();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(&trimmed) {
+                Ok(v) => {
+                    if let Err(e) = Router::handle_ctl_value(&kernel, &mut peer, &v, Wire::Json) {
+                        let _ = write_envelope(
+                            &mut peer,
+                            Wire::Json,
+                            &json!({"kind": "error", "reason": e}),
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = write_envelope(
+                        &mut peer,
+                        Wire::Json,
+                        &json!({"kind": "error", "reason": format!("invalid json: {e}")}),
+                    );
+                }
+            }
+        }
     }
 
     /// One connection, any transport, both wire formats. The FIRST byte
@@ -1989,6 +2165,103 @@ impl Router {
         my_uin
     }
 
+    /// Operator control verbs — served ONLY on the dedicated control
+    /// socket (`<socket>.ctl`, mode 0600, peer-credential checked). F02:
+    /// being unregistered is NOT authentication; the agent listener
+    /// refuses every ctl verb and journals it.
+    fn handle_ctl_value(
+        kernel: &Kernel,
+        writer: &mut Peer,
+        v: &Value,
+        wire: Wire,
+    ) -> Result<(), String> {
+        let kind = v
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or("ctl: missing 'kind'")?;
+        match kind {
+            "ctl_qos" => {
+                // bandwidth accounting + queue state, operator-only
+                let stats = kernel.delivery.lock().unwrap().stats();
+                let reply = json!({"kind": "qos", "stats": stats});
+                write_envelope(writer, wire, &reply).map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            "ctl_ps" => {
+                let dump = kernel.ps_dump();
+                let reply = json!({"kind": "ps", "agents": dump});
+                if debug_json_enabled() {
+                    eprintln!("[ctl_ps] reply = {reply}");
+                }
+                write_envelope(writer, wire, &reply).map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            "ctl_grant" | "ctl_revoke" => {
+                let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+                let caps: Vec<String> = v
+                    .get("caps")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let uin = kernel.by_name.lock().unwrap().get(name).copied();
+                if let Some(uin) = uin {
+                    {
+                        let agents = kernel.agents.lock().unwrap();
+                        if let Some(entry) = agents.get(&uin) {
+                            let mut e = entry.lock().unwrap();
+                            if kind == "ctl_grant" {
+                                for c in &caps {
+                                    // the grant is POLICY: it
+                                    // survives registration and
+                                    // respawn
+                                    if !e.granted.contains(c) {
+                                        e.granted.push(c.clone());
+                                    }
+                                    e.revoked.retain(|x| x != c);
+                                    if !e.caps.contains(c) {
+                                        e.caps.push(c.clone());
+                                    }
+                                }
+                            } else {
+                                for c in &caps {
+                                    if !e.revoked.contains(c) {
+                                        e.revoked.push(c.clone());
+                                    }
+                                }
+                                e.caps.retain(|c| !caps.contains(c));
+                            }
+                        }
+                    }
+                    let ev = if kind == "ctl_grant" {
+                        "cap_granted"
+                    } else {
+                        "cap_revoked"
+                    };
+                    kernel
+                        .ledger
+                        .append(ev, json!({"uin": uin, "name": name, "caps": caps}))
+                        .ok();
+                    let ack = if kind == "ctl_grant" {
+                        "granted"
+                    } else {
+                        "revoked"
+                    };
+                    write_envelope(writer, wire, &json!({"kind": ack, "name": name}))
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                } else {
+                    Err(format!("ctl: unknown agent '{name}'"))
+                }
+            }
+            _ => Err(format!("ctl: unknown control verb '{kind}'")),
+        }
+    }
+
     /// Handle ONE decoded envelope (transport- and format-agnostic).
     fn handle_value(
         kernel: &Kernel,
@@ -1997,78 +2270,27 @@ impl Router {
         my_uin: &mut Option<u64>,
         wire: Wire,
     ) -> Result<(), String> {
-        // control channel verbs — operators may dump the table and
-        // renegotiate capabilities AT RUNTIME; agents can never reach
-        // this: their first envelope registers them
-        if my_uin.is_none() {
-            if let Some(kind) = v.get("kind").and_then(Value::as_str) {
-                match kind {
-                    "ctl_qos" => {
-                        // bandwidth accounting + queue state, operator-only
-                        let stats = kernel.delivery.lock().unwrap().stats();
-                        let reply = json!({"kind": "qos", "stats": stats});
-                        write_envelope(writer, wire, &reply).map_err(|e| e.to_string())?;
-                        return Ok(());
-                    }
-                    "ctl_ps" => {
-                        let dump = kernel.ps_dump();
-                        let reply = json!({"kind": "ps", "agents": dump});
-                        if debug_json_enabled() {
-                            eprintln!("[ctl_ps] reply = {reply}");
-                        }
-                        write_envelope(writer, wire, &reply).map_err(|e| e.to_string())?;
-                        return Ok(());
-                    }
-                    "ctl_grant" | "ctl_revoke" => {
-                        let name = v.get("name").and_then(Value::as_str).unwrap_or("");
-                        let caps: Vec<String> = v
-                            .get("caps")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(String::from)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let uin = kernel.by_name.lock().unwrap().get(name).copied();
-                        if let Some(uin) = uin {
-                            {
-                                let agents = kernel.agents.lock().unwrap();
-                                if let Some(entry) = agents.get(&uin) {
-                                    let mut e = entry.lock().unwrap();
-                                    if kind == "ctl_grant" {
-                                        for c in &caps {
-                                            if !e.caps.contains(c) {
-                                                e.caps.push(c.clone());
-                                            }
-                                        }
-                                    } else {
-                                        e.caps.retain(|c| !caps.contains(c));
-                                    }
-                                }
-                            }
-                            let ev = if kind == "ctl_grant" {
-                                "cap_granted"
-                            } else {
-                                "cap_revoked"
-                            };
-                            kernel
-                                .ledger
-                                .append(ev, json!({"uin": uin, "name": name, "caps": caps}))
-                                .ok();
-                            let ack = if kind == "ctl_grant" {
-                                "granted"
-                            } else {
-                                "revoked"
-                            };
-                            write_envelope(writer, wire, &json!({"kind": ack, "name": name}))
-                                .map_err(|e| e.to_string())?;
-                            return Ok(());
-                        }
-                    }
-                    _ => {}
-                }
+        // F02: control verbs on an AGENT connection are refused — the
+        // operator surface is the dedicated `<socket>.ctl` socket with
+        // restrictive permissions and peer-credential checks. Being
+        // unregistered is not authentication.
+        if let Some(kind) = v.get("kind").and_then(Value::as_str) {
+            if kind.starts_with("ctl_") {
+                kernel
+                    .ledger
+                    .append(
+                        "ctl_refused",
+                        json!({"kind": kind,
+                               "reason": "control verbs are only served on the operator socket"}),
+                    )
+                    .ok();
+                write_envelope(
+                    writer,
+                    wire,
+                    &json!({"kind": "error", "reason": "control verbs are only served on the operator socket"}),
+                )
+                .map_err(|e| e.to_string())?;
+                return Ok(());
             }
         }
         // agent envelopes
@@ -2083,6 +2305,13 @@ impl Router {
                         let bundle_id = v.get("bundle_id").and_then(Value::as_u64).unwrap_or(0);
                         let to_name = v.get("to").and_then(Value::as_str).unwrap_or("");
                         let hops = v.get("hops").and_then(Value::as_u64).unwrap_or(0) as u8;
+                        // `from` is ROUTING METADATA (the origin the
+                        // relay forwards on behalf of), not an identity
+                        // claim — the SESSION carries the authority here:
+                        // the relay capability was checked above, and the
+                        // custody chain (kernel hand-offs only) is what
+                        // authenticates the route. Journaled on every
+                        // dtn_relayed for audit.
                         let orig = v.get("from").and_then(Value::as_u64).unwrap_or(me);
                         let body = v.get("body").cloned().unwrap_or(Value::Null);
                         let frag_meta = v.get("frag").filter(|f| !f.is_null()).and_then(|f| {
@@ -2092,6 +2321,9 @@ impl Router {
                                 total: f.get("total")?.as_u64()? as u32,
                             })
                         });
+                        // F01 (DTN): relaying is a capability like any
+                        // other — the SESSION must hold `relay:<to>`
+                        kernel.check_cap(me, "relay", to_name)?;
                         if hops > kernel.max_hops {
                             kernel
                                 .ledger
@@ -2203,7 +2435,12 @@ impl Router {
                     "custody_ack" => {
                         let bundle_id = v.get("bundle_id").and_then(Value::as_u64).unwrap_or(0);
                         // CUSTODY TRANSFER: the relay owns the bundle now,
-                        // so the kernel deletes its own copy (exactly once)
+                        // so the kernel deletes its own copy (exactly once).
+                        // F01 (DTN): ONLY the entity custody was transferred
+                        // TO may acknowledge it — an unrelated relay cannot
+                        // release another relay's custody transfer, and an
+                        // agent cannot release kernel custody it was never
+                        // handed.
                         let frag_index = v
                             .get("frag_index")
                             .and_then(Value::as_u64)
@@ -2212,7 +2449,20 @@ impl Router {
                             .delivery
                             .lock()
                             .unwrap()
-                            .ack_custody(bundle_id, frag_index);
+                            .ack_custody(bundle_id, frag_index, me);
+                        if released == 0 {
+                            kernel
+                                .ledger
+                                .append(
+                                    "custody_ack_refused",
+                                    json!({"by": me, "bundle_id": bundle_id,
+                                           "reason": "session is not the current custody holder"}),
+                                )
+                                .ok();
+                            return Err(format!(
+                                "custody: uin {me} does not hold custody of bundle {bundle_id}"
+                            ));
+                        }
                         kernel
                             .ledger
                             .append(
@@ -2244,8 +2494,79 @@ impl Router {
                 return Err(reason);
             }
         };
+        // F01: the acting identity is the SESSION (the registered
+        // connection), never the envelope's claim — agent A cannot send,
+        // checkpoint, complete, heartbeat or note as agent B, and an
+        // unregistered connection cannot issue agent operations at all.
+        let env = {
+            let session = *my_uin;
+            let claimed = match &env {
+                Envelope::Heartbeat { uin, .. }
+                | Envelope::Send { uin, .. }
+                | Envelope::Checkpoint { uin, .. }
+                | Envelope::Done { uin }
+                | Envelope::Note { uin, .. } => Some(*uin),
+                _ => None,
+            };
+            match (claimed, session) {
+                (Some(_), None) => {
+                    kernel
+                        .ledger
+                        .append(
+                            "identity_refused",
+                            json!({"reason": "agent operation on an unregistered connection",
+                                   "line": v}),
+                        )
+                        .ok();
+                    return Err("identity: register before agent operations".to_string());
+                }
+                (Some(claim), Some(sess)) if claim != sess => {
+                    kernel
+                        .ledger
+                        .append(
+                            "identity_mismatch",
+                            json!({"claimed": claim, "session": sess}),
+                        )
+                        .ok();
+                    return Err(format!(
+                        "identity: claimed uin {claim} does not match the session ({sess})"
+                    ));
+                }
+                _ => {}
+            }
+            // the session uin REWRITES the acting identity — the claim is
+            // never trusted even when it matches
+            match (session, env) {
+                (
+                    Some(u),
+                    Envelope::Heartbeat {
+                        uin: _,
+                        step,
+                        phase,
+                    },
+                ) => Envelope::Heartbeat {
+                    uin: u,
+                    step,
+                    phase,
+                },
+                (Some(u), Envelope::Send { uin: _, to, body }) => {
+                    Envelope::Send { uin: u, to, body }
+                }
+                (Some(u), Envelope::Checkpoint { uin: _, state }) => {
+                    Envelope::Checkpoint { uin: u, state }
+                }
+                (Some(u), Envelope::Done { .. }) => Envelope::Done { uin: u },
+                (Some(u), Envelope::Note { uin: _, text }) => Envelope::Note { uin: u, text },
+                (_, other) => other,
+            }
+        };
         match env {
-            Envelope::Register { name, caps } => {
+            Envelope::Register {
+                name,
+                caps,
+                pid,
+                token,
+            } => {
                 let uin = kernel
                     .by_name
                     .lock()
@@ -2257,6 +2578,33 @@ impl Router {
                     let agents = kernel.agents.lock().unwrap();
                     let entry = agents.get(&uin).ok_or("no entry")?;
                     let e = entry.lock().unwrap();
+                    // F01: registration is bound to the SPECIFIC spawned
+                    // instance via the per-instance token the kernel handed
+                    // the spawned process. A LIVE instance requires the
+                    // token — a random process that knows the manifest name
+                    // (and even the pid from the readable ledger) cannot
+                    // take it. A DEAD instance's identity may be claimed
+                    // without the token (operator-driven restarts); the
+                    // stale-instance refusal below still guards live ones.
+                    // The VM tier is exempt: the kernel-spawned pid there
+                    // is the Firecracker VM, not the agentd inside it.
+                    let live = matches!(e.state, ProcState::Running | ProcState::Registered);
+                    let token_ok = e.auth_token.is_none() // microvm: not yet plumbable
+                        || !live
+                        || token.as_deref() == e.auth_token.as_deref();
+                    if !token_ok {
+                        kernel
+                            .ledger
+                            .append(
+                                "identity_refused",
+                                json!({"reason": "registration token missing or wrong for a LIVE instance",
+                                       "name": name, "spawned_pid": e.pid, "claimed_pid": pid}),
+                            )
+                            .ok();
+                        return Err(format!(
+                            "register: '{name}' is live and this process does not hold its registration token"
+                        ));
+                    }
                     // one live instance per UIN: a second register (stale
                     // process that didn't get the kill, or a duplicate)
                     // is refused — the respawning pid is the authority
@@ -2272,7 +2620,20 @@ impl Router {
                     let agents = kernel.agents.lock().unwrap();
                     let entry = agents.get(&uin).ok_or("no entry")?;
                     let mut e = entry.lock().unwrap();
-                    e.caps = caps;
+                    // F01: effective caps = the TRUSTED source ∪ operator
+                    // grants − operator revocations. The trusted source is
+                    // the manifest's caps when declared; otherwise (legacy
+                    // manifests) the task-supplied caps. Either way the
+                    // operator policy is never lost.
+                    let source_caps = e.manifest_caps.clone().unwrap_or_else(|| caps.clone());
+                    let mut merged = source_caps.clone();
+                    for g in &e.granted {
+                        if !merged.contains(g) {
+                            merged.push(g.clone());
+                        }
+                    }
+                    merged.retain(|c| !e.revoked.contains(c));
+                    e.caps = merged;
                     e.state = ProcState::Running;
                     e.out = Some(Arc::new(Mutex::new(
                         writer.try_clone().map_err(|e| e.to_string())?,
@@ -2380,6 +2741,14 @@ impl Router {
     }
 }
 
+/// The dedicated operator control socket path (F02): the agent socket path
+/// plus the `.ctl` suffix.
+fn control_socket_path(socket_path: &std::path::Path) -> std::path::PathBuf {
+    let mut p = socket_path.to_path_buf().into_os_string();
+    p.push(".ctl");
+    std::path::PathBuf::from(p)
+}
+
 /// Peer: one agent connection over ANY transport (UDS or TCP — the
 /// envelope contract and capability checks are identical).
 pub enum Peer {
@@ -2432,6 +2801,15 @@ impl JsonPeer {
         JsonPeer {
             peer,
             first: Some(first),
+            done: false,
+        }
+    }
+    /// No magic first byte: plain JSON lines from the first byte on (the
+    /// operator control connection, F02).
+    fn new_raw(peer: Peer) -> JsonPeer {
+        JsonPeer {
+            peer,
+            first: None,
             done: false,
         }
     }
@@ -2589,6 +2967,11 @@ pub struct AgentSpec {
     /// and delivered when it registers again
     #[serde(default)]
     pub dtn: bool,
+    /// F01: TRUSTED capabilities declared by the OPERATOR in the manifest.
+    /// When present, the agent's task cannot add capabilities — the kernel
+    /// owns the grant.
+    #[serde(default)]
+    pub caps: Option<Vec<String>>,
 }
 
 #[cfg(test)]

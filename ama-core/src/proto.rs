@@ -107,6 +107,8 @@ const FIELD_NUMBERS: &[(&str, u32)] = &[
     ("from", 13),
     ("reason", 14),
     ("note", 15),
+    ("pid", 16),
+    ("token", 17),
 ];
 
 fn field_of(key: &str) -> Option<u32> {
@@ -128,10 +130,10 @@ pub fn encode_value(v: &Value) -> Result<Vec<u8>, String> {
             continue;
         }
         match k.as_str() {
-            "kind" | "name" | "to" | "step" | "phase" | "text" | "reason" => {
+            "kind" | "name" | "to" | "step" | "phase" | "text" | "reason" | "token" => {
                 put_string(&mut msg, field, val.as_str().unwrap_or_default());
             }
-            "uin" | "seq" | "from" => {
+            "uin" | "seq" | "from" | "pid" => {
                 put_tag(&mut msg, field, 0);
                 put_varint(&mut msg, val.as_u64().unwrap_or(0));
             }
@@ -177,6 +179,9 @@ pub fn decode_raw(msg: &[u8]) -> Result<Value, String> {
     let mut note: Option<bool> = None;
     let mut seq: u64 = 0;
     let mut from: u64 = 0;
+    let mut pid: u64 = 0;
+    let mut seen_pid = false;
+    let mut token: Option<String> = None;
     let mut seen_uin = false;
     let mut seen_seq = false;
     let mut seen_from = false;
@@ -198,6 +203,18 @@ pub fn decode_raw(msg: &[u8]) -> Result<Value, String> {
             (2, 0) => {
                 uin = get_varint(msg, &mut pos).ok_or("proto: truncated uin")?;
                 seen_uin = true;
+            }
+            (16, 0) => {
+                pid = get_varint(msg, &mut pos).ok_or("proto: truncated pid")?;
+                seen_pid = true;
+            }
+            (17, 2) => {
+                let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
+                token = Some(
+                    String::from_utf8(msg.get(pos..pos + len).ok_or("proto: range")?.to_vec())
+                        .map_err(|e| e.to_string())?,
+                );
+                pos += len;
             }
             (3, 2) => {
                 let len = get_varint(msg, &mut pos).ok_or("proto: truncated len")? as usize;
@@ -313,6 +330,12 @@ pub fn decode_raw(msg: &[u8]) -> Result<Value, String> {
         // only messages that CARRIED a uin get one — `register` rejects it
         v.insert("uin".into(), json!(uin));
     }
+    if seen_pid {
+        v.insert("pid".into(), json!(pid));
+    }
+    if let Some(t) = token {
+        v.insert("token".into(), json!(t));
+    }
     if seen_seq {
         v.insert("seq".into(), json!(seq));
     }
@@ -361,6 +384,8 @@ mod proto_tests {
             Envelope::Register {
                 name: "a".into(),
                 caps: vec!["send:b".into(), "send:c".into()],
+                pid: 4242,
+                token: Some("t".into()),
             },
             Envelope::Heartbeat {
                 uin: 7,

@@ -1,0 +1,9 @@
+{
+  "name": "b",
+  "caps": ["send:a", "send:c", "send:sneaky"],
+  "steps": [
+    { "op": "wait", "ms": 100 },
+    { "op": "sleep", "ms": 6000 },
+    { "op": "wait", "ms": 4000 }
+  ]
+}

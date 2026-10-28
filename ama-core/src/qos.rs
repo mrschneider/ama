@@ -803,8 +803,12 @@ impl DeliverySystem {
     /// CUSTODY TRANSFER: the relay holding the bundle now owns it, so the
     /// kernel deletes its own copy. `frag_index` names the exact fragment
     /// (fragments of one logical bundle are independent custody units).
-    /// Returns how many were released.
-    pub fn ack_custody(&mut self, bundle_id: u64, frag_index: Option<u32>) -> usize {
+    /// F01 (DTN): only the CURRENT custody holder may acknowledge — the
+    /// entity the bundle was transferred to (`next_hop`), or the
+    /// destination the kernel holds it for (destination registration
+    /// flushes custody separately, never through this path). Returns how
+    /// many were released; 0 means the caller does not hold custody.
+    pub fn ack_custody(&mut self, bundle_id: u64, frag_index: Option<u32>, by: u64) -> usize {
         let before = self.bundles.len();
         let kept: Vec<DtnBundle> = self
             .bundles
@@ -812,6 +816,11 @@ impl DeliverySystem {
             .filter(|b| {
                 if b.bundle_id != bundle_id {
                     return true; // other bundles stay
+                }
+                // OWNERSHIP: the acking session must be the holder the
+                // bundle was transferred to
+                if b.next_hop != Some(by) {
+                    return true; // not the caller's custody — stays
                 }
                 match (frag_index, b.frag) {
                     (Some(i), Some(m)) => m.index != i, // keep the others
@@ -1189,7 +1198,7 @@ mod tests {
             .unwrap();
         assert_eq!(d.bundles.len(), 1);
         assert_eq!(
-            d.ack_custody(77, None),
+            d.ack_custody(77, None, 7),
             1,
             "the relay's ack must release exactly one bundle"
         );
@@ -1198,7 +1207,27 @@ mod tests {
             0,
             "custody transferred: the kernel no longer holds it"
         );
-        assert_eq!(d.ack_custody(77, None), 0, "a second ack is a no-op");
+        assert_eq!(d.ack_custody(77, None, 7), 0, "a second ack is a no-op");
+    }
+
+    #[test]
+    fn custody_ack_only_releases_the_holders_transfer() {
+        // F01 (DTN): an unrelated relay cannot acknowledge another relay's
+        // custody transfer — the kernel keeps holding it
+        let mut d = DeliverySystem::new(16, Duration::from_secs(60));
+        d.store_routed(1, 5, json!({"n": 1}), 5, None, Some(7), 0, 77, None)
+            .unwrap();
+        assert_eq!(
+            d.ack_custody(77, None, 9),
+            0,
+            "a different session is not the custody holder"
+        );
+        assert_eq!(d.bundles.len(), 1, "the kernel keeps holding the bundle");
+        assert_eq!(
+            d.ack_custody(77, None, 7),
+            1,
+            "the actual holder's ack releases it"
+        );
     }
 
     #[test]

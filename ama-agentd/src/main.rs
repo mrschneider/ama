@@ -217,7 +217,9 @@ fn main() {
     // register
     send(
         &writer,
-        &json!({"kind": "register", "name": task.name, "caps": task.caps}),
+        &json!({"kind": "register", "name": task.name, "caps": task.caps,
+                "pid": std::process::id(),
+                "token": std::env::var("AMA_REGISTER_TOKEN").ok()}),
     );
 
     // process welcome (and any recover state) first

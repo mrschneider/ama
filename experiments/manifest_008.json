@@ -21,11 +21,17 @@
     },
     {
       "name": "relay1",
-      "task": "experiments/tasks_008/relay1.json"
+      "task": "experiments/tasks_008/relay1.json",
+      "caps": [
+        "relay"
+      ]
     },
     {
       "name": "relay2",
-      "task": "experiments/tasks_008/relay2.json"
+      "task": "experiments/tasks_008/relay2.json",
+      "caps": [
+        "relay"
+      ]
     },
     {
       "name": "far",
