@@ -75,18 +75,33 @@ EOF
 # EXTERNAL kill of agent c (the real fail-fast path: the operator/OOM/
 # supervisor kills the PID — the kernel must detect the EOF and respawn
 # the agent FROM ITS LEDGER CHECKPOINT while everyone else keeps running)
-C_PID=$(python3 -c "
+# Kill the LIVE instance of c: the FIRST 'spawned' can belong to an
+# instance the heartbeat watchdog already reaped (CI: first c died at
+# 5.2s), and killing a corpse produces no EOF -> no 'crashed' event ->
+# the recovery check fails. Retry across respawns until a live pid dies.
+C_PID=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  C_PID=$(python3 -c "
 import json
+pid = ''
 for l in open('$LEDGER'):
     e = json.loads(l)
     if e['ev'] == 'spawned' and e['detail']['name'] == 'c':
-        print(e['detail']['pid']); break
-")
+        pid = e['detail']['pid']  # last spawned wins (respawn keeps uin)
+print(pid)
+" 2>/dev/null || true)
+  if [ -n "$C_PID" ] && kill -0 "$C_PID" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
 if [ -z "$C_PID" ]; then
   echo "FAIL: agent c never spawned" >&2; exit 1
 fi
+if ! kill -0 "$C_PID" 2>/dev/null; then
+  echo "::error title=kill::no live c pid found after retries (last=$C_PID gone)" >&2
+fi
 echo "== killing agent c (pid $C_PID) externally =="
-# a vanished pid must NOT abort the run silently (set -e) — annotate it
 kill -9 "$C_PID" 2>/dev/null && echo "KILL: sent -9 to $C_PID" || echo "::error title=kill::kill -9 $C_PID failed (already gone?)"
 
 # phase 2: wait for the terminal evidence instead of sleeping 12 s
@@ -188,16 +203,17 @@ ok("capabilities: no message was delivered on the denied attempt",
 
 # 5. watchdog: agent d looped with no progress -> killed with the reason, respawned
 kills = [d for d in events if d['ev'] == 'killed' and 'no progress' in str(d['detail'].get('reason', ''))]
+d_uins = [d2['detail']['uin'] for d2 in find('spawned') if d2['detail']['name'] == 'd']
 ok("watchdog: infinite reasoning loop detected via progress watchdog",
-   any(d['detail']['uin'] == [d2['detail']['uin'] for d2 in find('spawned') if d2['detail']['name'] == 'd'][0]
-       for d in kills))
+   bool(d_uins) and any(d['detail']['uin'] in d_uins for d in kills))
 respawns_d = [d for d in events if d['ev'] == 'respawned'
               and d['detail']['name'] == 'd']
 ok("watchdog: respawn budget enforced (d died after the budget)",
    any(d['ev'] == 'dead' and d['detail']['name'] == 'd' and 'budget' in str(d['detail']['reason']) for d in events))
 
 # 6. crash + recovery: agent c crashed, respawned from its LAST checkpoint, resumed
-uin_c = [d['detail']['uin'] for d in events if d['ev'] == 'spawned' and d['detail']['name'] == 'c'][0]
+_c_uins = [d['detail']['uin'] for d in events if d['ev'] == 'spawned' and d['detail']['name'] == 'c']
+uin_c = _c_uins[0] if _c_uins else -1
 cps = [d['detail']['state']['state'] for d in events if d['ev'] == 'checkpoint' and d['detail']['uin'] == uin_c]
 ok("recovery: c checkpointed n=0 before the external kill", any(c.get('n') == 0 for c in cps))
 crash_events = [d for d in events if d['ev'] == 'crashed' and d['detail']['uin'] == uin_c]
