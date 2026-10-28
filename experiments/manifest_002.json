@@ -9,19 +9,29 @@
   "agents": [
     {
       "name": "b",
-      "task": "experiments/tasks/b.json"
+      "task": "experiments/tasks/b.json",
+      "caps": [
+        "send:a"
+      ]
     },
     {
       "name": "a",
-      "task": "experiments/tasks/a.json"
+      "task": "experiments/tasks/a.json",
+      "caps": [
+        "send:b"
+      ]
     },
     {
       "name": "c",
-      "task": "experiments/tasks/c.json"
+      "task": "experiments/tasks/c.json",
+      "caps": []
     },
     {
       "name": "m",
-      "task": "experiments/tasks/m.json"
+      "task": "experiments/tasks/m.json",
+      "caps": [
+        "send:b"
+      ]
     }
   ]
 }

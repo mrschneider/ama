@@ -51,6 +51,68 @@ pub fn debug_json_enabled() -> bool {
     *AMA_DEBUG_JSON.get_or_init(|| std::env::var("AMA_DEBUG_JSON").is_ok())
 }
 
+/// F10: make THIS process unreadable to its own same-UID children.
+/// With dumpable=0 the kernel's `/proc/<pid>/{environ,mem,fd}` tree is
+/// EACCES to every other process running as the same uid — which is what
+/// keeps `AMA_OPERATOR_TOKEN` out of an agent's reach while agents still
+/// share the kernel's OS identity. Socket file modes alone cannot do it:
+/// 0600 on the control socket admits every same-uid process, agents
+/// included.
+pub fn set_non_dumpable() {
+    use std::sync::OnceLock;
+    static LOCKED: OnceLock<()> = OnceLock::new();
+    LOCKED.get_or_init(|| unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong, 0, 0, 0);
+    });
+}
+
+/// 128 bits of /dev/urandom as hex — instance tokens and, when nothing
+/// was pre-shared, the operator credential.
+pub fn random_token() -> String {
+    let mut f =
+        std::fs::File::open("/dev/urandom").expect("open /dev/urandom for the registration token");
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    f.read_exact(&mut bytes)
+        .expect("read /dev/urandom for the registration token");
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+}
+
+/// F10: the operator credential — pre-shared through AMA_OPERATOR_TOKEN
+/// (the kernel and the operator CLI both read it), generated fresh when
+/// unset. It is never written to disk and never handed to a child
+/// (`build_agent_command` strips it from the child env), so the only
+/// places it exists are the two non-dumpable processes that need it.
+pub fn operator_token_from_env() -> String {
+    match std::env::var("AMA_OPERATOR_TOKEN") {
+        Ok(t) if !t.is_empty() => t,
+        _ => random_token(),
+    }
+}
+
+/// F10 migration hatch: manifests that OMIT `caps` used to silently fall
+/// back to whatever the TASK asked for — a task could grant itself. The
+/// default is now NO grants; export AMA_LEGACY_TRUST_TASK_CAPS=1 to keep
+/// the old behaviour while a manifest is migrated.
+pub fn legacy_trust_task_caps() -> bool {
+    use std::sync::OnceLock;
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("AMA_LEGACY_TRUST_TASK_CAPS").is_ok_and(|v| v == "1"))
+}
+
+/// Credential compare that does not short-circuit on the first differing
+/// byte (the length is not secret; the content is).
+pub fn credential_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 /// Serialize + frame an envelope in the connection's wire format.
 pub fn write_envelope(w: &mut dyn IoWrite, wire: Wire, v: &Value) -> io::Result<()> {
     match wire {
@@ -152,10 +214,10 @@ pub enum Envelope {
         /// the registering process's own pid (telemetry; NOT auth — pids
         /// are world-readable)
         pid: u32,
-        /// F01: the registration token the kernel handed the spawned
-        /// process via AMA_REGISTER_TOKEN — required while the instance is
-        /// live; a DEAD instance's identity may be claimed without it
-        /// (operator-driven restarts)
+        /// F01/F10: the registration token the kernel handed the spawned
+        /// process via AMA_REGISTER_TOKEN — required in EVERY state. A
+        /// dead identity comes back only through the operator's
+        /// ctl_restart, never by an unauthenticated claim
         token: Option<String>,
     },
     Heartbeat {
@@ -663,6 +725,10 @@ pub struct Kernel {
     pub max_hops: u8,
     /// bodies above this size are fragmented (None = never)
     pub max_bundle_bytes: Option<usize>,
+    /// F10: the operator credential every control verb must present.
+    /// Independent of the OS identity: same-uid agents share the control
+    /// socket's file mode but never hold this secret.
+    pub operator_token: String,
 }
 
 impl Kernel {
@@ -690,6 +756,7 @@ impl Kernel {
             vm_boot: None,
             delivery: Mutex::new(qos::DeliverySystem::new(1024, Duration::from_secs(300))),
             routes: std::collections::HashMap::new(),
+            operator_token: operator_token_from_env(),
             max_hops: default_max_hops_u8(),
             max_bundle_bytes: None,
         })
@@ -866,7 +933,15 @@ impl Kernel {
                 .and_then(|a| a.rsplit(':').next()?.parse::<u64>().ok())
                 .ok_or_else(|| "isolation 'microvm' requires kernel.tcp_port".to_string())?;
             let mut c = Command::new(script);
-            c.args([uin.to_string(), task_path.into(), port.to_string()]);
+            // F10: the guest's instance credential travels with the launch
+            // it is built for (baked into its private initramfs by this
+            // kernel-spawned script) — never through a shared path
+            c.args([
+                uin.to_string(),
+                task_path.into(),
+                port.to_string(),
+                token.to_string(),
+            ]);
             c
         } else {
             let mut c = Command::new(&self.agentd_path);
@@ -890,6 +965,10 @@ impl Kernel {
             c.env("AMA_REGISTER_TOKEN", token);
             c
         };
+        // F10: the operator credential is not launch policy — children
+        // inherit env wholesale, so stripping it here is the only thing
+        // that keeps it out of an agent's address space
+        cmd.env_remove("AMA_OPERATOR_TOKEN");
         // microVM: the guest's SERIAL CONSOLE is firecracker's STDOUT —
         // nulling it discards the only window into the VM
         if microvm && debug_enabled() {
@@ -924,14 +1003,23 @@ impl Kernel {
     }
 
     /// F01: a fresh per-instance registration token.
+    /// F10: is this OS pid one of the processes the kernel itself
+    /// spawned? The control socket refuses them before reading a single
+    /// byte of a request — an agent cannot reach operator authority even
+    /// if it somehow obtained the credential.
+    pub fn is_agent_pid(&self, pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        if self.children.lock().unwrap().contains_key(&pid) {
+            return true;
+        }
+        let agents = self.agents.lock().unwrap();
+        agents.values().any(|e| e.lock().unwrap().pid == pid)
+    }
+
     fn fresh_token(&self) -> String {
-        let mut f = std::fs::File::open("/dev/urandom")
-            .expect("open /dev/urandom for the registration token");
-        use std::io::Read;
-        let mut bytes = [0u8; 16];
-        f.read_exact(&mut bytes)
-            .expect("read /dev/urandom for the registration token");
-        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        random_token()
     }
 
     // 9 params by design: the launch policy IS the parameter list —
@@ -951,7 +1039,6 @@ impl Kernel {
         // 8 params by design: name/task/tcp/wire/isolation are the
         // pre-existing spawn surface, qos+dtn are the delivery contract
         let uin = self.next_uin.fetch_add(1, Ordering::SeqCst);
-        let microvm = isolation == Some("microvm");
         let tcp_addr = tcp.map(String::from).or_else(|| self.tcp_addr.clone());
         let wire = wire_opt.unwrap_or(Wire::Json);
         let token = self.fresh_token();
@@ -976,8 +1063,8 @@ impl Kernel {
             pid,
             caps: Vec::new(),
             manifest_caps: trusted_caps,
-            auth_token: if microvm { None } else { Some(token) },
-            wire, // the spawn declares the wire; register keeps it
+            auth_token: Some(token), // F10: the guest holds it too
+            wire,                    // the spawn declares the wire; register keeps it
             tcp_addr: tcp.map(String::from).or_else(|| self.tcp_addr.clone()),
             spawned_at: Instant::now(),
             granted: Vec::new(),
@@ -1679,6 +1766,13 @@ impl Kernel {
     /// defaults to json and re-registers under a different wire than the
     /// manifest asked for (experiment 004: proto agent reborn as json).
     pub fn respawn(&self, uin: u64) {
+        self.respawn_inner(uin, false);
+    }
+
+    /// `authorized = true` skips the automatic respawn budget: an
+    /// operator-initiated restart is an explicit decision, not a loop
+    /// the kernel decided to keep running.
+    fn respawn_inner(&self, uin: u64, authorized: bool) {
         let (
             name,
             task,
@@ -1711,7 +1805,7 @@ impl Kernel {
             let mc = e.manifest_caps.clone();
             (n, t, r, c, w, iso, pr, dn, tcp, mc)
         };
-        if respawns >= self.max_respawns {
+        if !authorized && respawns >= self.max_respawns {
             let agents = self.agents.lock().unwrap();
             if let Some(e) = agents.get(&uin) {
                 e.lock().unwrap().state = ProcState::Dead;
@@ -1725,7 +1819,6 @@ impl Kernel {
                 .ok();
             return;
         }
-        let microvm = isolation.as_deref() == Some("microvm");
         // F01: a fresh token for the fresh instance — the OLD token is
         // dead with the old process
         let token = self.fresh_token();
@@ -1763,8 +1856,10 @@ impl Kernel {
             let mut e = e.lock().unwrap();
             e.pid = pid;
             e.respawns += 1;
-            // F01: the fresh instance registers with the FRESH token
-            e.auth_token = if microvm { None } else { Some(token) };
+            // F01: the fresh instance registers with the FRESH token;
+            // F10: including the VM tier — the guest received this token
+            // in the initramfs its launch assembled
+            e.auth_token = Some(token);
             // F05: restart fidelity — reapply the resource policy
             if self.apply_cgroups {
                 let _ = sandbox::apply_cgroup(pid, &name);
@@ -1788,6 +1883,45 @@ impl Kernel {
         self.ledger
             .append("respawned", json!({"uin": uin, "name": name, "pid": pid}))
             .ok();
+    }
+
+    /// F10: operator-authorized restart of an entry that is NOT live.
+    /// Resets the automatic respawn budget (the operator just authorized
+    /// a fresh launch) and spawns a fresh instance with a FRESH token —
+    /// this is the only way a dead identity comes back, replacing the old
+    /// "any process may claim a dead identity" hole.
+    pub fn restart_authorized(&self, uin: u64) -> Result<(), String> {
+        {
+            let agents = self.agents.lock().unwrap();
+            let entry = agents.get(&uin).ok_or("no entry")?;
+            let mut e = entry.lock().unwrap();
+            let live =
+                matches!(e.state, ProcState::Running | ProcState::Registered) && e.out.is_some();
+            if live {
+                return Err(format!(
+                    "ctl: agent '{}' is live - nothing to restart",
+                    e.name
+                ));
+            }
+            let judged = matches!(e.state, ProcState::Dead | ProcState::Completed);
+            let stale_pid = e.pid;
+            e.respawns = 0; // the operator authorized a fresh launch
+            e.state = ProcState::Killed("operator restart".into());
+            e.out = None;
+            drop(e);
+            drop(agents);
+            // a stale process must not survive into the new launch: two
+            // processes for one uin is exactly what the table forbids
+            if !judged && stale_pid != 0 {
+                let _ = Command::new("kill")
+                    .args(["-9", &stale_pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+        self.respawn_inner(uin, true);
+        Ok(())
     }
 
     /// Watchdog sweep: heartbeat timeout AND progress-loop detection.
@@ -1928,6 +2062,17 @@ impl Router {
         kernel: Kernel,
         agents: &[AgentSpecTuple],
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        // F10: the kernel must not be readable by the agents it spawns
+        set_non_dumpable();
+        if std::env::var("AMA_OPERATOR_TOKEN")
+            .map(|v| v.is_empty())
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "[ama] operator token generated (export AMA_OPERATOR_TOKEN to pre-share it): {}",
+                kernel.operator_token
+            );
+        }
         let kernel = Arc::new(kernel);
         let _ = std::fs::remove_file(&kernel.socket_path);
         let listener = std::os::unix::net::UnixListener::bind(&kernel.socket_path)?;
@@ -1996,13 +2141,8 @@ impl Router {
                 for conn in ctl_listener.incoming().flatten() {
                     let k = k.clone();
                     std::thread::spawn(move || {
-                        if let Err(e) = Router::check_peer_credentials(&conn) {
-                            k.ledger
-                                .append(
-                                    "ctl_refused",
-                                    json!({"reason": format!("operator socket peer credential rejected: {e}")}),
-                                )
-                                .ok();
+                        if let Err(e) = Router::ctl_door(&k, &conn) {
+                            k.ledger.append("ctl_refused", json!({"reason": e})).ok();
                             return;
                         }
                         Router::ctl_connection(k, Peer::Unix(conn));
@@ -2041,9 +2181,27 @@ impl Router {
         Ok(handle)
     }
 
+    /// F10: the control socket's DOOR. Two independent gates, both
+    /// evaluated before a single byte of the request is read: the peer
+    /// must run as the kernel's uid, AND its pid must not be one of the
+    /// kernel's own spawned agents. Extracted from the accept loop so a
+    /// test can drive it against a live socketpair (SO_PEERCRED reports
+    /// the real peer pid there).
+    fn ctl_door(kernel: &Kernel, conn: &std::os::unix::net::UnixStream) -> Result<(), String> {
+        Router::check_peer_credentials(conn)?;
+        let cred = Router::peer_creds(conn)?;
+        if kernel.is_agent_pid(cred.pid as u32) {
+            return Err(format!(
+                "peer PID {} belongs to a spawned agent — the operator socket is not for agents",
+                cred.pid
+            ));
+        }
+        Ok(())
+    }
+
     /// Unix peer-credential check: the connecting process must run as the
     /// SAME uid as the kernel. (SO_PEERCRED via libc.)
-    fn check_peer_credentials(sock: &std::os::unix::net::UnixStream) -> Result<(), String> {
+    fn peer_creds(sock: &std::os::unix::net::UnixStream) -> Result<libc::ucred, String> {
         use std::os::unix::io::AsRawFd;
         let mut cred: libc::ucred = libc::ucred {
             pid: 0,
@@ -2063,6 +2221,11 @@ impl Router {
         if r != 0 {
             return Err("SO_PEERCRED unavailable".to_string());
         }
+        Ok(cred)
+    }
+
+    fn check_peer_credentials(sock: &std::os::unix::net::UnixStream) -> Result<(), String> {
+        let cred = Self::peer_creds(sock)?;
         let my_uid = unsafe { libc::getuid() };
         if cred.uid != my_uid {
             return Err(format!("peer uid {} != kernel uid {}", cred.uid, my_uid));
@@ -2353,6 +2516,26 @@ impl Router {
             .get("kind")
             .and_then(Value::as_str)
             .ok_or("ctl: missing 'kind'")?;
+        // F10: operator authority is a CREDENTIAL, not an OS identity.
+        // Same-uid agents can open this socket (0600 admits them), so
+        // every verb must present the token they were never given.
+        let presented = v.get("token").and_then(Value::as_str).unwrap_or("");
+        if !credential_eq(presented, &kernel.operator_token) {
+            kernel
+                .ledger
+                .append(
+                    "ctl_refused",
+                    json!({"kind": kind, "reason": "operator token missing or wrong"}),
+                )
+                .ok();
+            write_envelope(
+                writer,
+                wire,
+                &json!({"kind": "error", "reason": "operator token required"}),
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         match kind {
             "ctl_qos" => {
                 // bandwidth accounting + queue state, operator-only
@@ -2431,6 +2614,28 @@ impl Router {
                 } else {
                     Err(format!("ctl: unknown agent '{name}'"))
                 }
+            }
+            "ctl_restart" => {
+                // F10: the EXPLICITLY AUTHORIZED restart that replaces
+                // unauthenticated claims of a dead identity. Only an
+                // operator holding the credential can bring a dead entry
+                // back — and the fresh launch gets a fresh token.
+                let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+                let uin = kernel
+                    .by_name
+                    .lock()
+                    .unwrap()
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| format!("ctl: unknown agent '{name}'"))?;
+                kernel
+                    .ledger
+                    .append("restart_authorized", json!({"uin": uin, "name": name}))
+                    .ok();
+                kernel.restart_authorized(uin)?;
+                write_envelope(writer, wire, &json!({"kind": "restarted", "name": name}))
+                    .map_err(|e| e.to_string())?;
+                Ok(())
             }
             _ => Err(format!("ctl: unknown control verb '{kind}'")),
         }
@@ -2748,36 +2953,51 @@ impl Router {
                     .get(&name)
                     .copied()
                     .ok_or_else(|| format!("unknown agent '{name}' — not in the manifest"))?;
+                // F10: ONE critical section, from the identity check to
+                // the state transition. The old code checked under the
+                // locks, DROPPED them and re-acquired to mutate — two
+                // concurrent claims could both pass the check and both
+                // become Running. The entry lock now serializes them: the
+                // loser observes the winner's state and is refused.
                 {
                     let agents = kernel.agents.lock().unwrap();
                     let entry = agents.get(&uin).ok_or("no entry")?;
-                    let e = entry.lock().unwrap();
-                    // F01: registration is bound to the SPECIFIC spawned
-                    // instance via the per-instance token the kernel handed
-                    // the spawned process. A LIVE instance requires the
-                    // token — a random process that knows the manifest name
-                    // (and even the pid from the readable ledger) cannot
-                    // take it. A DEAD instance's identity may be claimed
-                    // without the token (operator-driven restarts); the
-                    // stale-instance refusal below still guards live ones.
-                    // The VM tier is exempt: the kernel-spawned pid there
-                    // is the Firecracker VM, not the agentd inside it.
-                    let live = matches!(e.state, ProcState::Running | ProcState::Registered);
-                    let token_ok = e.auth_token.is_none() // microvm: not yet plumbable
-                        || !live
-                        || token.as_deref() == e.auth_token.as_deref();
+                    let mut e = entry.lock().unwrap();
+                    // F10: the per-instance token is required in EVERY
+                    // lifecycle state — initial registration, reconnect,
+                    // restart, and the microVM tier (the credential is
+                    // baked into the guest's private initramfs at launch).
+                    // Knowing the manifest name, or the pid the readable
+                    // ledger prints, is not identity: only the process
+                    // this kernel spawned holds the secret. A DEAD entry
+                    // is no longer claimable without it — the operator's
+                    // explicit ctl_restart is how a dead identity returns.
+                    let presented = token.as_deref().unwrap_or("");
+                    let token_ok =
+                        !presented.is_empty() && Some(presented) == e.auth_token.as_deref();
                     if !token_ok {
                         kernel
                             .ledger
                             .append(
                                 "identity_refused",
-                                json!({"reason": "registration token missing or wrong for a LIVE instance",
-                                       "name": name, "spawned_pid": e.pid, "claimed_pid": pid}),
+                                json!({"reason": "registration token missing, wrong, or stale",
+                                       "name": name,
+                                       "entry_state": format!("{:?}", e.state),
+                                       "spawned_pid": e.pid, "claimed_pid": pid}),
                             )
                             .ok();
                         return Err(format!(
-                            "register: '{name}' is live and this process does not hold its registration token"
+                            "register: '{name}' requires this instance's registration token"
                         ));
+                    }
+                    // F10: the AUTHENTICATED claimer becomes the instance:
+                    // record its pid so every pid-based check (the ctl
+                    // door, kill, ps) targets the LIVE process instead of
+                    // the corpse the ledger last recorded. The VM tier is
+                    // excluded — there the watched pid is Firecracker, and
+                    // the guest's pid is meaningless on this host.
+                    if e.isolation.as_deref() != Some("microvm") {
+                        e.pid = pid;
                     }
                     // one live instance per UIN: a second register (stale
                     // process that didn't get the kill, or a duplicate)
@@ -2787,20 +3007,19 @@ impl Router {
                             "agent '{name}' already registered (stale instance refused)"
                         ));
                     }
-                    drop(e);
-                    drop(agents);
-                }
-                {
-                    let agents = kernel.agents.lock().unwrap();
-                    let entry = agents.get(&uin).ok_or("no entry")?;
-                    let mut e = entry.lock().unwrap();
-                    // F01: effective caps = the TRUSTED source ∪ operator
-                    // grants − operator revocations. The trusted source is
-                    // the manifest's caps when declared; otherwise (legacy
-                    // manifests) the task-supplied caps. Either way the
-                    // operator policy is never lost.
-                    let source_caps = e.manifest_caps.clone().unwrap_or_else(|| caps.clone());
-                    let mut merged = source_caps.clone();
+                    // F10: effective caps = the TRUSTED source + operator
+                    // grants - operator revocations. The trusted source is
+                    // the manifest's caps when DECLARED; an omitted policy
+                    // is no longer "whatever the task asked for" — it is
+                    // NO grants (AMA_LEGACY_TRUST_TASK_CAPS=1 keeps the old
+                    // fallback while a manifest is migrated). The operator
+                    // policy is never lost either way.
+                    let source_caps = match &e.manifest_caps {
+                        Some(mc) => mc.clone(),
+                        None if legacy_trust_task_caps() => caps.clone(),
+                        None => Vec::new(),
+                    };
+                    let mut merged = source_caps;
                     for g in &e.granted {
                         if !merged.contains(g) {
                             merged.push(g.clone());
@@ -2816,6 +3035,8 @@ impl Router {
                     e.last_hb = Instant::now();
                     e.stuck_sweeps = 0;
                     e.last_step = String::new();
+                    drop(e);
+                    drop(agents);
                 }
                 *my_uin = Some(uin);
                 // DTN custody flush: the fresh agent gets its held bundles
@@ -3273,5 +3494,300 @@ mod ledger_perf_tests {
         }
         assert_eq!(ledger.last_checkpoint(1).unwrap(), json!({"v": "good"}));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod f10_authority_tests {
+    //! F10 gates: operator authority is a credential + a pid check, not
+    //! an OS identity; registration is authenticated in every lifecycle
+    //! state; an omitted capability policy grants nothing.
+
+    use super::*;
+
+    fn temp_kernel(tag: &str) -> (Kernel, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ama-f10-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let k = Kernel::new(
+            &dir.join("k.sock"),
+            &dir.join("ledger.jsonl"),
+            "/bin/true",
+            150,
+            5000,
+            2,
+        )
+        .unwrap();
+        (k, dir)
+    }
+
+    fn entry(
+        pid: u32,
+        manifest_caps: Option<Vec<String>>,
+        token: &str,
+        state: ProcState,
+    ) -> ProcEntry {
+        ProcEntry {
+            uin: 7,
+            name: "alice".into(),
+            pid,
+            caps: Vec::new(),
+            tcp_addr: None,
+            spawned_at: Instant::now(),
+            manifest_caps,
+            auth_token: Some(token.into()),
+            granted: Vec::new(),
+            revoked: Vec::new(),
+            state,
+            last_hb: Instant::now(),
+            last_step: String::new(),
+            last_phase: String::new(),
+            stuck_sweeps: 0,
+            respawns: 0,
+            last_checkpoint: None,
+            task_path: "tasks/alice.json".into(),
+            out: None,
+            wire: Wire::Json,
+            isolation: None,
+            priority: 5,
+            dtn: false,
+        }
+    }
+
+    fn insert(k: &Kernel, name: &str, e: ProcEntry) {
+        let uin = e.uin;
+        k.agents
+            .lock()
+            .unwrap()
+            .insert(uin, Arc::new(Mutex::new(e)));
+        k.by_name.lock().unwrap().insert(name.into(), uin);
+    }
+
+    /// the ctl socket's DOOR over a REAL socketpair (SO_PEERCRED reports
+    /// the true peer pid there): a pid in the agent table is refused
+    /// even when the uid matches.
+    #[test]
+    fn ctl_door_refuses_a_pid_that_belongs_to_a_spawned_agent() {
+        let (k, _dir) = temp_kernel("door-agent");
+        let (_a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        insert(
+            &k,
+            "alice",
+            entry(std::process::id(), None, "t", ProcState::Running),
+        );
+        let err = Router::ctl_door(&k, &b).expect_err("own pid must be refused");
+        assert!(err.contains("spawned agent"), "unexpected: {err}");
+        assert!(k.is_agent_pid(std::process::id()));
+    }
+
+    #[test]
+    fn ctl_door_admits_a_non_agent_same_uid_peer() {
+        let (k, _dir) = temp_kernel("door-plain");
+        let (_a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(!k.is_agent_pid(std::process::id()));
+        Router::ctl_door(&k, &b).expect("a non-agent peer must pass the door");
+    }
+
+    fn read_reply(client: &std::os::unix::net::UnixStream) -> Value {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(client)
+            .read_line(&mut line)
+            .expect("reply line");
+        serde_json::from_str(line.trim()).expect("reply json")
+    }
+
+    #[test]
+    fn control_verbs_require_the_operator_credential() {
+        let (mut k, _dir) = temp_kernel("ctl-token");
+        k.operator_token = "s3cret-operator".into();
+        insert(
+            &k,
+            "alice",
+            entry(
+                4242,
+                Some(vec!["send:b".into()]),
+                "agent-tok",
+                ProcState::Running,
+            ),
+        );
+
+        // wrong credential: refused, and NOTHING changes
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut w = Peer::Unix(server);
+        let v = json!({"kind": "ctl_grant", "name": "alice", "caps": ["send:x"],
+                       "token": "wrong"});
+        Router::handle_ctl_value(&k, &mut w, &v, Wire::Json).unwrap();
+        let r = read_reply(&client);
+        assert_eq!(r["kind"], "error", "wrong token must be refused: {r}");
+        assert!(
+            r["reason"].as_str().unwrap_or("").contains("token"),
+            "reason: {r}"
+        );
+        assert!(!k.agents.lock().unwrap()[&7]
+            .lock()
+            .unwrap()
+            .caps
+            .contains(&"send:x".to_string()));
+        let kinds: Vec<String> = k.ledger.read_all().iter().map(|e| e.ev.clone()).collect();
+        assert!(
+            kinds.contains(&"ctl_refused".to_string()),
+            "journalled: {kinds:?}"
+        );
+
+        // correct credential: the same verb is served
+        let (client2, server2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut w2 = Peer::Unix(server2);
+        let v2 = json!({"kind": "ctl_grant", "name": "alice", "caps": ["send:x"],
+                        "token": "s3cret-operator"});
+        Router::handle_ctl_value(&k, &mut w2, &v2, Wire::Json).unwrap();
+        let r2 = read_reply(&client2);
+        assert_eq!(r2["kind"], "granted", "valid token must be served: {r2}");
+        assert!(k.agents.lock().unwrap()[&7]
+            .lock()
+            .unwrap()
+            .caps
+            .contains(&"send:x".to_string()));
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    fn try_register(k: &Kernel, token: Option<&str>, caps: &[&str]) -> Result<(), String> {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        // keep `client` alive: a successful register writes the welcome
+        // before returning, and a dropped peer is EPIPE
+        let mut w = Peer::Unix(server);
+        let _keep = client;
+        let v = json!({"kind": "register", "name": "alice",
+                       "caps": caps, "pid": 9999, "token": token});
+        let mut my_uin: Option<u64> = None;
+        Router::handle_value(k, &mut w, &v, &mut my_uin, Wire::Json)
+    }
+
+    #[test]
+    fn registration_requires_the_instance_token_in_every_state() {
+        let states = [
+            ProcState::Registered,
+            ProcState::Running,
+            ProcState::Killed("boom".into()),
+            ProcState::Dead,
+            ProcState::Completed,
+        ];
+        for state in states {
+            let (k, _dir) = temp_kernel(&format!("reg-{state:?}"));
+            insert(
+                &k,
+                "alice",
+                entry(
+                    1111,
+                    Some(vec!["send:b".into()]),
+                    "real-token",
+                    state.clone(),
+                ),
+            );
+            for bad in [None, Some("forged"), Some("")] {
+                let err = try_register(&k, bad, &["send:x"])
+                    .expect_err(&format!("state {state:?}, token {bad:?} must be refused"));
+                assert!(
+                    err.contains("registration token"),
+                    "state {state:?}, token {bad:?}: {err}"
+                );
+            }
+            // correct token: refused ONLY where the contract says so —
+            // a Running instance cannot be taken twice; every other state
+            // admits the authenticated holder (that IS the restart path)
+            let outcome = try_register(&k, Some("real-token"), &["send:x"]);
+            if matches!(state, ProcState::Running) {
+                let err = outcome.expect_err("a Running instance must not be taken twice");
+                assert!(err.contains("already registered"), "{err}");
+            } else {
+                if let Err(e) = outcome {
+                    panic!("the CURRENT token holder must be admitted in state {state:?}: {e}");
+                }
+                assert_eq!(
+                    k.agents.lock().unwrap()[&7].lock().unwrap().caps,
+                    vec!["send:b".to_string()],
+                    "declared caps, not the task's request"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&_dir);
+        }
+    }
+
+    #[test]
+    fn omitted_manifest_policy_yields_no_grants() {
+        let (k, _dir) = temp_kernel("caps-default");
+        // manifest_caps: None (the policy key is absent) — the task still
+        // ASKS for send:x; an omitted policy must grant nothing
+        insert(
+            &k,
+            "alice",
+            entry(2222, None, "real-token", ProcState::Killed("x".into())),
+        );
+        try_register(&k, Some("real-token"), &["send:x"])
+            .expect("authenticated registration must succeed");
+        let caps = k.agents.lock().unwrap()[&7].lock().unwrap().caps.clone();
+        assert!(
+            caps.is_empty(),
+            "omitted policy must grant nothing, got {caps:?}"
+        );
+
+        // declared policy wins over what the task asks for
+        insert(
+            &k,
+            "alice",
+            entry(
+                3333,
+                Some(vec!["send:b".into()]),
+                "real-token",
+                ProcState::Killed("x".into()),
+            ),
+        );
+        try_register(&k, Some("real-token"), &["send:x"])
+            .expect("authenticated registration must succeed");
+        let caps = k.agents.lock().unwrap()[&7].lock().unwrap().caps.clone();
+        assert_eq!(
+            caps,
+            vec!["send:b".to_string()],
+            "declared caps are the source"
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    #[test]
+    fn operator_grant_and_revocation_merge_survive_reregistration() {
+        let (k, _dir) = temp_kernel("policy-merge");
+        let mut e = entry(
+            5555,
+            Some(vec!["send:a".into()]),
+            "real-token",
+            ProcState::Killed("x".into()),
+        );
+        e.revoked = vec!["send:a".into()];
+        e.granted = vec!["send:c".into()];
+        insert(&k, "alice", e);
+        try_register(&k, Some("real-token"), &["send:a", "send:x"]).unwrap();
+        let caps = k.agents.lock().unwrap()[&7].lock().unwrap().caps.clone();
+        assert!(
+            caps.contains(&"send:c".to_string()),
+            "grant survives: {caps:?}"
+        );
+        assert!(
+            !caps.contains(&"send:a".to_string()),
+            "revocation survives: {caps:?}"
+        );
+        assert!(
+            !caps.contains(&"send:x".to_string()),
+            "task caps are not grants: {caps:?}"
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    #[test]
+    fn credential_compare_is_exact() {
+        assert!(credential_eq("abc", "abc"));
+        assert!(!credential_eq("abc", "abd"));
+        assert!(!credential_eq("abc", "abcd"));
+        assert!(!credential_eq("", "x"));
+        assert!(credential_eq("", ""));
     }
 }

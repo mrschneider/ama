@@ -15,25 +15,35 @@
       "task": "experiments/tasks_007/light.json",
       "qos": {
         "weight": 1
-      }
+      },
+      "caps": [
+        "send:sink"
+      ]
     },
     {
       "name": "heavy",
       "task": "experiments/tasks_007/heavy.json",
       "qos": {
         "weight": 3
-      }
+      },
+      "caps": [
+        "send:sink"
+      ]
     },
     {
       "name": "sink",
-      "task": "experiments/tasks_007/sink.json"
+      "task": "experiments/tasks_007/sink.json",
+      "caps": []
     },
     {
       "name": "big",
       "task": "experiments/tasks_007/big.json",
       "qos": {
         "max_bytes_per_sec": 2000
-      }
+      },
+      "caps": [
+        "send:sink"
+      ]
     }
   ]
 }

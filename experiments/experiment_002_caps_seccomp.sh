@@ -4,6 +4,9 @@
 # runtime, the previously denied send goes through, and a revocation
 # closes it again — while a's/b's/c's work proceeds untouched.
 set -euo pipefail
+# F10: operator authority is a CREDENTIAL — the kernel and this
+# operator CLI must share it; agents are stripped of it at spawn
+export AMA_OPERATOR_TOKEN="ama-local-operator-token"
 cd "$(dirname "$0")/.."
 LEDGER=/tmp/ama_exp/ledger.jsonl
 rm -rf /tmp/ama_exp && mkdir -p /tmp/ama_exp

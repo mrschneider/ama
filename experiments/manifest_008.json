@@ -17,7 +17,10 @@
   "agents": [
     {
       "name": "src",
-      "task": "experiments/tasks_008/src.json"
+      "task": "experiments/tasks_008/src.json",
+      "caps": [
+        "send:far"
+      ]
     },
     {
       "name": "relay1",
@@ -36,7 +39,8 @@
     {
       "name": "far",
       "task": "experiments/tasks_008/far.json",
-      "dtn": true
+      "dtn": true,
+      "caps": []
     }
   ]
 }

@@ -18,6 +18,9 @@
 #  5. `far` comes back (fresh agentd process), registers, and the kernel
 #     reassembles the two fragments into ONE message and delivers it.
 set -euo pipefail
+# F10: operator authority is a CREDENTIAL — the kernel and this
+# operator CLI must share it; agents are stripped of it at spawn
+export AMA_OPERATOR_TOKEN="ama-local-operator-token"
 cd "$(dirname "$0")/.."
 rm -rf /tmp/ama_exp /tmp/ama_dbg_agent_*
 mkdir -p /tmp/ama_exp
@@ -49,12 +52,11 @@ kill -9 "$FAR_PID" 2>/dev/null || true
 
 # t~8s: the destination comes back — the fragments must reassemble
 sleep 7
-./target/debug/ama-agentd --socket /tmp/ama_exp.sock \
-  --task experiments/tasks_008/far.json &
-FAR2=$!
+# F10: same contract as 006 — the operator's ctl_restart is the only
+# way a dead destination comes back (a hand-started agentd has no token)
+./target/debug/ama restart --socket /tmp/ama_exp.sock --name far
 
 python3 experiments/wait_ledger_quiet.py 3 35
-kill $FAR2 2>/dev/null || true
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 

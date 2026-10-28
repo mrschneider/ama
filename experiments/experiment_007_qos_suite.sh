@@ -17,6 +17,9 @@
 # serving the queue, and the operator can read the same numbers at any
 # time on the control channel: `ama qos`.
 set -euo pipefail
+# F10: operator authority is a CREDENTIAL — the kernel and this
+# operator CLI must share it; agents are stripped of it at spawn
+export AMA_OPERATOR_TOKEN="ama-local-operator-token"
 cd "$(dirname "$0")/.."
 rm -rf /tmp/ama_exp /tmp/ama_dbg_agent_*
 mkdir -p /tmp/ama_exp

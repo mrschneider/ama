@@ -22,7 +22,7 @@ else
   add "LEDGER MISSING"
 fi
 
-if [ -f /tmp/ama_exp/kernel.err ]; then
+if [ -f "$EXPDIR/kernel.err" ]; then
   add "KERNELERR $(wc -l < /tmp/ama_exp/kernel.err) lines, tail 5:"
   while IFS= read -r l; do add "k: ${l:0:250}"; done < <(tail -5 /tmp/ama_exp/kernel.err)
 else
@@ -35,7 +35,7 @@ for f in /tmp/ama_dbg_agent_*.stderr; do
   while IFS= read -r l; do add "$(basename "$f"): ${l:0:250}"; done < <(tail -3 "$f")
 done
 
-if [ -f /tmp/ama_exp/ps.json ]; then
+if [ -f "$EXPDIR/ps.json" ]; then
   add "PS: $(tr -d ' \n' < /tmp/ama_exp/ps.json | head -c 600)"
 fi
 

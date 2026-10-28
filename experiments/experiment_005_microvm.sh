@@ -9,6 +9,9 @@
 # Requires: /dev/kvm writable (udev rule), ufw allow from 172.16.0.0/12,
 # vm/bin/{firecracker,busybox}, vm/vmlinux-6.1.155, vm/agentd-static.
 set -euo pipefail
+# F10: operator authority is a CREDENTIAL — the kernel and this
+# operator CLI must share it; agents are stripped of it at spawn
+export AMA_OPERATOR_TOKEN="ama-local-operator-token"
 cd "$(dirname "$0")/.."
 rm -rf /tmp/ama_exp /tmp/ama_vm* /tmp/ama_dbg_agent_*
 mkdir -p /tmp/ama_exp

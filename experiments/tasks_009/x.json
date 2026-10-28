@@ -1,0 +1,11 @@
+{
+  "name": "x",
+  "caps": [
+    "send:c"
+  ],
+  "steps": [
+    {
+      "op": "wait"
+    }
+  ]
+}

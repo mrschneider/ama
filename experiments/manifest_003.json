@@ -10,13 +10,19 @@
   "agents": [
     {
       "name": "a",
-      "task": "experiments/tasks_003/a.json"
+      "task": "experiments/tasks_003/a.json",
+      "caps": [
+        "send:b"
+      ]
     },
     {
       "name": "b",
       "task": "experiments/tasks_003/b.json",
       "transport": "tcp",
-      "wire": "msgpack"
+      "wire": "msgpack",
+      "caps": [
+        "send:a"
+      ]
     }
   ]
 }

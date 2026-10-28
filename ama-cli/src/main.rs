@@ -4,16 +4,38 @@
 //!   ama ps --socket <path>                                    process table dump
 //!   ama inspect --socket <path> --name <agent>                one entry
 //!
-//! `ps`/`inspect` use a CONTROL connection (kind "ctl_*" envelopes). The
-//! kernel enforces that control verbs are only accepted on connections
-//! that never registered as agents — agents cannot control the kernel.
+//! `ps`/`grant`/`revoke`/`qos`/`restart` use a CONTROL connection (kind
+//! "ctl_*" envelopes). Two independent gates protect it (F10): every verb
+//! must carry AMA_OPERATOR_TOKEN (a credential agents are never given),
+//! and the kernel refuses peers whose pid is one of its own spawned
+//! agents — before reading a byte. Agents cannot control the kernel.
 
 use ama_core::AgentSpecTuple;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::exit;
 
+/// F10: the operator credential. Read from AMA_OPERATOR_TOKEN — the SAME
+/// value the kernel holds. Refusing to run without it is deliberate: a
+/// CLI that silently sent an empty token would turn every operator
+/// action into an anonymous one.
+fn operator_token() -> String {
+    match std::env::var("AMA_OPERATOR_TOKEN") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!(
+                "ama: AMA_OPERATOR_TOKEN is not set.\n  \
+                 export AMA_OPERATOR_TOKEN=<the value the kernel logged at startup>"
+            );
+            exit(2);
+        }
+    }
+}
+
 fn main() {
+    // F10: lock our own /proc entries first — the credential lives in
+    // this process's address space and same-uid agents must not read it
+    ama_core::set_non_dumpable();
     let mut args = std::env::args().skip(1);
     let cmd = args.next().unwrap_or_default();
     let mut socket = String::new();
@@ -61,6 +83,8 @@ fn main() {
         "qos" => ctl_qos(&ctl_socket),
         "grant" => ctl_caps(&ctl_socket, "ctl_grant", &name, &caps),
         "revoke" => ctl_caps(&ctl_socket, "ctl_revoke", &name, &caps),
+        // F10: the explicitly authorized way a dead identity comes back
+        "restart" => ctl_restart(&ctl_socket, &name),
         "jail" => {
             // Tool Execution Jail: run a command inside the seccomp filter
             // (--strict upgrades to the allowlist profile: default-DENY,
@@ -90,7 +114,10 @@ fn main() {
 }
 
 fn ctl_qos(socket: &str) {
-    let msg = format!("{}\n", serde_json::json!({"kind": "ctl_qos"}));
+    let msg = format!(
+        "{}\n",
+        serde_json::json!({"kind": "ctl_qos", "token": operator_token()})
+    );
     let mut s = UnixStream::connect(socket).expect("connect");
     s.write_all(msg.as_bytes()).expect("ctl");
     let mut line = String::new();
@@ -106,7 +133,28 @@ fn ctl_caps(socket: &str, verb: &str, name: &str, caps: &str) {
         .collect();
     let msg = format!(
         "{}\n",
-        serde_json::json!({"kind": verb, "name": name, "caps": list})
+        serde_json::json!({"kind": verb, "name": name, "caps": list,
+                           "token": operator_token()})
+    );
+    let mut s = UnixStream::connect(socket).expect("connect");
+    s.write_all(msg.as_bytes()).expect("ctl");
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).expect("reply");
+    println!("{}", line.trim());
+}
+
+/// F10: operator-authorized restart of a non-live entry. The kernel
+/// spawns the fresh instance (fresh token); an unauthenticated process
+/// claiming the dead identity is refused instead.
+fn ctl_restart(socket: &str, name: &str) {
+    if name.is_empty() {
+        eprintln!("restart requires: ama restart --socket <path> --name <agent>");
+        exit(2);
+    }
+    let msg = format!(
+        "{}\n",
+        serde_json::json!({"kind": "ctl_restart", "name": name,
+                           "token": operator_token()})
     );
     let mut s = UnixStream::connect(socket).expect("connect");
     s.write_all(msg.as_bytes()).expect("ctl");
@@ -189,7 +237,11 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
 
 fn ps(socket: &str) {
     let mut s = UnixStream::connect(socket).expect("connect");
-    s.write_all(b"{\"kind\": \"ctl_ps\"}\n").expect("ctl");
+    let msg = format!(
+        "{}\n",
+        serde_json::json!({"kind": "ctl_ps", "token": operator_token()})
+    );
+    s.write_all(msg.as_bytes()).expect("ctl");
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).expect("reply");
     println!("{}", line.trim());

@@ -7,7 +7,23 @@
     "max_respawns": 0
   },
   "agents": [
-    { "name": "a", "task": "experiments/tasks_009/a.json", "caps": ["send:b"] },
-    { "name": "b", "task": "experiments/tasks_009/b.json", "caps": ["send:a"] }
+    {
+      "name": "a",
+      "task": "experiments/tasks_009/a.json",
+      "caps": [
+        "send:b"
+      ]
+    },
+    {
+      "name": "b",
+      "task": "experiments/tasks_009/b.json",
+      "caps": [
+        "send:a"
+      ]
+    },
+    {
+      "name": "x",
+      "task": "experiments/tasks_009/x.json"
+    }
   ]
 }

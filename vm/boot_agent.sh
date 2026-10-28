@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # boot_agent.sh — boot ONE ama agent inside its own Firecracker microVM.
 #
-# Usage: boot_agent.sh <uin> <task_path> <kernel_tcp_port>
+# Usage: boot_agent.sh <uin> <task_path> <kernel_tcp_port> <register_token>
 #
 # The script is exec'd BY the ama kernel as the agent's process: it
 # assembles the per-agent initramfs, wires a private tap, and `exec`s
@@ -14,7 +14,7 @@
 # — VMs cannot see each other's traffic, only the kernel's tap IP.
 set -euo pipefail
 VM_DIR="$(cd "$(dirname "$0")" && pwd)"
-UIN="$1"; TASK="$2"; PORT="$3"
+UIN="$1"; TASK="$2"; PORT="$3"; TOKEN="$4"
 
 KERNEL_IMG="$VM_DIR/vmlinux-6.1.155"
 FC="$VM_DIR/bin/firecracker"
@@ -39,7 +39,7 @@ fi
     "$RUN/initramfs.cpio.gz" \
     "$VM_DIR/agentd-static" \
     "$TASK" \
-    "$GUEST_IP" "$HOST_IP" "$PORT" "vm$UIN" \
+    "$GUEST_IP" "$HOST_IP" "$PORT" "vm$UIN" "$TOKEN" \
     >/dev/null
 
 # firecracker config — a config-file boot STARTS the instance immediately

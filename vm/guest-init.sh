@@ -26,6 +26,10 @@ echo "[guest] net up — starting ama-agentd (name=__NAME__)"
 # self-filter (the strict allowlist denies socket(AF_INET) — the guest
 # NEEDS it to reach the kernel over the tap; a dead PID 1 = kernel panic)
 export AMA_VM=1
+# F10: the instance credential is baked into THIS initramfs by the
+# kernel-spawned launch script — the VM tier authenticates exactly like
+# every other tier (no more "VM agents may claim their identity unaided")
+export AMA_REGISTER_TOKEN=__TOKEN__
 /bin/ama-agentd --tcp __HOST_IP__:__PORT__ --task /etc/task.json
 # RESCUE: if the agentd dies, PID 1 must not exit (kernel panic) —
 # park forever so the kernel watchdog sees the VM alive/timeout cleanly

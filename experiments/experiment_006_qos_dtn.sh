@@ -14,6 +14,9 @@
 # agent resumes from its checkpoint and drains its backlog. Custody
 # transfer + store-and-forward + TTL, end to end.
 set -euo pipefail
+# F10: operator authority is a CREDENTIAL — the kernel and this
+# operator CLI must share it; agents are stripped of it at spawn
+export AMA_OPERATOR_TOKEN="ama-local-operator-token"
 cd "$(dirname "$0")/.."
 rm -rf /tmp/ama_exp /tmp/ama_dbg_agent_*
 mkdir -p /tmp/ama_exp
@@ -50,12 +53,12 @@ kill -9 "$DTN_PID" 2>/dev/null || true
 # agentd process for the same name registers and the kernel flushes the
 # held backlog to it
 sleep 5
-./target/debug/ama-agentd --socket /tmp/ama_exp.sock \
-  --task experiments/tasks_006/dtn.json &
-DTN_RESTART_PID=$!
+# F10: a dead identity comes back ONLY through the operator's explicit
+# restart — a hand-started agentd holds no registration token and the
+# kernel refuses its claim (that hole is what experiment 009 guards)
+./target/debug/ama restart --socket /tmp/ama_exp.sock --name dtn
 
 python3 experiments/wait_ledger_quiet.py 3 35
-kill $DTN_RESTART_PID 2>/dev/null || true
 kill $KERNEL_PID 2>/dev/null || true
 wait $KERNEL_PID 2>/dev/null || true
 

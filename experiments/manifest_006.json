@@ -12,19 +12,29 @@
       "task": "experiments/tasks_006/src.json",
       "qos": {
         "max_msgs_per_sec": 3
-      }
+      },
+      "caps": [
+        "send:dtn",
+        "send:burst"
+      ]
     },
     {
       "name": "burst",
       "task": "experiments/tasks_006/burst.json",
       "qos": {
         "max_msgs_per_sec": 50
-      }
+      },
+      "caps": [
+        "send:src"
+      ]
     },
     {
       "name": "dtn",
       "task": "experiments/tasks_006/dtn.json",
-      "dtn": true
+      "dtn": true,
+      "caps": [
+        "send:src"
+      ]
     }
   ]
 }

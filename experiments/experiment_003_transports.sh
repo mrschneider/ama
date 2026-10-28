@@ -4,6 +4,9 @@
 # agent b is REMOTE (TCP, msgpack frames). The round trip must survive the
 # crossing of transports AND wire formats — one contract, every path.
 set -euo pipefail
+# F10: operator authority is a CREDENTIAL — the kernel and this
+# operator CLI must share it; agents are stripped of it at spawn
+export AMA_OPERATOR_TOKEN="ama-local-operator-token"
 cd "$(dirname "$0")/.."
 LEDGER=/tmp/ama_exp/ledger.jsonl
 rm -rf /tmp/ama_exp && mkdir -p /tmp/ama_exp
