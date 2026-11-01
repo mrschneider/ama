@@ -764,8 +764,13 @@ impl Ledger {
             *guard = Some(self.open_handle()?);
         }
         let f = guard.as_mut().unwrap();
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
+        // ONE write per append: line + terminator in a single buffer. Two
+        // write_all calls used to cost two syscalls on the hottest path in
+        // the kernel (route_send fast path pays ~6 us/append, measured).
+        let mut buf = Vec::with_capacity(line.len() + 1);
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+        f.write_all(&buf)?;
         Ok(e)
     }
 
