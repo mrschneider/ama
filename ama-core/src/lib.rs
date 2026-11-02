@@ -577,6 +577,20 @@ pub struct Ledger {
     /// (perf_bench measured it). Reopened on demand when the file or its
     /// parent dir vanish mid-flight.
     writer: Mutex<Option<std::fs::File>>,
+    /// P1: last checkpoint state per UIN, maintained on write. Checkpoints
+    /// are rare (per agent turn), so the index costs nothing on the hot
+    /// append path — but it takes `last_checkpoint` (the respawn critical
+    /// path) from O(ledger size) backward scan to O(1) lookup. The scan
+    /// remains as the fallback for pre-index tails and corrupted files.
+    cp_index: Mutex<HashMap<u64, Value>>,
+    /// P2: last (dev, ino) seen for `path` on disk. The stale-inode check
+    /// used to stat BOTH the fd and the path on EVERY append; the path's
+    /// identity rarely changes, so it is re-checked only every 1024
+    /// appends (or after a detected mismatch). A file replaced in between
+    /// is caught by the fd-vs-cached-id mismatch (handle metadata is
+    /// still checked every append).
+    disk_id: Mutex<Option<(u64, u64)>>,
+    appends: AtomicU64,
 }
 
 impl Ledger {
@@ -711,6 +725,9 @@ impl Ledger {
             path: path.to_path_buf(),
             seq,
             writer: Mutex::new(None),
+            cp_index: Mutex::new(HashMap::new()),
+            disk_id: Mutex::new(None),
+            appends: AtomicU64::new(0),
         })
     }
 
@@ -749,16 +766,41 @@ impl Ledger {
         // re-detected that implicitly; with a persistent handle the
         // contract "the ledger survives its parent dir being removed
         // mid-flight" is enforced here by comparing identities (dev, ino).
-        // One stat per append is far cheaper than the open we removed.
-        let stale = match guard.as_ref() {
-            Some(f) => {
-                let handle = f.metadata().ok().map(|m| (m.dev(), m.ino()));
-                let on_disk = std::fs::metadata(&self.path)
-                    .ok()
-                    .map(|m| (m.dev(), m.ino()));
-                handle != on_disk
+        // P2: the fd's own identity is checked EVERY append (cheap fstat);
+        // the PATH's identity used to cost a second stat per append — it
+        // is now cached and re-checked every 1024 appends. Trade-off,
+        // stated honestly: a path replaced between re-checks is detected
+        // only at the next re-check (≤1024 appends of writes into the
+        // void), not on the very next append as before. In exchange the
+        // steady-state cost is ONE stat per append instead of two.
+        let stale = {
+            let n = self.appends.fetch_add(1, Ordering::Relaxed);
+            let recheck_path = n & 0x3ff == 0;
+            let mut disk = self.disk_id.lock().unwrap();
+            match guard.as_ref() {
+                Some(f) => {
+                    let handle = f.metadata().ok().map(|m| (m.dev(), m.ino()));
+                    if recheck_path {
+                        *disk = std::fs::metadata(&self.path)
+                            .ok()
+                            .map(|m| (m.dev(), m.ino()));
+                    }
+                    let on_disk = if recheck_path {
+                        *disk
+                    } else {
+                        // cheap: compare against the cached path identity
+                        // (None = path vanished at the last check)
+                        match *disk {
+                            Some(id) => Some(id),
+                            None => std::fs::metadata(&self.path)
+                                .ok()
+                                .map(|m| (m.dev(), m.ino())),
+                        }
+                    };
+                    handle != on_disk
+                }
+                None => true,
             }
-            None => true,
         };
         if stale {
             *guard = Some(self.open_handle()?);
@@ -771,6 +813,19 @@ impl Ledger {
         buf.extend_from_slice(line.as_bytes());
         buf.push(b'\n');
         f.write_all(&buf)?;
+        // P1: checkpoints are rare — maintaining the in-memory index here
+        // costs nothing on the hot path and makes respawn O(1).
+        if e.ev == "checkpoint" {
+            if let (Some(uin), Some(state)) = (
+                e.detail.get("uin").and_then(Value::as_u64),
+                e.detail.get("state"),
+            ) {
+                self.cp_index
+                    .lock()
+                    .unwrap()
+                    .insert(uin, state.clone());
+            }
+        }
         Ok(e)
     }
 
@@ -807,11 +862,29 @@ impl Ledger {
 
     /// Last checkpoint recorded for a UIN — the respawn source of truth.
     ///
-    /// Scans the file BACKWARDS in chunks and returns on the first match:
-    /// the old implementation parsed the WHOLE ledger per call, and this
-    /// sits on the respawn critical path — perf_bench measured 0.7 us/event
-    /// (a 1M-event ledger would pay ~0.7 s per respawn).
+    /// P1: answered from the in-memory index maintained by `append` —
+    /// O(1) instead of the backward scan. The scan below is the FALLBACK
+    /// for states the index cannot know: ledgers written before this
+    /// index existed (kernel restart repopulates the index on the first
+    /// checkpoint append, but a respawn BEFORE that must still find the
+    /// pre-restart checkpoint) and corrupted tails. On a fallback hit the
+    /// index is re-seeded, so the scan is paid at most once per UIN.
     pub fn last_checkpoint(&self, uin: u64) -> Option<Value> {
+        if let Some(state) = self.cp_index.lock().unwrap().get(&uin) {
+            return Some(state.clone());
+        }
+        let found = self.scan_last_checkpoint(uin);
+        if let Some(state) = &found {
+            self.cp_index
+                .lock()
+                .unwrap()
+                .insert(uin, state.clone());
+        }
+        found
+    }
+
+    /// The original backward chunk scan — kept as the fallback path.
+    fn scan_last_checkpoint(&self, uin: u64) -> Option<Value> {
         use std::io::{Seek, SeekFrom};
         let mut f = std::fs::File::open(&self.path).ok()?;
         let len = f.metadata().ok()?.len();
@@ -1359,20 +1432,24 @@ impl Kernel {
     /// Capability check: the ONLY path a message takes. Denials are
     /// journaled — a refused send is a security event, not a silent drop.
     pub fn check_cap(&self, uin: u64, verb: &str, target: &str) -> Result<(), String> {
-        let need = format!("{verb}:{target}");
         let agents = self.agents.lock().unwrap();
         let entry = agents.get(&uin).ok_or("unknown uin")?;
         // a VERB-level grant (`relay`) covers every target of that verb; a
-        // TARGET-level grant (`send:b`) stays target-scoped
-        if entry
-            .lock()
-            .unwrap()
-            .caps
-            .iter()
-            .any(|c| c == &need || c == verb)
-        {
+        // TARGET-level grant (`send:b`) stays target-scoped. P3: the
+        // grant test is allocation-free — `format!("{verb}:{target}")` used
+        // to heap-allocate on EVERY send; the string is now built only on
+        // the (rare) deny path, for the audit record.
+        let granted = entry.lock().unwrap().caps.iter().any(|c| {
+            c == verb
+                || (c.len() == verb.len() + target.len() + 1
+                    && c.starts_with(verb)
+                    && c.as_bytes()[verb.len()] == b':'
+                    && &c[verb.len() + 1..] == target)
+        });
+        if granted {
             Ok(())
         } else {
+            let need = format!("{verb}:{target}");
             drop(agents);
             self.ledger
                 .append("cap_denied", json!({"uin": uin, "needed": need}))
@@ -1409,12 +1486,21 @@ impl Kernel {
         let body_encoded = serde_json::to_vec(body).unwrap_or_default();
         let bytes = body_encoded.len();
 
-        // ADMISSION + QoS in ONE locked pass: admit (byte rate + queue
-        // bound), then the sender's token bucket. A refused message never
-        // enters the kernel (journaled, never silent). The old code took
-        // this mutex up to four separate times per send; three of those
-        // acquisitions (and the refused-path's second and fourth) were
-        // pure churn.
+        let (_wire, dest_priority, dest_dtn, deliverable): (Wire, u8, bool, bool) = {
+            let agents = self.agents.lock().unwrap();
+            let entry = agents.get(&uin).ok_or("no process table entry")?;
+            let e = entry.lock().unwrap();
+            let deliverable =
+                matches!(e.state, ProcState::Running | ProcState::Registered) && e.out.is_some();
+            (e.wire, e.priority, e.dtn, deliverable)
+        };
+
+        // P5: ADMISSION + QoS + SCHEDULING in ONE locked pass. The
+        // delivery mutex used to be taken three times on the fast path
+        // (admit, schedule, record); admit and the link/schedule decision
+        // need no intervening state — they now share a single guard. The
+        // post-send `record_fast_path` stays a separate acquisition by
+        // design: it must happen AFTER the bytes are on the wire.
         // NOTE: the guard must be scoped — a MutexGuard held by an
         // `if let` scrutinee lives to the end of the whole `if let`
         // statement, and re-locking inside the block self-deadlocks
@@ -1424,9 +1510,17 @@ impl Kernel {
             Throttled,
             Ok,
         }
-        let gate = {
+        enum GateOut {
+            Denied(String),
+            Throttled,
+            /// deliverable + link idle: fast path, no scheduling side effect
+            Fast,
+            /// message queued in the WFQ (journaled by the caller)
+            Scheduled,
+        }
+        let gate_out = {
             let mut d = self.delivery.lock().unwrap();
-            if let Err(reason) = d.admit_bytes(from, bytes) {
+            let gate = if let Err(reason) = d.admit_bytes(from, bytes) {
                 d.record_denied();
                 Gate::Denied(reason)
             } else if !d.allow(from) {
@@ -1434,10 +1528,27 @@ impl Kernel {
                 Gate::Throttled
             } else {
                 Gate::Ok
+            };
+            match gate {
+                Gate::Denied(reason) => GateOut::Denied(reason),
+                Gate::Throttled => GateOut::Throttled,
+                Gate::Ok => {
+                    if !deliverable {
+                        // DTN / undeliverable: no link decision here
+                        GateOut::Fast
+                    } else if !d.link_busy() && d.link_ready(bytes) {
+                        GateOut::Fast
+                    } else {
+                        match d.schedule(from, uin, body.clone(), bytes) {
+                            Ok(()) => GateOut::Scheduled,
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                }
             }
         };
-        match gate {
-            Gate::Denied(reason) => {
+        match gate_out {
+            GateOut::Denied(reason) => {
                 self.ledger
                     .append(
                         "admission_denied",
@@ -1446,7 +1557,7 @@ impl Kernel {
                     .map_err(|e| e.to_string())?;
                 return Err(format!("admission: {reason}"));
             }
-            Gate::Throttled => {
+            GateOut::Throttled => {
                 self.ledger
                     .append(
                         "qos_throttled",
@@ -1455,17 +1566,17 @@ impl Kernel {
                     .map_err(|e| e.to_string())?;
                 return Err(format!("qos: sender {from} over its rate limit"));
             }
-            Gate::Ok => {}
+            GateOut::Scheduled => {
+                self.ledger
+                    .append(
+                        "qos_scheduled",
+                        json!({"from": from, "to": uin, "bytes": bytes}),
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+            GateOut::Fast => {}
         }
-
-        let (_wire, dest_priority, dest_dtn, deliverable): (Wire, u8, bool, bool) = {
-            let agents = self.agents.lock().unwrap();
-            let entry = agents.get(&uin).ok_or("no process table entry")?;
-            let e = entry.lock().unwrap();
-            let deliverable =
-                matches!(e.state, ProcState::Running | ProcState::Registered) && e.out.is_some();
-            (e.wire, e.priority, e.dtn, deliverable)
-        };
 
         if !deliverable {
             // DTN custody: hold the message for the target's next
@@ -1484,33 +1595,6 @@ impl Kernel {
                 ProcState::Completed => format!("agent '{to}' has completed its task"),
                 _ => format!("agent '{to}' has no connection"),
             });
-        }
-
-        // SCHEDULING in ONE locked pass: while the link is idle a connected
-        // destination is served straight through (work-conserving, zero
-        // added latency). Under contention the message joins the WFQ queue
-        // and the watchdog's tick serves it by virtual finish tag — weight,
-        // not arrival order, decides who gets the link. The old code took
-        // the delivery mutex twice here (check, then schedule).
-        let scheduled = {
-            let mut d = self.delivery.lock().unwrap();
-            if !d.link_busy() && d.link_ready(bytes) {
-                None
-            } else {
-                match d.schedule(from, uin, body.clone(), bytes) {
-                    Ok(()) => Some(()),
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-        };
-        if scheduled.is_some() {
-            self.ledger
-                .append(
-                    "qos_scheduled",
-                    json!({"from": from, "to": uin, "bytes": bytes}),
-                )
-                .map_err(|e| e.to_string())?;
-            return Ok(());
         }
 
         // F03: resolve the destination OUT of the tables, then enqueue
