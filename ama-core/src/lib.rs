@@ -820,10 +820,7 @@ impl Ledger {
                 e.detail.get("uin").and_then(Value::as_u64),
                 e.detail.get("state"),
             ) {
-                self.cp_index
-                    .lock()
-                    .unwrap()
-                    .insert(uin, state.clone());
+                self.cp_index.lock().unwrap().insert(uin, state.clone());
             }
         }
         Ok(e)
@@ -875,10 +872,7 @@ impl Ledger {
         }
         let found = self.scan_last_checkpoint(uin);
         if let Some(state) = &found {
-            self.cp_index
-                .lock()
-                .unwrap()
-                .insert(uin, state.clone());
+            self.cp_index.lock().unwrap().insert(uin, state.clone());
         }
         found
     }
