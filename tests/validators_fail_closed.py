@@ -34,6 +34,7 @@ def main() -> int:
             print(s.name, "->", "validator" if validator_heredoc(s) else "no validator")
         return 0
     failures = []
+    checked = 0
     with tempfile.TemporaryDirectory() as tmp:
         empty = Path(tmp) / "ledger.jsonl"
         empty.write_text("")
@@ -42,6 +43,7 @@ def main() -> int:
             if body is None:
                 print(f"SKIP (no validator): {script.name}")
                 continue
+            checked += 1
             body = body.replace("/tmp/ama_exp/", str(Path(tmp)) + "/")
             r = subprocess.run([sys.executable, "-c", body], capture_output=True, text=True)
             verdict = "PASS" if r.returncode != 0 else "FAIL-OPEN"
@@ -51,7 +53,7 @@ def main() -> int:
     if failures:
         print("\nFAIL-OPEN validators (print FAIL, exit 0):", failures)
         return 1
-    print(f"\nAll {len(SCRIPTS)} validators fail closed on empty evidence.")
+    print(f"\nAll {checked} validators fail closed on empty evidence.")
     return 0
 
 

@@ -17,8 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod custody;
 pub mod proto;
 pub mod qos;
+pub mod resources;
 pub mod sandbox;
 pub mod seccomp;
 
@@ -169,8 +171,14 @@ pub const OUTBOUND_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 /// the connection is judged (the deadline lives on the writer's socket).
 pub const OUTBOUND_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
 
+struct BudgetedFrame {
+    bytes: Vec<u8>,
+    _global: resources::ByteReservation,
+    _agent: resources::ByteReservation,
+}
+
 struct OutboundState {
-    frames: std::collections::VecDeque<Vec<u8>>,
+    frames: std::collections::VecDeque<BudgetedFrame>,
     bytes: usize,
 }
 
@@ -194,6 +202,7 @@ pub struct Outbound {
     idle: std::sync::Condvar,
     closed: std::sync::atomic::AtomicBool,
     ledger: Arc<Ledger>,
+    budget: Mutex<Arc<resources::ByteBudget>>,
 }
 
 impl Outbound {
@@ -224,8 +233,32 @@ impl Outbound {
         if self.is_closed() {
             return Err("connection closed".to_string());
         }
+        let global = self
+            .ledger
+            .outbound_budget
+            .reserve(frame.len())
+            .ok_or_else(|| {
+                self.ledger
+                    .append("outbound_budget_full", json!({"scope": "global"}))
+                    .ok();
+                "global outbound byte budget exhausted".to_string()
+            })?;
+        let budget = self.budget.lock().unwrap().clone();
+        let agent = budget.reserve(frame.len()).ok_or_else(|| {
+            self.ledger
+                .append(
+                    "outbound_queue_full",
+                    json!({"scope": "agent", "cap": self.cap}),
+                )
+                .ok();
+            self.close();
+            "agent outbound byte budget exhausted — connection closed".to_string()
+        })?;
         {
             let mut st = self.state.lock().unwrap();
+            if self.is_closed() {
+                return Err("connection closed".into());
+            }
             if st.bytes + frame.len() > self.cap {
                 drop(st);
                 self.ledger
@@ -240,7 +273,11 @@ impl Outbound {
                 );
             }
             st.bytes += frame.len();
-            st.frames.push_back(frame);
+            st.frames.push_back(BudgetedFrame {
+                bytes: frame,
+                _global: global,
+                _agent: agent,
+            });
         }
         self.idle.notify_one();
         Ok(())
@@ -252,11 +289,11 @@ impl Outbound {
         self.push(frame)
     }
 
-    fn pop(&self) -> Option<Vec<u8>> {
+    fn pop(&self) -> Option<BudgetedFrame> {
         let mut st = self.state.lock().unwrap();
         loop {
             if let Some(f) = st.frames.pop_front() {
-                st.bytes -= f.len();
+                st.bytes -= f.bytes.len();
                 return Some(f);
             }
             if self.is_closed() {
@@ -272,23 +309,36 @@ impl Outbound {
 /// connection (kernel, integration test, benchmark) obtains its
 /// `Outbound`.
 pub fn spawn_writer(ledger: Arc<Ledger>, writer: Peer, wire: Wire) -> Arc<Outbound> {
+    spawn_writer_reserved(ledger, writer, wire, None)
+}
+
+fn spawn_writer_reserved(
+    ledger: Arc<Ledger>,
+    writer: Peer,
+    wire: Wire,
+    lease: Option<Arc<resources::ConnectionReservation>>,
+) -> Arc<Outbound> {
     let out = Arc::new(Outbound {
         wire,
-        cap: OUTBOUND_QUEUE_BYTES,
+        cap: ledger.outbound_agent_limit.load(Ordering::Relaxed) as usize,
         state: Mutex::new(OutboundState {
             frames: std::collections::VecDeque::new(),
             bytes: 0,
         }),
         idle: std::sync::Condvar::new(),
         closed: std::sync::atomic::AtomicBool::new(false),
+        budget: Mutex::new(Arc::new(resources::ByteBudget::new(
+            ledger.outbound_agent_limit.load(Ordering::Relaxed) as usize,
+        ))),
         ledger,
     });
     let o = Arc::clone(&out);
     std::thread::spawn(move || {
+        let _lease = lease;
         let mut w = writer;
         let _ = w.set_write_timeout(Some(OUTBOUND_WRITE_DEADLINE));
         while let Some(frame) = o.pop() {
-            if w.write_all(&frame).is_err() || w.flush().is_err() {
+            if w.write_all(&frame.bytes).is_err() || w.flush().is_err() {
                 o.ledger
                     .append(
                         "outbound_write_failed",
@@ -325,6 +375,12 @@ pub fn read_proto_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
     let mut lenb = [0u8; 4];
     r.read_exact(&mut lenb)?;
     let len = u32::from_le_bytes(lenb) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "binary frame exceeds size limit",
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     // raw decode — NO Envelope schema check here: this frame may be a
@@ -348,6 +404,12 @@ pub fn read_msgpack_frame<R: std::io::Read>(r: &mut R) -> io::Result<Value> {
     let mut lenb = [0u8; 4];
     r.read_exact(&mut lenb)?;
     let len = u32::from_le_bytes(lenb) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "binary frame exceeds size limit",
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     rmp_serde::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -577,23 +639,31 @@ pub struct Ledger {
     /// (perf_bench measured it). Reopened on demand when the file or its
     /// parent dir vanish mid-flight.
     writer: Mutex<Option<std::fs::File>>,
-    /// P1: last checkpoint state per UIN, maintained on write. Checkpoints
-    /// are rare (per agent turn), so the index costs nothing on the hot
-    /// append path — but it takes `last_checkpoint` (the respawn critical
-    /// path) from O(ledger size) backward scan to O(1) lookup. The scan
-    /// remains as the fallback for pre-index tails and corrupted files.
+    /// Complete recovery index, populated from the active snapshot + WAL tail.
     cp_index: Mutex<HashMap<u64, Value>>,
-    /// P2: last (dev, ino) seen for `path` on disk. The stale-inode check
-    /// used to stat BOTH the fd and the path on EVERY append; the path's
-    /// identity rarely changes, so it is re-checked only every 1024
-    /// appends (or after a detected mismatch). A file replaced in between
-    /// is caught by the fd-vs-cached-id mismatch (handle metadata is
-    /// still checked every append).
-    disk_id: Mutex<Option<(u64, u64)>>,
-    appends: AtomicU64,
+    /// Poisoned on I/O failure; recovery must repair any partial append.
+    failed: std::sync::atomic::AtomicBool,
+    segment_bytes: AtomicU64,
+    snapshot_bytes: AtomicU64,
+    pub outbound_budget: Arc<resources::ByteBudget>,
+    outbound_agent_limit: AtomicU64,
+    agent_outbound_budgets: Mutex<HashMap<u64, std::sync::Weak<resources::ByteBudget>>>,
 }
 
 impl Ledger {
+    fn agent_budget(&self, uin: u64) -> Arc<resources::ByteBudget> {
+        let mut budgets = self.agent_outbound_budgets.lock().unwrap();
+        budgets.retain(|_, budget| budget.strong_count() > 0);
+        if let Some(budget) = budgets.get(&uin).and_then(std::sync::Weak::upgrade) {
+            return budget;
+        }
+        let budget = Arc::new(resources::ByteBudget::new(
+            self.outbound_agent_limit.load(Ordering::Relaxed) as usize,
+        ));
+        budgets.insert(uin, Arc::downgrade(&budget));
+        budget
+    }
+
     /// F10(item 4): repair a crash-torn tail at EXACT byte boundaries.
     ///
     /// Records are newline-terminated by `append` (one write for the
@@ -698,43 +768,75 @@ impl Ledger {
     }
 
     pub fn open(path: &std::path::Path) -> std::io::Result<Ledger> {
-        // F06/F10(item 4): repair a torn tail BEFORE anything reads or
-        // appends — a crash mid-write leaves a partial last line that
-        // (a) poisons the line count and (b) would corrupt every
-        // subsequent append-on-top. Every failure here propagates: the
-        // old code ignored set_len's error and printed "repaired" no
-        // matter what, i.e. a failed repair reported success.
+        let temporary = Self::suffixed(path, ".rotate.tmp");
+        if !path.try_exists()? && temporary.try_exists()? {
+            let snapshot: LedgerEvent =
+                serde_json::from_reader(std::fs::File::open(&temporary)?)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if snapshot.ev != "ledger_snapshot" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid rotation recovery snapshot",
+                ));
+            }
+            std::fs::rename(&temporary, path)?;
+            Self::sync_parent(path)?;
+        }
         Self::repair_tail(path)?;
-
-        let seq = {
-            let f = std::fs::File::open(path).ok();
-            let mut n = 0u64;
-            if let Some(f) = f {
-                // count lines WITHOUT parsing JSON: Ledger::open is O(file)
-                // at startup either way, but parsing every event to count it
-                // made startup several times slower on large ledgers.
-                for line in BufReader::new(f).lines().map_while(Result::ok) {
-                    if !line.trim().is_empty() {
-                        n += 1;
+        let mut checkpoints = HashMap::new();
+        let mut sequence = 0;
+        let mut snapshot_bytes = 0;
+        match std::fs::File::open(path) {
+            Ok(file) => {
+                for line in BufReader::new(file).lines() {
+                    let line = line?;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let event: LedgerEvent = serde_json::from_str(&line)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    if event.ev == "ledger_snapshot" {
+                        if sequence != 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "snapshot must start a segment",
+                            ));
+                        }
+                        checkpoints = serde_json::from_value(event.detail["checkpoints"].clone())
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        snapshot_bytes = line.len() as u64 + 1;
+                    }
+                    sequence = sequence.max(event.seq);
+                    if event.ev == "checkpoint" {
+                        if let (Some(uin), Some(state)) =
+                            (event.detail["uin"].as_u64(), event.detail.get("state"))
+                        {
+                            checkpoints.insert(uin, state.clone());
+                        }
                     }
                 }
             }
-            AtomicU64::new(n)
-        };
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let seq = AtomicU64::new(sequence);
         Ok(Ledger {
             path: path.to_path_buf(),
             seq,
             writer: Mutex::new(None),
-            cp_index: Mutex::new(HashMap::new()),
-            disk_id: Mutex::new(None),
-            appends: AtomicU64::new(0),
+            cp_index: Mutex::new(checkpoints),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            segment_bytes: AtomicU64::new(64 << 20),
+            snapshot_bytes: AtomicU64::new(snapshot_bytes),
+            outbound_budget: Arc::new(resources::ByteBudget::new(64 << 20)),
+            outbound_agent_limit: AtomicU64::new(OUTBOUND_QUEUE_BYTES as u64),
+            agent_outbound_budgets: Mutex::new(HashMap::new()),
         })
     }
 
-    fn open_handle(&self) -> std::io::Result<std::fs::File> {
-        // the ledger must survive its parent dir being removed mid-flight
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    fn open_handle(&self) -> io::Result<std::fs::File> {
+        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
         }
         std::fs::OpenOptions::new()
             .create(true)
@@ -742,197 +844,181 @@ impl Ledger {
             .open(&self.path)
     }
 
-    pub fn append(&self, ev: &str, detail: Value) -> std::io::Result<LedgerEvent> {
-        // F06: sequence ids are allocated UNDER the writer lock — the
-        // old path allocated from the atomic BEFORE locking, so two
-        // concurrent appends could write seq 8 AFTER seq 9 (file order
-        // diverging from sequence order breaks every replay)
-        let mut guard = self.writer.lock().unwrap();
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let ts_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let e = LedgerEvent {
-            seq,
-            ts_ms,
-            ev: ev.into(),
-            detail,
-        };
-        let line = serde_json::to_string(&e).unwrap();
-        // The cached handle can silently point at an UNLINKED inode: after
-        // the file (or its parent dir) is removed, write() into the still-
-        // open fd SUCCEEDS — into the void. The old open-per-append code
-        // re-detected that implicitly; with a persistent handle the
-        // contract "the ledger survives its parent dir being removed
-        // mid-flight" is enforced here by comparing identities (dev, ino).
-        // P2: the fd's own identity is checked EVERY append (cheap fstat);
-        // the PATH's identity used to cost a second stat per append — it
-        // is now cached and re-checked every 1024 appends. Trade-off,
-        // stated honestly: a path replaced between re-checks is detected
-        // only at the next re-check (≤1024 appends of writes into the
-        // void), not on the very next append as before. In exchange the
-        // steady-state cost is ONE stat per append instead of two.
-        let stale = {
-            let n = self.appends.fetch_add(1, Ordering::Relaxed);
-            let recheck_path = n & 0x3ff == 0;
-            let mut disk = self.disk_id.lock().unwrap();
-            match guard.as_ref() {
-                Some(f) => {
-                    let handle = f.metadata().ok().map(|m| (m.dev(), m.ino()));
-                    if recheck_path {
-                        *disk = std::fs::metadata(&self.path)
-                            .ok()
-                            .map(|m| (m.dev(), m.ino()));
-                    }
-                    let on_disk = if recheck_path {
-                        *disk
-                    } else {
-                        // cheap: compare against the cached path identity
-                        // (None = path vanished at the last check)
-                        match *disk {
-                            Some(id) => Some(id),
-                            None => std::fs::metadata(&self.path)
-                                .ok()
-                                .map(|m| (m.dev(), m.ino())),
-                        }
-                    };
-                    handle != on_disk
-                }
-                None => true,
-            }
-        };
-        if stale {
-            *guard = Some(self.open_handle()?);
-        }
-        let f = guard.as_mut().unwrap();
-        // ONE write per append: line + terminator in a single buffer. Two
-        // write_all calls used to cost two syscalls on the hottest path in
-        // the kernel (route_send fast path pays ~6 us/append, measured).
-        let mut buf = Vec::with_capacity(line.len() + 1);
-        buf.extend_from_slice(line.as_bytes());
-        buf.push(b'\n');
-        f.write_all(&buf)?;
-        // P1: checkpoints are rare — maintaining the in-memory index here
-        // costs nothing on the hot path and makes respawn O(1).
-        if e.ev == "checkpoint" {
-            if let (Some(uin), Some(state)) = (
-                e.detail.get("uin").and_then(Value::as_u64),
-                e.detail.get("state"),
-            ) {
-                self.cp_index.lock().unwrap().insert(uin, state.clone());
-            }
-        }
-        Ok(e)
+    fn suffixed(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        name.into()
+    }
+    fn sync_parent(path: &std::path::Path) -> io::Result<()> {
+        std::fs::File::open(
+            path.parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new(".")),
+        )?
+        .sync_all()
+    }
+    pub fn set_segment_bytes(&self, bytes: u64) {
+        self.segment_bytes.store(bytes, Ordering::Relaxed);
+    }
+    pub fn is_healthy(&self) -> bool {
+        !self.failed.load(Ordering::Acquire)
     }
 
-    /// F06: DURABLE append — `sync_data` before returning, so a
-    /// checkpoint acknowledgment that references this event survives a
-    /// HOST failure, not just an agent process failure. The plain
-    /// `append` stays buffered (the hot path pays ~1 syscall, not two).
-    /// Guarantees now spelled out: agent failure -> ledger survives
-    /// (buffered is enough, the kernel process holds the fd); kernel
-    /// restart -> file contents survive (page cache); HOST crash ->
-    /// only `append_durable`-sealed events are promised.
-    pub fn append_durable(&self, ev: &str, detail: Value) -> std::io::Result<LedgerEvent> {
-        let e = self.append(ev, detail)?;
-        let mut guard = self.writer.lock().unwrap();
-        if let Some(f) = guard.as_mut() {
-            f.sync_data()
-                .map_err(|err| std::io::Error::other(format!("ledger sync_data failed: {err}")))?;
+    pub fn append(&self, ev: &str, detail: Value) -> io::Result<LedgerEvent> {
+        self.append_mode(ev, detail, false)
+    }
+    /// Acknowledgement boundary: append + fsync under ONE generation/writer lock.
+    pub fn append_durable(&self, ev: &str, detail: Value) -> io::Result<LedgerEvent> {
+        self.append_mode(ev, detail, true)
+    }
+    fn append_mode(&self, ev: &str, detail: Value, durable: bool) -> io::Result<LedgerEvent> {
+        let mut writer = self.writer.lock().unwrap();
+        if !self.is_healthy() {
+            return Err(io::Error::other("ledger writer failed; recovery required"));
         }
-        Ok(e)
+        let result = (|| {
+            let disk = std::fs::metadata(&self.path)
+                .ok()
+                .map(|m| (m.dev(), m.ino()));
+            let handle = writer
+                .as_ref()
+                .and_then(|f| f.metadata().ok())
+                .map(|m| (m.dev(), m.ino()));
+            if writer.is_none() || disk != handle {
+                *writer = Some(self.open_handle()?);
+            }
+            let limit = self.segment_bytes.load(Ordering::Relaxed);
+            if limit > 0
+                && writer
+                    .as_ref()
+                    .unwrap()
+                    .metadata()?
+                    .len()
+                    .saturating_sub(self.snapshot_bytes.load(Ordering::Relaxed))
+                    >= limit
+            {
+                self.rotate_locked(&mut writer)?;
+            }
+            let event = LedgerEvent {
+                seq: self.seq.load(Ordering::Relaxed) + 1,
+                ts_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                ev: ev.into(),
+                detail,
+            };
+            let mut bytes = serde_json::to_vec(&event).map_err(io::Error::other)?;
+            bytes.push(b'\n');
+            let file = writer.as_mut().unwrap();
+            file.write_all(&bytes)?;
+            if durable {
+                file.sync_data()?;
+                Self::sync_parent(&self.path)?;
+            }
+            self.seq.store(event.seq, Ordering::Release);
+            if event.ev == "checkpoint" {
+                if let (Some(uin), Some(state)) =
+                    (event.detail["uin"].as_u64(), event.detail.get("state"))
+                {
+                    self.cp_index.lock().unwrap().insert(uin, state.clone());
+                }
+            }
+            Ok(event)
+        })();
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    /// Coordinate a durable checkpoint snapshot and an archived WAL segment.
+    /// Archives are retained; deletion/retention is an operator policy.
+    pub fn rotate(&self) -> io::Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        if !self.is_healthy() {
+            return Err(io::Error::other("ledger writer failed"));
+        }
+        let result = self.rotate_locked(&mut writer);
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+        result
+    }
+    fn rotate_locked(&self, writer: &mut Option<std::fs::File>) -> io::Result<()> {
+        let sequence = self.seq.load(Ordering::Acquire);
+        if sequence == 0 || !self.path.try_exists()? {
+            return Ok(());
+        }
+        let archive = Self::suffixed(&self.path, &format!(".segment-{sequence:020}.jsonl"));
+        if archive.try_exists()? {
+            return Ok(());
+        }
+        if writer.is_none() {
+            *writer = Some(self.open_handle()?);
+        }
+        writer.as_ref().unwrap().sync_data()?;
+        let snapshot = LedgerEvent {
+            seq: sequence,
+            ts_ms: 0,
+            ev: "ledger_snapshot".into(),
+            detail: json!({"checkpoints": *self.cp_index.lock().unwrap()}),
+        };
+        let mut bytes = serde_json::to_vec(&snapshot).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        let temporary = Self::suffixed(&self.path, ".rotate.tmp");
+        {
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        // A crash after archiving but before activation is completed by open().
+        std::fs::rename(&self.path, &archive)?;
+        Self::sync_parent(&self.path)?;
+        std::fs::rename(temporary, &self.path)?;
+        Self::sync_parent(&self.path)?;
+        *writer = Some(self.open_handle()?);
+        self.snapshot_bytes
+            .store(bytes.len() as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn read_all(&self) -> Vec<LedgerEvent> {
-        std::fs::File::open(&self.path)
-            .ok()
-            .map(|f| {
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let prefix = format!(
+            "{}.segment-",
+            self.path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let mut files: Vec<_> = std::fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|e| e.path())
+            .collect();
+        files.sort();
+        files.push(self.path.clone());
+        files
+            .into_iter()
+            .filter_map(|p| std::fs::File::open(p).ok())
+            .flat_map(|f| {
                 BufReader::new(f)
                     .lines()
                     .map_while(Result::ok)
                     .filter_map(|l| serde_json::from_str::<LedgerEvent>(&l).ok())
-                    .collect()
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
+            .filter(|e| e.ev != "ledger_snapshot")
+            .collect()
     }
 
-    /// Last checkpoint recorded for a UIN — the respawn source of truth.
-    ///
-    /// P1: answered from the in-memory index maintained by `append` —
-    /// O(1) instead of the backward scan. The scan below is the FALLBACK
-    /// for states the index cannot know: ledgers written before this
-    /// index existed (kernel restart repopulates the index on the first
-    /// checkpoint append, but a respawn BEFORE that must still find the
-    /// pre-restart checkpoint) and corrupted tails. On a fallback hit the
-    /// index is re-seeded, so the scan is paid at most once per UIN.
+    /// Complete recovery index: hits AND misses are O(1), including after restart.
     pub fn last_checkpoint(&self, uin: u64) -> Option<Value> {
-        if let Some(state) = self.cp_index.lock().unwrap().get(&uin) {
-            return Some(state.clone());
-        }
-        let found = self.scan_last_checkpoint(uin);
-        if let Some(state) = &found {
-            self.cp_index.lock().unwrap().insert(uin, state.clone());
-        }
-        found
-    }
-
-    /// The original backward chunk scan — kept as the fallback path.
-    fn scan_last_checkpoint(&self, uin: u64) -> Option<Value> {
-        use std::io::{Seek, SeekFrom};
-        let mut f = std::fs::File::open(&self.path).ok()?;
-        let len = f.metadata().ok()?.len();
-        const CHUNK: usize = 8192;
-        let mut carry: Vec<u8> = Vec::new(); // tail fragment of a line whose start is in the previous chunk
-        let mut pos = len;
-        while pos > 0 {
-            let take = (CHUNK as u64).min(pos) as usize;
-            pos -= take as u64;
-            f.seek(SeekFrom::Start(pos)).ok()?;
-            let mut chunk = vec![0u8; take];
-            f.read_exact(&mut chunk).ok()?;
-            let segs: Vec<&[u8]> = chunk.split(|&b| b == b'\n').collect();
-            // the chunk's last segment (+ carry from the chunk closer to the
-            // EOF) is the line closest to the end — check it first. A line
-            // longer than CHUNK accumulates in carry across iterations and
-            // assembles correctly here.
-            let mut line = segs[segs.len() - 1].to_vec();
-            line.extend_from_slice(&carry);
-            if let Some(state) = Self::checkpoint_in_line(&line, uin) {
-                return Some(state);
-            }
-            // then the chunk's complete lines, nearest-EOF first. F06:
-            // a chunk with NO newline yields exactly one segment — the
-            // old `segs[1..segs.len()-1]` was an invalid slice range that
-            // panicked instead of just accumulating into carry.
-            if segs.len() > 2 {
-                for s in segs[1..segs.len() - 1].iter().rev() {
-                    if let Some(state) = Self::checkpoint_in_line(s, uin) {
-                        return Some(state);
-                    }
-                }
-            }
-            carry = segs[0].to_vec();
-        }
-        // pos == 0: carry now holds the file's FIRST line (it starts at byte
-        // 0, so it needs no head from anywhere). If the first line spanned
-        // chunks it was already assembled and checked as the boundary line.
-        if let Some(state) = Self::checkpoint_in_line(&carry, uin) {
-            return Some(state);
-        }
-        None
-    }
-
-    fn checkpoint_in_line(line: &[u8], uin: u64) -> Option<Value> {
-        if !line.contains(&b'"') {
-            return None; // fast reject: no JSON at all (empty segment, newline)
-        }
-        let e: LedgerEvent = serde_json::from_slice(line).ok()?;
-        if e.ev == "checkpoint" && e.detail.get("uin").and_then(Value::as_u64) == Some(uin) {
-            Some(e.detail.get("state").cloned().unwrap_or(Value::Null))
-        } else {
-            None
-        }
+        self.cp_index.lock().unwrap().get(&uin).cloned()
     }
 }
 
@@ -1042,6 +1128,10 @@ pub struct Kernel {
     /// Independent of the OS identity: same-uid agents share the control
     /// socket's file mode but never hold this secret.
     pub operator_token: String,
+    pub resource_limits: resources::ResourceLimits,
+    connections: Arc<resources::Connections>,
+    control_connections: Arc<resources::Connections>,
+    delivery_wake: Arc<(Mutex<u64>, std::sync::Condvar)>,
 }
 
 impl Kernel {
@@ -1072,7 +1162,42 @@ impl Kernel {
             operator_token: operator_token_from_env(),
             max_hops: default_max_hops_u8(),
             max_bundle_bytes: None,
+            resource_limits: resources::ResourceLimits::default(),
+            connections: Arc::new(resources::Connections::new(
+                resources::ResourceLimits::default(),
+            )),
+            control_connections: Arc::new(resources::Connections::new(resources::ResourceLimits {
+                max_connections: 16,
+                max_connections_per_peer: 16,
+                ..resources::ResourceLimits::default()
+            })),
+            delivery_wake: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
         })
+    }
+
+    pub fn configure_resources(&mut self, limits: resources::ResourceLimits) -> Result<(), String> {
+        limits.validate()?;
+        self.ledger
+            .outbound_budget
+            .set_limit(limits.max_outbound_bytes)?;
+        self.ledger.set_segment_bytes(limits.ledger_segment_bytes);
+        self.ledger.outbound_agent_limit.store(
+            limits.max_outbound_bytes_per_agent as u64,
+            Ordering::Relaxed,
+        );
+        self.connections = Arc::new(resources::Connections::new(limits.clone()));
+        let mut control = limits.clone();
+        control.max_connections = limits.max_control_connections;
+        control.max_connections_per_peer = limits.max_control_connections;
+        self.control_connections = Arc::new(resources::Connections::new(control));
+        {
+            let mut delivery = self.delivery.lock().unwrap();
+            delivery.bundles.max_bytes = limits.max_custody_bytes;
+            delivery.bundles.max_sender_bytes = limits.max_custody_bytes_per_sender;
+            delivery.bundles.max_destination_bytes = limits.max_custody_bytes_per_destination;
+        }
+        self.resource_limits = limits;
+        Ok(())
     }
 
     /// Configure the delivery link from the manifest's kernel section:
@@ -1093,6 +1218,7 @@ impl Kernel {
             d.wfq = qos::WfqScheduler::new(c);
         }
         d.link_bytes_per_tick = link_bytes_per_tick;
+        d.refill_link();
     }
 
     /// Install the DTN routing table and the hop/fragment policy.
@@ -1464,6 +1590,9 @@ impl Kernel {
     /// forward with a TTL, delivered on the next registration. Without
     /// `dtn: true` the historical behaviour stands: the send fails.
     pub fn route_send(&self, from: u64, to: &str, body: &Value) -> Result<(), String> {
+        if !self.ledger.is_healthy() {
+            return Err("audit ledger unavailable; recovery required".into());
+        }
         let uin = self
             .by_name
             .lock()
@@ -1514,10 +1643,31 @@ impl Kernel {
         }
         let gate_out = {
             let mut d = self.delivery.lock().unwrap();
-            let gate = if let Err(reason) = d.admit_bytes(from, bytes) {
+            d.refill_elapsed();
+            let queued = deliverable && (d.link_busy() || !d.link_can_fit(bytes));
+            let preflight = if deliverable {
+                d.validate_link_message(bytes)
+            } else {
+                Ok(())
+            }
+            .and_then(|()| {
+                if queued {
+                    d.validate_queue_size(bytes)
+                } else {
+                    Ok(())
+                }
+            });
+            let admission = d.admit_bytes(from, bytes).and_then(|()| {
+                if preflight.is_err() {
+                    d.refund_admission(from, bytes);
+                }
+                preflight
+            });
+            let gate = if let Err(reason) = admission {
                 d.record_denied();
                 Gate::Denied(reason)
             } else if !d.allow(from) {
+                d.refund_admission(from, bytes);
                 d.record_throttled();
                 Gate::Throttled
             } else {
@@ -1530,12 +1680,14 @@ impl Kernel {
                     if !deliverable {
                         // DTN / undeliverable: no link decision here
                         GateOut::Fast
-                    } else if !d.link_busy() && d.link_ready(bytes) {
+                    } else if !queued {
+                        let ready = d.link_ready(bytes);
+                        debug_assert!(ready);
                         GateOut::Fast
                     } else {
-                        match d.schedule(from, uin, body.clone(), bytes) {
+                        match d.schedule_admitted(from, uin, body.clone(), bytes) {
                             Ok(()) => GateOut::Scheduled,
-                            Err(e) => return Err(e.to_string()),
+                            Err(e) => GateOut::Denied(e),
                         }
                     }
                 }
@@ -1567,6 +1719,7 @@ impl Kernel {
                         json!({"from": from, "to": uin, "bytes": bytes}),
                     )
                     .map_err(|e| e.to_string())?;
+                self.notify_delivery();
                 return Ok(());
             }
             GateOut::Fast => {}
@@ -1627,15 +1780,55 @@ impl Kernel {
         Ok(())
     }
 
-    /// Drain the WFQ delivery queue in virtual-finish-tag order. Called
-    /// from the watchdog tick (and once more at the end of `sweep`), so a
-    /// scheduled message waits at most one tick (200 ms) — the price of
-    /// fair scheduling on a kernel with no dedicated link thread.
+    fn notify_delivery(&self) {
+        let (generation, changed) = &*self.delivery_wake;
+        *generation.lock().unwrap() += 1;
+        changed.notify_one();
+    }
+
+    fn start_delivery_scheduler(kernel: &Arc<Self>) {
+        let weak = Arc::downgrade(kernel);
+        let wake = kernel.delivery_wake.clone();
+        std::thread::spawn(move || loop {
+            let observed = *wake.0.lock().unwrap();
+            let Some(kernel) = weak.upgrade() else {
+                break;
+            };
+            kernel.drain_delivery_queue();
+            let delay = if !kernel.ledger.is_healthy() {
+                Duration::from_secs(1)
+            } else {
+                let mut delivery = kernel.delivery.lock().unwrap();
+                delivery.refill_elapsed();
+                delivery
+                    .pending
+                    .peek()
+                    .map(|m| delivery.next_link_delay(m.0.bytes))
+                    .unwrap_or(Duration::from_secs(1))
+            };
+            drop(kernel);
+            let guard = wake.0.lock().unwrap();
+            if *guard == observed {
+                drop(
+                    wake.1
+                        .wait_timeout(guard, delay.max(Duration::from_micros(1)))
+                        .unwrap(),
+                );
+            }
+        });
+    }
+
+    /// Drain WFQ in virtual-finish-tag order from the dedicated scheduler.
+    /// No supervisor work or fixed watchdog sleep controls delivery latency.
     pub fn drain_delivery_queue(&self) {
+        if !self.ledger.is_healthy() {
+            return;
+        }
         let mut served = 0usize;
         loop {
             let next = {
                 let mut d = self.delivery.lock().unwrap();
+                d.refill_elapsed();
                 // peek before popping: a message the link cannot carry
                 // yet stays queued (WFQ order is preserved across ticks)
                 let head = d.pending.peek().map(|m| m.0.bytes);
@@ -1988,7 +2181,19 @@ impl Kernel {
 
         // ROUTING: bundles whose next hop is this agent — the relay is
         // back, hand it the custody it was waiting for
-        let via = self.delivery.lock().unwrap().drain_via(uin);
+        let (via, via_expired) = {
+            let mut delivery = self.delivery.lock().unwrap();
+            let via = delivery.drain_via(uin);
+            (via, delivery.take_expired_report())
+        };
+        for bundle in via_expired {
+            self.ledger
+                .append(
+                    "dtn_expired",
+                    json!({"from": bundle.from, "to": bundle.to, "body": bundle.body}),
+                )
+                .ok();
+        }
         for b in &via {
             self.forward_to_relay(b, uin)?;
             self.ledger
@@ -2346,11 +2551,6 @@ impl Kernel {
                 })
                 .collect()
         };
-        // QoS: refill the link's per-tick budget, then serve the WFQ
-        // queue while the budget lasts (the rest waits for the next tick)
-        self.delivery.lock().unwrap().refill_link();
-        self.drain_delivery_queue();
-
         // DTN sweep: bundles whose TTL ran out while the destination
         // never registered — journaled then dropped (never silent)
         {
@@ -2436,6 +2636,7 @@ impl Router {
             );
         }
         let kernel = Arc::new(kernel);
+        Kernel::start_delivery_scheduler(&kernel);
         let _ = std::fs::remove_file(&kernel.socket_path);
         let listener = std::os::unix::net::UnixListener::bind(&kernel.socket_path)?;
         let k = kernel.clone();
@@ -2481,7 +2682,7 @@ impl Router {
                         let k = k.clone();
                         let _ = stream.set_nodelay(true);
                         let _ = stream.set_read_timeout(None);
-                        std::thread::spawn(move || Router::connection(k, Peer::Tcp(stream)));
+                        Router::spawn_connection(k, Peer::Tcp(stream), false);
                     }
                 }
                 Err(e) => eprintln!("[ama] tcp listener {addr}: {e}"),
@@ -2502,13 +2703,7 @@ impl Router {
             std::thread::spawn(move || {
                 for conn in ctl_listener.incoming().flatten() {
                     let k = k.clone();
-                    std::thread::spawn(move || {
-                        if let Err(e) = Router::ctl_door(&k, &conn) {
-                            k.ledger.append("ctl_refused", json!({"reason": e})).ok();
-                            return;
-                        }
-                        Router::ctl_connection(k, Peer::Unix(conn));
-                    });
+                    Router::spawn_connection(k, Peer::Unix(conn), true);
                 }
             });
         }
@@ -2534,13 +2729,62 @@ impl Router {
                         let k = kernel.clone();
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(None);
-                        std::thread::spawn(move || Router::connection(k, Peer::Unix(stream)));
+                        Router::spawn_connection(k, Peer::Unix(stream), false);
                     }
                     Err(_) => continue,
                 }
             }
         });
         Ok(handle)
+    }
+
+    fn spawn_connection(kernel: Arc<Kernel>, peer: Peer, control: bool) {
+        let identity = match &peer {
+            Peer::Tcp(s) => s
+                .peer_addr()
+                .map(|a| format!("tcp:{}", a.ip()))
+                .unwrap_or_else(|_| "tcp:unknown".into()),
+            Peer::Unix(s) => Self::peer_creds(s)
+                .map(|c| format!("uid:{}", c.uid))
+                .unwrap_or_else(|_| "unix:unknown".into()),
+        };
+        let admission = if control {
+            &kernel.control_connections
+        } else {
+            &kernel.connections
+        };
+        let Some(lease) = admission.acquire(identity.clone()) else {
+            kernel
+                .ledger
+                .append(
+                    "connection_refused",
+                    json!({"peer": identity, "reason": "connection budget exhausted"}),
+                )
+                .ok();
+            return;
+        };
+        let lease = Arc::new(lease);
+        std::thread::spawn(move || {
+            let _lease = lease.clone();
+            if control {
+                if let Peer::Unix(ref s) = peer {
+                    if let Err(e) = Self::ctl_door(&kernel, s) {
+                        kernel
+                            .ledger
+                            .append("ctl_refused", json!({"reason": e}))
+                            .ok();
+                        return;
+                    }
+                }
+                peer.set_read_timeout(Some(Duration::from_millis(
+                    kernel.resource_limits.idle_timeout_ms,
+                )))
+                .ok();
+                Self::ctl_connection(kernel, peer, Some(lease));
+            } else {
+                Self::connection(kernel, peer, Some(lease));
+            }
+        });
     }
 
     /// F10: the control socket's DOOR. Two independent gates, both
@@ -2596,13 +2840,17 @@ impl Router {
     }
 
     /// The operator control connection: JSON lines, ctl verbs ONLY.
-    fn ctl_connection(kernel: Arc<Kernel>, peer: Peer) {
+    fn ctl_connection(
+        kernel: Arc<Kernel>,
+        peer: Peer,
+        lease: Option<Arc<resources::ConnectionReservation>>,
+    ) {
         // plain JSON lines from the FIRST byte — no wire-format magic on
         // the operator socket (F02). F03: replies go through the same
         // bounded-writer machinery as agent connections, so process
         // inspection can never block on a stalled reader either.
         let out = match peer.try_clone() {
-            Ok(w) => spawn_writer(kernel.ledger.clone(), w, Wire::Json),
+            Ok(w) => spawn_writer_reserved(kernel.ledger.clone(), w, Wire::Json, lease),
             Err(_) => return,
         };
         let mut reader = JsonPeer::new_raw(peer);
@@ -2631,9 +2879,23 @@ impl Router {
     /// One connection, any transport, both wire formats. The FIRST byte
     /// decides the format: `{` = JSON lines (v0.1 contract), 0xFF = the
     /// length-prefixed msgpack frames (§6.2 wire encoding).
-    fn connection(kernel: Arc<Kernel>, mut peer: Peer) {
+    fn connection(
+        kernel: Arc<Kernel>,
+        mut peer: Peer,
+        lease: Option<Arc<resources::ConnectionReservation>>,
+    ) {
+        peer.set_read_timeout(Some(Duration::from_millis(
+            kernel.resource_limits.handshake_timeout_ms,
+        )))
+        .ok();
+        let initial_deadline =
+            Instant::now() + Duration::from_millis(kernel.resource_limits.handshake_timeout_ms);
         let mut first = [0u8; 1];
-        if peer.read(&mut first).unwrap_or(0) == 0 {
+        if PeerDeadline::until(&mut peer, initial_deadline)
+            .read(&mut first)
+            .unwrap_or(0)
+            == 0
+        {
             return;
         }
         let wire = match first[0] {
@@ -2654,15 +2916,19 @@ impl Router {
         // F03: the dedicated writer owns every byte this connection
         // sends — the reader half never writes the socket again
         let out = match peer.try_clone() {
-            Ok(w) => spawn_writer(kernel.ledger.clone(), w, wire),
+            Ok(w) => spawn_writer_reserved(kernel.ledger.clone(), w, wire, lease),
             Err(_) => return,
         };
         let my_uin = match wire {
             Wire::Json => {
-                Router::json_loop(kernel.clone(), &mut JsonPeer::new(peer, first[0]), &out)
+                let mut reader = JsonPeer::new(peer, first[0]);
+                reader.first_deadline = Some(initial_deadline);
+                Router::json_loop(kernel.clone(), &mut reader, &out)
             }
-            Wire::Msgpack => Router::msgpack_loop(kernel.clone(), peer, true, &out),
-            Wire::Proto => Router::proto_loop(kernel.clone(), peer, &out),
+            Wire::Msgpack => {
+                Router::msgpack_loop(kernel.clone(), peer, true, &out, initial_deadline)
+            }
+            Wire::Proto => Router::proto_loop(kernel.clone(), peer, &out, initial_deadline),
         };
         // reader gone: stop feeding the writer (queued frames are dropped
         // with the connection)
@@ -2672,20 +2938,33 @@ impl Router {
         kernel.connection_closed(my_uin);
     }
 
-    fn proto_loop(kernel: Arc<Kernel>, mut peer: Peer, out: &Arc<Outbound>) -> Option<u64> {
+    fn proto_loop(
+        kernel: Arc<Kernel>,
+        mut peer: Peer,
+        out: &Arc<Outbound>,
+        initial_deadline: Instant,
+    ) -> Option<u64> {
         let mut my_uin: Option<u64> = None;
         // first frame: the 0x0A magic byte was already consumed
         let mut v = {
+            let mut input = PeerDeadline::until(&mut peer, initial_deadline);
             let mut lenb = [0u8; 4];
-            if peer.read_exact(&mut lenb).is_err() {
+            if input.read_exact(&mut lenb).is_err() {
                 return None;
             }
             let len = u32::from_le_bytes(lenb) as usize;
             if len > MAX_FRAME {
-                return None; // oversized first frame: refuse the connection
+                kernel
+                    .ledger
+                    .append(
+                        "frame_refused",
+                        json!({"reason": "oversized binary frame", "bytes": len}),
+                    )
+                    .ok();
+                return None;
             }
             let mut buf = vec![0u8; len];
-            if peer.read_exact(&mut buf).is_err() {
+            if input.read_exact(&mut buf).is_err() {
                 return None;
             }
             match proto::decode_raw(&buf) {
@@ -2712,14 +2991,32 @@ impl Router {
                     let _ = out.send(&json!({"kind": "error", "reason": e}));
                 }
             }
-            match read_proto_frame(&mut peer) {
+            let deadline = if my_uin.is_some() {
+                Instant::now() + Duration::from_millis(kernel.resource_limits.idle_timeout_ms)
+            } else {
+                initial_deadline
+            };
+            match read_proto_frame(&mut PeerDeadline::until(&mut peer, deadline)) {
                 Ok(v2) => {
                     if debug_enabled() {
                         eprintln!("[proto_loop] next frame: {v2}");
                     }
                     v = v2;
                 }
-                Err(_) => break,
+                Err(error) => {
+                    kernel
+                        .ledger
+                        .append(
+                            if error.kind() == io::ErrorKind::InvalidData {
+                                "frame_refused"
+                            } else {
+                                "connection_read_closed"
+                            },
+                            json!({"reason": error.to_string()}),
+                        )
+                        .ok();
+                    break;
+                }
             }
         }
         my_uin
@@ -2730,6 +3027,7 @@ impl Router {
         mut peer: Peer,
         _first_magic_seen: bool,
         out: &Arc<Outbound>,
+        initial_deadline: Instant,
     ) -> Option<u64> {
         let mut my_uin: Option<u64> = None;
         if debug_enabled() {
@@ -2737,16 +3035,24 @@ impl Router {
         }
         // first frame: the magic byte was already consumed
         let mut v = {
+            let mut input = PeerDeadline::until(&mut peer, initial_deadline);
             let mut lenb = [0u8; 4];
-            if peer.read_exact(&mut lenb).is_err() {
+            if input.read_exact(&mut lenb).is_err() {
                 return None;
             }
             let len = u32::from_le_bytes(lenb) as usize;
             if len > MAX_FRAME {
-                return None; // oversized first frame: refuse the connection
+                kernel
+                    .ledger
+                    .append(
+                        "frame_refused",
+                        json!({"reason": "oversized binary frame", "bytes": len}),
+                    )
+                    .ok();
+                return None;
             }
             let mut buf = vec![0u8; len];
-            if peer.read_exact(&mut buf).is_err() {
+            if input.read_exact(&mut buf).is_err() {
                 return None;
             }
             match rmp_serde::from_slice::<Value>(&buf) {
@@ -2768,14 +3074,32 @@ impl Router {
                     let _ = out.send(&json!({"kind": "error", "reason": e}));
                 }
             }
-            match read_msgpack_frame(&mut peer) {
+            let deadline = if my_uin.is_some() {
+                Instant::now() + Duration::from_millis(kernel.resource_limits.idle_timeout_ms)
+            } else {
+                initial_deadline
+            };
+            match read_msgpack_frame(&mut PeerDeadline::until(&mut peer, deadline)) {
                 Ok(v2) => {
                     if debug_enabled() {
                         eprintln!("[msgpack_loop] next frame: {v2}");
                     }
                     v = v2;
                 }
-                Err(_) => break,
+                Err(error) => {
+                    kernel
+                        .ledger
+                        .append(
+                            if error.kind() == io::ErrorKind::InvalidData {
+                                "frame_refused"
+                            } else {
+                                "connection_read_closed"
+                            },
+                            json!({"reason": error.to_string()}),
+                        )
+                        .ok();
+                    break;
+                }
             }
         }
         let _ = last_wire;
@@ -2788,7 +3112,14 @@ impl Router {
         // the first '{' was already consumed by the mode detector
         match reader.read_line_after(&mut line) {
             Ok(true) => {}
-            _ => return None,
+            Ok(false) => return None,
+            Err(error) => {
+                kernel
+                    .ledger
+                    .append("frame_refused", json!({"reason": error.to_string()}))
+                    .ok();
+                return None;
+            }
         }
         // the first '{' is ALREADY in `line` (pushed by the JsonPeer) —
         // prepending a second brace produced `{{kind` → "key must be a
@@ -2822,10 +3153,21 @@ impl Router {
                     let _ = out.send(&json!({"kind": "error", "reason": format!("rejected: {e}")}));
                 }
             }
+            if my_uin.is_some() {
+                reader.first_deadline = None;
+                reader.timeout = Duration::from_millis(kernel.resource_limits.idle_timeout_ms);
+            }
             line.clear();
             match reader.read_line_after(&mut line) {
                 Ok(true) => {}
-                _ => break, // EOF: process gone
+                Ok(false) => break,
+                Err(error) => {
+                    kernel
+                        .ledger
+                        .append("frame_refused", json!({"reason": error.to_string()}))
+                        .ok();
+                    break;
+                }
             }
             if debug_json_enabled() {
                 eprintln!("[json_loop] line = {:?}", line.trim_end());
@@ -2883,7 +3225,7 @@ impl Router {
             "ctl_qos" => {
                 // bandwidth accounting + queue state, operator-only
                 let stats = kernel.delivery.lock().unwrap().stats();
-                let reply = json!({"kind": "qos", "stats": stats});
+                let reply = json!({"kind": "qos", "stats": stats, "connections": kernel.connections.stats(), "control_connections": kernel.control_connections.stats(), "outbound_bytes": kernel.ledger.outbound_budget.usage().0, "ledger_healthy": kernel.ledger.is_healthy()});
                 out.send(&reply).map_err(|e| e.to_string())?;
                 Ok(())
             }
@@ -3361,7 +3703,10 @@ impl Router {
                     e.state = ProcState::Running;
                     // F03: the entry holds the connection's QUEUE — the
                     // writer thread behind it is the only socket writer
-                    e.out = Some(Arc::clone(out));
+                    *out.budget.lock().unwrap() = kernel.ledger.agent_budget(uin);
+                    if let Some(previous) = e.out.replace(Arc::clone(out)) {
+                        previous.close();
+                    }
                     e.wire = wire;
                     e.last_hb = Instant::now();
                     e.stuck_sweeps = 0;
@@ -3411,7 +3756,7 @@ impl Router {
             Envelope::Checkpoint { uin, state } => {
                 let e = kernel
                     .ledger
-                    .append("checkpoint", json!({"uin": uin, "state": state}))
+                    .append_durable("checkpoint", json!({"uin": uin, "state": state}))
                     .map_err(|e| e.to_string())?;
                 let agents = kernel.agents.lock().unwrap();
                 if let Some(entry) = agents.get(&uin) {
@@ -3510,6 +3855,19 @@ impl Peer {
         }
     }
 
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Peer::Unix(s) => s.set_read_timeout(timeout),
+            Peer::Tcp(s) => s.set_read_timeout(timeout),
+        }
+    }
+    fn read_timeout(&self) -> io::Result<Option<Duration>> {
+        match self {
+            Peer::Unix(s) => s.read_timeout(),
+            Peer::Tcp(s) => s.read_timeout(),
+        }
+    }
+
     /// F03: the writer half carries a deadline so a peer that stopped
     /// reading releases the writer thread instead of parking it.
     pub fn set_write_timeout(&self, t: Option<std::time::Duration>) -> std::io::Result<()> {
@@ -3520,30 +3878,70 @@ impl Peer {
     }
 }
 
+/// A whole-frame deadline, not a fresh timeout for each trickled byte.
+struct PeerDeadline<'a> {
+    peer: &'a mut Peer,
+    deadline: Instant,
+}
+impl<'a> PeerDeadline<'a> {
+    fn until(peer: &'a mut Peer, deadline: Instant) -> Self {
+        Self { peer, deadline }
+    }
+}
+impl Read for PeerDeadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "frame read deadline exceeded")
+            })?;
+        self.peer.set_read_timeout(Some(remaining))?;
+        self.peer.read(buf)
+    }
+}
+
 /// A JSON peer whose first byte was consumed by the mode detector.
 struct JsonPeer {
     peer: BufReader<Peer>,
     first: Option<u8>,
     done: bool,
+    timeout: Duration,
+    first_deadline: Option<Instant>,
 }
 
 impl JsonPeer {
     fn new(peer: Peer, first: u8) -> JsonPeer {
+        let timeout = peer
+            .read_timeout()
+            .ok()
+            .flatten()
+            .unwrap_or(Duration::from_secs(30));
         JsonPeer {
             // buffered: per-byte read() made every JSON line a syscall storm
             // (microbench: 23.45 us/line unbuffered vs 1.30 us/line buffered)
             peer: BufReader::with_capacity(1 << 16, peer),
             first: Some(first),
             done: false,
+            timeout,
+            first_deadline: None,
         }
     }
     /// No magic first byte: plain JSON lines from the first byte on (the
     /// operator control connection, F02).
     fn new_raw(peer: Peer) -> JsonPeer {
+        let timeout = peer
+            .read_timeout()
+            .ok()
+            .flatten()
+            .unwrap_or(Duration::from_secs(30));
         JsonPeer {
             peer: BufReader::with_capacity(1 << 16, peer),
             first: None,
             done: false,
+            timeout,
+            first_deadline: None,
         }
     }
     /// read one JSON line; the stored first byte is prepended on the
@@ -3558,29 +3956,37 @@ impl JsonPeer {
         if let Some(b) = self.first.take() {
             line.push(b as char);
         }
+        let deadline = self
+            .first_deadline
+            .unwrap_or_else(|| Instant::now() + self.timeout);
         let mut buf = Vec::new();
-        let mut b = [0u8; 1];
         loop {
-            match self.peer.read(&mut b) {
-                Ok(0) => {
-                    self.done = true;
-                    line.push_str(&String::from_utf8_lossy(&buf));
-                    return Ok(!line.is_empty());
-                }
-                Ok(_) => {
-                    if b[0] == b'\n' {
-                        line.push_str(&String::from_utf8_lossy(&buf));
-                        return Ok(true);
-                    }
-                    buf.push(b[0]);
-                    if buf.len() > MAX_LINE {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "json line exceeds the size limit",
-                        ));
-                    }
-                }
-                Err(e) => return Err(e),
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "json frame deadline exceeded")
+                })?;
+            self.peer.get_ref().set_read_timeout(Some(remaining))?;
+            let available = self.peer.fill_buf()?;
+            if available.is_empty() {
+                self.done = true;
+                line.push_str(&String::from_utf8_lossy(&buf));
+                return Ok(!line.is_empty());
+            }
+            let newline = available.iter().position(|b| *b == b'\n');
+            let count = newline.unwrap_or(available.len());
+            if line.len() + buf.len() + count > MAX_LINE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "json line exceeds the size limit",
+                ));
+            }
+            buf.extend_from_slice(&available[..count]);
+            self.peer.consume(count + usize::from(newline.is_some()));
+            if newline.is_some() {
+                line.push_str(&String::from_utf8_lossy(&buf));
+                return Ok(true);
             }
         }
     }
@@ -3596,6 +4002,8 @@ pub struct Manifest {
 pub struct KernelConfig {
     pub socket: String,
     pub ledger: String,
+    #[serde(default)]
+    pub resources: resources::ResourceLimits,
     #[serde(default = "default_hb")]
     pub hb_interval_ms: u64,
     #[serde(default = "default_timeout")]
@@ -4156,6 +4564,7 @@ mod f03_outbound_tests {
             }),
             idle: std::sync::Condvar::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
+            budget: Mutex::new(Arc::new(resources::ByteBudget::new(cap))),
             ledger,
         })
     }
@@ -4730,3 +5139,6 @@ mod f05_launch_deadline_tests {
         assert_eq!(dump[0]["state"], "starting");
     }
 }
+
+#[cfg(test)]
+mod enterprise_tests;

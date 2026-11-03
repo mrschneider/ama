@@ -8,8 +8,8 @@
 # roughly three times the link of the weight-1 flow. The ledger's
 # qos_delivered order is the evidence.
 #
-# ADMISSION CONTROL: `big` has a 2000 B/s byte budget and sends three
-# ~1500 B payloads back-to-back. The first fits; the rest are refused at
+# ADMISSION CONTROL: `big` has a 1000 B/s byte budget and sends three
+# ~1500 B payloads back-to-back. Each exceeds one burst and is refused at
 # admission and journaled `admission_denied` — the kernel never queues
 # what it has not admitted, and never drops silently.
 #

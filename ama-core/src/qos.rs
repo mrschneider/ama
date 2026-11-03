@@ -550,7 +550,7 @@ pub fn reassemble_parts(mut parts: Vec<Value>) -> Option<Value> {
 /// the kernel is not a mailbox of unbounded size.
 pub struct DeliverySystem {
     /// destination UIN -> bundles awaiting its registration
-    pub bundles: BinaryHeap<DtnBundle>,
+    pub bundles: crate::custody::CustodyStore,
     pub max_bundles: usize,
     pub default_ttl: Duration,
     /// sender UIN -> token bucket (None = unlimited)
@@ -578,12 +578,15 @@ pub struct DeliverySystem {
     pub link_bytes_per_tick: Option<u64>,
     /// bytes left in the current tick's link budget
     link_budget: u64,
+    link_fraction: f64,
+    link_updated: Instant,
+    observed_capacity: Option<u64>,
 }
 
 impl DeliverySystem {
     pub fn new(max_bundles: usize, default_ttl: Duration) -> Self {
         Self {
-            bundles: BinaryHeap::new(),
+            bundles: crate::custody::CustodyStore::default(),
             max_bundles,
             default_ttl,
             buckets: HashMap::new(),
@@ -598,6 +601,9 @@ impl DeliverySystem {
             next_seq: 0,
             link_bytes_per_tick: None,
             link_budget: u64::MAX,
+            link_fraction: 0.0,
+            link_updated: Instant::now(),
+            observed_capacity: None,
         }
     }
 
@@ -617,6 +623,79 @@ impl DeliverySystem {
     /// watchdog tick, before draining).
     pub fn refill_link(&mut self) {
         self.link_budget = self.link_bytes_per_tick.unwrap_or(u64::MAX);
+        self.link_fraction = 0.0;
+        self.link_updated = Instant::now();
+        self.observed_capacity = self.link_bytes_per_tick;
+    }
+
+    /// Smooth refill at the legacy rate: configured bytes per 200 ms.
+    /// Bursts are bounded to one tick; messages larger than that are refused.
+    pub fn refill_elapsed(&mut self) {
+        if self.observed_capacity != self.link_bytes_per_tick {
+            self.refill_link();
+            return;
+        }
+        let now = Instant::now();
+        if let Some(capacity) = self.link_bytes_per_tick {
+            let earned = now.duration_since(self.link_updated).as_secs_f64() * capacity as f64
+                / 0.2
+                + self.link_fraction;
+            self.link_budget = self
+                .link_budget
+                .saturating_add(earned.floor() as u64)
+                .min(capacity);
+            self.link_fraction = if self.link_budget == capacity {
+                0.0
+            } else {
+                earned.fract()
+            };
+        } else {
+            self.link_budget = u64::MAX;
+        }
+        self.link_updated = now;
+    }
+    pub fn link_can_fit(&self, bytes: usize) -> bool {
+        self.link_budget >= bytes as u64
+    }
+    pub fn validate_link_message(&self, bytes: usize) -> Result<(), String> {
+        if self
+            .link_bytes_per_tick
+            .is_some_and(|capacity| bytes as u64 > capacity)
+        {
+            return Err(
+                "message exceeds link burst capacity; fragment or increase link budget".into(),
+            );
+        }
+        Ok(())
+    }
+    pub fn validate_queue_size(&self, bytes: usize) -> Result<(), String> {
+        if bytes as u64
+            > self
+                .admission
+                .max_queue_bytes
+                .saturating_sub(self.accounting.queued_bytes)
+        {
+            return Err("admission: delivery queue at capacity".into());
+        }
+        Ok(())
+    }
+    pub fn next_link_delay(&self, bytes: usize) -> Duration {
+        if self.link_can_fit(bytes) {
+            return Duration::ZERO;
+        }
+        match self.link_bytes_per_tick {
+            Some(capacity) if capacity > 0 => Duration::from_secs_f64(
+                ((bytes as f64 - self.link_budget as f64 - self.link_fraction).max(0.0) * 0.2
+                    / capacity as f64)
+                    .max(0.000001),
+            ),
+            _ => Duration::from_secs(1),
+        }
+    }
+    pub fn refund_admission(&mut self, from: u64, bytes: usize) {
+        if let Some(bucket) = self.admission.buckets.get_mut(&from) {
+            bucket.tokens = (bucket.tokens + bytes as f64).min(bucket.rate as f64);
+        }
     }
 
     /// May the link carry `bytes` right now? Deducts the budget when it
@@ -644,8 +723,23 @@ impl DeliverySystem {
         body: Value,
         bytes: usize,
     ) -> Result<(), String> {
+        self.validate_link_message(bytes)?;
+        self.validate_queue_size(bytes)?;
         self.admission
             .admit(from, bytes, self.accounting.queued_bytes)?;
+        self.schedule_admitted(from, to, body, bytes)
+    }
+
+    /// Called only after admission, while the kernel retains the delivery lock.
+    pub(crate) fn schedule_admitted(
+        &mut self,
+        from: u64,
+        to: u64,
+        body: Value,
+        bytes: usize,
+    ) -> Result<(), String> {
+        self.validate_link_message(bytes)?;
+        self.validate_queue_size(bytes)?;
         let tag = self.wfq.tag(from, bytes);
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -702,7 +796,7 @@ impl DeliverySystem {
     }
 
     pub fn record_queued_drop(&mut self, bytes: usize) {
-        self.accounting.queued_bytes = self.accounting.queued_bytes.saturating_sub(bytes as u64);
+        // pop_next already removed these bytes from the queue.
         self.accounting.bytes_dropped += bytes as u64;
     }
 
@@ -722,7 +816,9 @@ impl DeliverySystem {
     }
 
     pub fn stats(&self) -> Value {
-        self.accounting.snapshot()
+        let mut stats = self.accounting.snapshot();
+        stats["custody"] = serde_json::json!({"bundles": self.bundles.len(), "bytes": self.bundles.bytes(), "byte_limit": self.bundles.max_bytes});
+        stats
     }
 
     /// Declare a sender's rate limit (called at registration when the
@@ -789,7 +885,7 @@ impl DeliverySystem {
         b.hops = hops;
         b.next_hop = next_hop;
         b.frag = frag;
-        self.bundles.push(b);
+        self.bundles.insert(b)?;
         Ok(())
     }
 
@@ -809,82 +905,21 @@ impl DeliverySystem {
     /// flushes custody separately, never through this path). Returns how
     /// many were released; 0 means the caller does not hold custody.
     pub fn ack_custody(&mut self, bundle_id: u64, frag_index: Option<u32>, by: u64) -> usize {
-        let before = self.bundles.len();
-        let kept: Vec<DtnBundle> = self
-            .bundles
-            .drain()
-            .filter(|b| {
-                if b.bundle_id != bundle_id {
-                    return true; // other bundles stay
-                }
-                // OWNERSHIP: the acking session must be the holder the
-                // bundle was transferred to
-                if b.next_hop != Some(by) {
-                    return true; // not the caller's custody — stays
-                }
-                match (frag_index, b.frag) {
-                    (Some(i), Some(m)) => m.index != i, // keep the others
-                    (Some(_), None) => false,           // the whole one goes
-                    (None, _) => false,                 // release them all
-                }
-            })
-            .collect();
-        for b in kept {
-            self.bundles.push(b);
-        }
-        before - self.bundles.len()
+        self.bundles.acknowledge(bundle_id, frag_index, by)
     }
 
     /// Bundles handed to `uin` as the next hop (custody for a relay).
     pub fn drain_via(&mut self, uin: u64) -> Vec<DtnBundle> {
-        let now = Instant::now();
-        let mut kept: Vec<DtnBundle> = Vec::new();
-        let mut out: Vec<DtnBundle> = Vec::new();
-        let mut expired: Vec<DtnBundle> = Vec::new();
-        while let Some(b) = self.bundles.pop() {
-            if b.expires_at <= now {
-                expired.push(b);
-            } else if b.next_hop == Some(uin) {
-                out.push(b);
-            } else {
-                kept.push(b);
-            }
-        }
-        for b in kept {
-            self.bundles.push(b);
-        }
-        self.expired_report.extend(expired);
-        out.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then(a.stored_at.cmp(&b.stored_at))
-        });
-        out
+        self.expired_report
+            .extend(self.bundles.expire(Instant::now()));
+        self.bundles.drain_via(uin)
     }
 
     /// Drain every bundle addressed to `uin` whose TTL is still valid,
     /// in priority order. Called when the destination registers.
     pub fn drain_for(&mut self, uin: u64) -> Vec<DtnBundle> {
-        let now = Instant::now();
-        let mut kept: Vec<DtnBundle> = Vec::new();
-        let mut expired: Vec<DtnBundle> = Vec::new();
-        let mut out: Vec<DtnBundle> = Vec::new();
-        while let Some(b) = self.bundles.pop() {
-            if b.to == uin {
-                if b.expires_at > now {
-                    out.push(b);
-                } else {
-                    expired.push(b);
-                }
-            } else if b.expires_at > now {
-                kept.push(b);
-            } else {
-                expired.push(b);
-            }
-        }
-        for b in kept {
-            self.bundles.push(b);
-        }
+        let expired = self.bundles.expire(Instant::now());
+        let mut out = self.bundles.drain_for(uin);
         // FRAGMENT REASSEMBLY: a message split into fragments becomes one
         // message again when its set is complete; an incomplete set stays
         // in custody (it can still complete on a later delivery).
@@ -929,7 +964,7 @@ impl DeliverySystem {
             } else {
                 // incomplete: keep the fragments for a later attempt
                 for b in group {
-                    self.bundles.push(b);
+                    self.bundles.restore(b);
                 }
             }
         }
@@ -948,19 +983,8 @@ impl DeliverySystem {
     /// Bundles whose TTL ran out while their destination never came
     /// back — swept by the kernel's watchdog (journal + drop).
     pub fn sweep_expired(&mut self) -> Vec<DtnBundle> {
-        let now = Instant::now();
-        let mut kept: Vec<DtnBundle> = Vec::new();
-        let mut expired: Vec<DtnBundle> = Vec::new();
-        while let Some(b) = self.bundles.pop() {
-            if b.expires_at > now {
-                kept.push(b);
-            } else {
-                expired.push(b);
-            }
-        }
-        for b in kept {
-            self.bundles.push(b);
-        }
+        let mut expired = std::mem::take(&mut self.expired_report);
+        expired.extend(self.bundles.expire(Instant::now()));
         expired
     }
 }

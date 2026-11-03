@@ -212,3 +212,67 @@ bash experiments/experiment_006_qos_dtn.sh     # per-sender rate limits + DTN cu
 bash experiments/experiment_007_qos_suite.sh   # WFQ weights + admission control + bandwidth accounting
 bash experiments/experiment_008_dtn_routing.sh # multi-hop relays + custody acks + fragmentation
 ```
+## Resource admission and recovery limits
+
+The optional `kernel.resources` manifest object configures the limits below.
+Omitted fields use these defaults; budgets and timeouts must be positive.
+`ledger_segment_bytes: 0` disables automatic segmentation.
+
+```json
+{
+  "resources": {
+    "max_connections": 512,
+    "max_connections_per_peer": 128,
+    "max_control_connections": 16,
+    "handshake_timeout_ms": 5000,
+    "idle_timeout_ms": 30000,
+    "max_outbound_bytes": 67108864,
+    "max_outbound_bytes_per_agent": 4194304,
+    "max_custody_bytes": 67108864,
+    "max_custody_bytes_per_sender": 16777216,
+    "max_custody_bytes_per_destination": 33554432,
+    "ledger_segment_bytes": 67108864
+  }
+}
+```
+
+Agent connections are admitted before spawning workers. TCP peers are grouped
+by source IP, Unix peers by UID. Operator connections have a separate reserved
+pool. Reservations cover both reader and writer lifetimes. A total frame
+read deadline prevents slow trickles from resetting the timeout; authenticated
+sessions use the idle timeout for each subsequent frame. Binary lengths and
+JSON lines are bounded by 16 MiB before allocating an oversized body.
+
+Outbound byte reservations cover queued and in-flight encoded frames. Each
+agent identity shares its budget across reconnects; anonymous connections
+have separate local budgets and share the global limit. Custody accounts for
+encoded bundles globally, per sender and per destination. These are payload
+budgets, not process RSS caps; protocol parsing, metadata and checkpoint state
+also consume memory. Resource and queue refusals are written to the ledger.
+
+Queued delivery uses its own wakeable scheduler, independent of watchdog
+sweeps. Link tokens refill with elapsed time. A message larger than a finite
+link burst is rejected rather than permanently blocking the queue. Admission
+charges each message once, including the path that queues after a link stall.
+Custody indexes select destination, relay and acknowledgement records without
+rebuilding the entire queue; expiry inspects the next deadline.
+
+Checkpoint acknowledgements follow `sync_data` and parent-directory sync.
+Any ledger write or sync failure poisons further appends and blocks normal
+routing until recovery. The complete checkpoint index is loaded once from the
+active snapshot and WAL tail, so absent checkpoint lookups do not rescan disk.
+
+Automatic rotation snapshots the latest checkpoints into a synced temporary
+file, archives the active WAL as `.segment-<sequence>.jsonl`, then activates
+the snapshot and syncs the parent directory. Startup finishes an interrupted
+rotation when the active file is absent and the temporary snapshot is valid.
+Sequence numbers continue across rotations; history reads include archived
+segments and omit internal snapshot records. **Archives are retained:** operators
+must define their own backup and retention policy. Checkpoint snapshots grow
+with the number and size of retained checkpoint states. Durability ultimately
+depends on filesystem and storage sync guarantees; tests simulate failure and
+restart rather than physical power loss.
+
+Run `bash experiments/experiment_010_resource_recovery.sh` for deterministic
+frame, deadline, connection, memory-accounting, scheduler, custody and ledger
+failure/recovery probes.

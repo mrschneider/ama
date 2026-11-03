@@ -39,7 +39,7 @@
       "name": "big",
       "task": "experiments/tasks_007/big.json",
       "qos": {
-        "max_bytes_per_sec": 2000
+        "max_bytes_per_sec": 1000
       },
       "caps": [
         "send:sink"

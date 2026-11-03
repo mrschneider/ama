@@ -185,6 +185,9 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
     )
     .expect("kernel");
     let mut kernel = kernel; // shadow for mutation
+    kernel
+        .configure_resources(m.kernel.resources.clone())
+        .expect("resource policy");
     kernel.apply_cgroups = cgroups; // opt-in, best-effort (see sandbox.rs)
     kernel.tcp_addr = m.kernel.tcp_port.map(|p| {
         format!(

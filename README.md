@@ -139,3 +139,7 @@ experiments/    runnable E2E proof + task manifests
 ## License
 
 Apache-2.0.
+Resource admission, delivery scheduling and durable checkpoint recovery are
+covered by `bash experiments/experiment_010_resource_recovery.sh`. See the
+[resource and recovery configuration](docs/architecture/kernel-reference.md#resource-admission-and-recovery-limits)
+for connection deadlines, byte budgets and ledger segment retention.
