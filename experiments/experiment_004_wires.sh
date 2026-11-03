@@ -7,6 +7,7 @@ set -euo pipefail
 # F10: operator authority is a CREDENTIAL — the kernel and this
 # operator CLI must share it; agents are stripped of it at spawn
 export AMA_OPERATOR_TOKEN="ama-local-operator-token"
+export AMA_LEDGER_VERBOSE=1
 cd "$(dirname "$0")/.."
 rm -rf /tmp/ama_exp && mkdir -p /tmp/ama_exp
 rm -f /tmp/ama_exp.sock

@@ -19,6 +19,7 @@ set -euo pipefail
 # F10: operator authority is a CREDENTIAL — the kernel and this
 # operator CLI must share it; agents are stripped of it at spawn
 export AMA_OPERATOR_TOKEN="ama-local-operator-token"
+export AMA_LEDGER_VERBOSE=1
 cd "$(dirname "$0")/.."
 # evidence blocks (and abort_evidence.sh) read $LEDGER — 009 keeps its
 # own ledger directory
