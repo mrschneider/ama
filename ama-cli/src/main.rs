@@ -193,6 +193,11 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
         )
     });
     kernel.vm_boot = m.kernel.vm_boot.clone();
+    // an explicit manifest value wins; absent falls back to the
+    // AMA_LEDGER_VERBOSE env default set in Kernel::new
+    if let Some(v) = m.kernel.ledger_verbose {
+        kernel.ledger_verbose = v;
+    }
     kernel.configure_delivery(
         m.kernel.admission_max_bytes_per_sec,
         m.kernel.admission_max_queue_bytes,
