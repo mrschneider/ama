@@ -1569,8 +1569,12 @@ impl Kernel {
                 self.ledger
                     .append(
                         "qos_throttled",
-                        // PERF: no body in the journal (see `delivered`)
-                        json!({"from": from, "to": uin, "bytes": bytes}),
+                        // PERF: bytes by default, body in verbose mode
+                        if self.ledger_verbose {
+                            json!({"from": from, "to": uin, "bytes": bytes, "body": body})
+                        } else {
+                            json!({"from": from, "to": uin, "bytes": bytes})
+                        },
                     )
                     .map_err(|e| e.to_string())?;
                 return Err(format!("qos: sender {from} over its rate limit"));
