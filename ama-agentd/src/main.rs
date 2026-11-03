@@ -161,7 +161,7 @@ fn main() {
     {
         let inbox = inbox.clone();
         let alive = alive.clone();
-        let mut r = writer.lock().unwrap().try_clone().expect("reader clone");
+        let r = writer.lock().unwrap().try_clone().expect("reader clone");
         std::thread::spawn(move || {
             match wire {
                 Wire::Json => {
@@ -180,24 +180,33 @@ fn main() {
                     }
                     alive.store(false, Ordering::SeqCst);
                 }
-                Wire::Msgpack => loop {
-                    if !alive.load(Ordering::SeqCst) {
-                        break;
+                Wire::Msgpack => {
+                    // PERF: buffered reads — unbuffered read_exact made
+                    // every frame 3+ syscalls (a real cost behind TCP);
+                    // the JSON arm above already buffers
+                    let mut r = BufReader::with_capacity(1 << 16, r);
+                    loop {
+                        if !alive.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        match read_msgpack_frame(&mut r) {
+                            Ok(v) => inbox.lock().unwrap().push_back(v),
+                            Err(_) => break,
+                        }
                     }
-                    match read_msgpack_frame(&mut r) {
-                        Ok(v) => inbox.lock().unwrap().push_back(v),
-                        Err(_) => break,
+                }
+                Wire::Proto => {
+                    let mut r = BufReader::with_capacity(1 << 16, r);
+                    loop {
+                        if !alive.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        match read_proto_frame(&mut r) {
+                            Ok(v) => inbox.lock().unwrap().push_back(v),
+                            Err(_) => break,
+                        }
                     }
-                },
-                Wire::Proto => loop {
-                    if !alive.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match read_proto_frame(&mut r) {
-                        Ok(v) => inbox.lock().unwrap().push_back(v),
-                        Err(_) => break,
-                    }
-                },
+                }
             }
             // F08: DISCONNECT is a signal — poison the inbox so every wait
             // loop terminates instead of hanging forever (all three wire

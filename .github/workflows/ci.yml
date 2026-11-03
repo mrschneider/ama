@@ -10,6 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  AMA_LEDGER_VERBOSE: "1"
 
 jobs:
   fmt:
@@ -92,5 +93,6 @@ jobs:
           pkill -9 -x ama-agentd || true
           sleep 1
           bash experiments/experiment_009_authority.sh
+      - run: bash experiments/experiment_010_resource_recovery.sh
       # experiment_005_microvm is intentionally excluded: it requires
       # /dev/kvm, which GitHub-hosted runners do not expose.
