@@ -877,6 +877,9 @@ impl Ledger {
             return Err(io::Error::other("ledger writer failed; recovery required"));
         }
         let result = (|| {
+            // External-rotation detection: compare the live path against the
+            // handle we hold. A stale fd still fstats to the old inode, so the
+            // path statx is the only thing that catches external renames.
             let disk = std::fs::metadata(&self.path)
                 .ok()
                 .map(|m| (m.dev(), m.ino()));
@@ -887,11 +890,12 @@ impl Ledger {
             if writer.is_none() || disk != handle {
                 *writer = Some(self.open_handle()?);
             }
+            let file = writer.as_mut().unwrap();
+            // Single size check: reuse the same metadata read for the
+            // rotation trigger instead of a second metadata() call.
             let limit = self.segment_bytes.load(Ordering::Relaxed);
             if limit > 0
-                && writer
-                    .as_ref()
-                    .unwrap()
+                && file
                     .metadata()?
                     .len()
                     .saturating_sub(self.snapshot_bytes.load(Ordering::Relaxed))
