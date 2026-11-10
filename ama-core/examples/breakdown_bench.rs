@@ -26,7 +26,11 @@ fn main() {
             .as_millis();
     }
     let dt = t0.elapsed();
-    println!("SystemTime::now() x{}: {:.3} us/call", n, dt.as_micros() as f64 / n as f64);
+    println!(
+        "SystemTime::now() x{}: {:.3} us/call",
+        n,
+        dt.as_micros() as f64 / n as f64
+    );
 
     // (b) std::fs::metadata (path statx)
     let p = path.clone();
@@ -35,7 +39,11 @@ fn main() {
         let _ = std::fs::metadata(&p).map(|m| (m.dev(), m.ino()));
     }
     let dt = t0.elapsed();
-    println!("std::fs::metadata(path) x{}: {:.3} us/call", n, dt.as_micros() as f64 / n as f64);
+    println!(
+        "std::fs::metadata(path) x{}: {:.3} us/call",
+        n,
+        dt.as_micros() as f64 / n as f64
+    );
 
     // (c) serde_json::to_vec
     let t0 = Instant::now();
@@ -43,19 +51,33 @@ fn main() {
         let _ = serde_json::to_vec(&detail).unwrap();
     }
     let dt = t0.elapsed();
-    println!("serde_json::to_vec x{}: {:.3} us/call", n, dt.as_micros() as f64 / n as f64);
+    println!(
+        "serde_json::to_vec x{}: {:.3} us/call",
+        n,
+        dt.as_micros() as f64 / n as f64
+    );
 
     // (d) full append
     let t0 = Instant::now();
     for i in 0..n {
-        ledger.append("delivered", json!({"i": i, "bytes": 128})).unwrap();
+        ledger
+            .append("delivered", json!({"i": i, "bytes": 128}))
+            .unwrap();
     }
     let dt = t0.elapsed();
-    println!("full append x{}: {:.3} us/call", n, dt.as_micros() as f64 / n as f64);
+    println!(
+        "full append x{}: {:.3} us/call",
+        n,
+        dt.as_micros() as f64 / n as f64
+    );
 
     // (e) write_all to an already-open buffered file (lower bound for I/O)
     let _ = std::fs::remove_file(&path);
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
     let mut bytes = serde_json::to_vec(&detail).unwrap();
     bytes.push(b'\n');
     let t0 = Instant::now();
@@ -64,7 +86,11 @@ fn main() {
     }
     f.flush().unwrap();
     let dt = t0.elapsed();
-    println!("write_all (open fd) x{}: {:.3} us/call", n, dt.as_micros() as f64 / n as f64);
+    println!(
+        "write_all (open fd) x{}: {:.3} us/call",
+        n,
+        dt.as_micros() as f64 / n as f64
+    );
 
     std::process::exit(0);
 }

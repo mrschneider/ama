@@ -20,7 +20,12 @@ fn main() {
         ledger.append(ev, serde_json::json!({"i": i})).unwrap();
     }
     let dt = t0.elapsed();
-    println!("append x{}: {:.4} us/call, {:.2} M/s", n, dt.as_micros() as f64 / n as f64, n as f64 / dt.as_secs_f64() / 1e6);
+    println!(
+        "append x{}: {:.4} us/call, {:.2} M/s",
+        n,
+        dt.as_micros() as f64 / n as f64,
+        n as f64 / dt.as_secs_f64() / 1e6
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

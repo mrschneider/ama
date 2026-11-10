@@ -9,8 +9,8 @@
 
 use ama_core::Ledger;
 use serde_json::json;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -68,9 +68,7 @@ fn main() {
             let ledger = Arc::clone(&ledger);
             handles.push(thread::spawn(move || {
                 for i in 0..per_thread {
-                    ledger
-                        .append_durable("delivered", json!({"i": i}))
-                        .unwrap();
+                    ledger.append_durable("delivered", json!({"i": i})).unwrap();
                 }
             }));
         }
@@ -80,11 +78,8 @@ fn main() {
         let dt = t0.elapsed();
         let rate = total as f64 / dt.as_secs_f64();
         println!(
-            "threads={:>2} durable: {} in {:?} => {}/s",
-            threads,
-            total,
-            dt,
-            format!("{rate:.0}")
+            "threads={:>2} durable: {} in {:?} => {:.0}/s",
+            threads, total, dt, rate
         );
     }
 
