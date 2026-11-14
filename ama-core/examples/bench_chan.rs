@@ -7,8 +7,8 @@
 //!   * `two`    — encode off the lock, then lock only for write+flush (the
 //!     current agentd two-phase refactor).
 //!   * `chan`   — producers push pre-encoded bytes to an mpsc channel; a single
-//!                writer thread drains and writes. The socket Mutex is gone; the
-//!                only lock is the brief channel push.
+//!     writer thread drains and writes. The socket Mutex is gone; the
+//!     only lock is the brief channel push.
 //!
 //! Metric: heartbeat tail latency (the watchdog liveness signal) and task
 //! throughput. Larger payloads make the encode the dominant cost so the
