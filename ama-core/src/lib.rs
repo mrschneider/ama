@@ -898,8 +898,10 @@ impl Ledger {
             if writer.is_none() || disk != handle {
                 *writer = Some(self.open_handle()?);
                 // Re-sync the in-memory length to the freshly opened file.
-                self.seg_len
-                    .store(writer.as_ref().unwrap().metadata()?.len(), Ordering::Relaxed);
+                self.seg_len.store(
+                    writer.as_ref().unwrap().metadata()?.len(),
+                    Ordering::Relaxed,
+                );
             }
             // PERF: use the in-memory segment length instead of a per-append
             // fstat. The value is updated after every successful write and
@@ -999,8 +1001,7 @@ impl Ledger {
         self.snapshot_bytes
             .store(bytes.len() as u64, Ordering::Relaxed);
         // Reset the in-memory segment length: the new file is just the snapshot.
-        self.seg_len
-            .store(bytes.len() as u64, Ordering::Relaxed);
+        self.seg_len.store(bytes.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
