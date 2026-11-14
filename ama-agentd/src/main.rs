@@ -11,7 +11,7 @@ use ama_core::{read_msgpack_frame, read_proto_frame, write_envelope, Peer, Wire}
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,6 +67,10 @@ struct Task {
     name: String,
     caps: Vec<String>,
     steps: Vec<Step>,
+    /// if true, loop back to step 0 after the task completes (sustained
+    /// load / long-running agent). Default false (run-to-completion).
+    #[serde(default)]
+    repeat: bool,
 }
 
 fn main() {
@@ -254,9 +258,31 @@ fn main() {
         });
     }
 
+    // The send helper is TWO-PHASE on purpose. The FIRST phase ENCODES the
+    // envelope to bytes OUTSIDE the writer lock; the SECOND phase locks the
+    // writer and writes the finished buffer. A naive single-phase send
+    // (lock -> write_envelope -> write_all -> flush) held the writer lock
+    // across the full JSON serialization pass, so the heartbeat thread and
+    // every task step serialized back-to-back on ONE lock — the heartbeat
+    // (every 150 ms) and the task loop were effectively mutually exclusive.
+    // Encoding off-lock lets the two producers run in parallel; the writer
+    // lock is now held only for the (cheap) write_all + flush, so the
+    // heartbeat never blocks waiting for a task step to finish serializing.
+    //
+    // `write_envelope` is kept for the caller that builds an envelope inline
+    // (e.g. the reader's disconnected marker) where the two-phase split
+    // would not help; the hot step path always goes through `send_encoded`.
     let send = |writer: &Arc<Mutex<Peer>>, v: &Value| {
+        let buf = ama_core::encode_envelope(wire, v).expect("encode");
         let mut w = writer.lock().unwrap();
-        write_envelope(&mut *w, wire, v).expect("send")
+        w.write_all(&buf).expect("send");
+        w.flush().expect("send")
+    };
+    // Encode ONCE, send the finished buffer (lock only for the write).
+    let send_encoded = |writer: &Arc<Mutex<Peer>>, buf: &[u8]| {
+        let mut w = writer.lock().unwrap();
+        w.write_all(buf).expect("send");
+        w.flush().expect("send")
     };
 
     // register
@@ -387,70 +413,67 @@ fn main() {
         }
     };
 
-    while idx < task.steps.len() {
-        if std::env::var("AMA_DEBUG_STEP").is_ok() {
-            eprintln!(
-                "[agentd {}] step {} at {:?}",
-                task.name,
-                idx,
-                std::time::SystemTime::now()
-            );
-        }
-        last_step.store(idx as u64, Ordering::SeqCst);
-        let step = &task.steps[idx];
-        match step {
-            Step::Checkpoint { state } => {
-                send(
-                    &writer,
-                    &json!({"kind": "checkpoint", "uin": uin, "state": {"step_index": idx + 1, "state": state}}),
+    // When repeat is set, loop back to step 0 after the task completes.
+    loop {
+        while idx < task.steps.len() {
+            if std::env::var("AMA_DEBUG_STEP").is_ok() {
+                eprintln!(
+                    "[agentd {}] step {} at {:?}",
+                    task.name,
+                    idx,
+                    std::time::SystemTime::now()
                 );
-                drain_acks(&inbox);
             }
-            Step::Send { to, body } => {
-                send(
-                    &writer,
-                    &json!({"kind": "send", "uin": uin, "to": to, "body": body}),
-                );
-                drain_acks(&inbox);
-            }
-            Step::Relay { timeout_ms, next } => {
-                // this step is an I/O wait: declare it BLOCKED so the
-                // progress watchdog does not read it as a reasoning loop
-                phase.store(1, Ordering::SeqCst);
-                // wait for a bundle frame (the kernel hands custody here)
-                let deadline = std::time::Instant::now() + Duration::from_millis(*timeout_ms);
-                let mut bundle: Option<Value> = None;
-                while std::time::Instant::now() < deadline {
-                    let got = inbox.lock().unwrap().pop_front();
-                    if let Some(v) = got {
-                        if v.get("kind").and_then(Value::as_str) == Some("bundle") {
-                            bundle = Some(v);
-                            break;
-                        }
-                        continue;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                if let Some(b) = bundle {
-                    let bundle_id = b.get("bundle_id").and_then(Value::as_u64).unwrap_or(0);
-                    let hops = b.get("hops").and_then(Value::as_u64).unwrap_or(0);
-                    // a fragment is its own custody unit: the ack names
-                    // the index so the kernel releases exactly it
-                    let frag_index = b
-                        .get("frag")
-                        .and_then(|f| f.get("index"))
-                        .and_then(Value::as_u64);
-                    // custody transfer: the relay owns it now, the kernel
-                    // drops its copy when it sees this ack
-                    send(
-                        &writer,
-                        &json!({"kind": "custody_ack", "uin": uin,
-                                "bundle_id": bundle_id, "frag_index": frag_index}),
-                    );
+            last_step.store(idx as u64, Ordering::SeqCst);
+            let step = &task.steps[idx];
+            match step {
+                Step::Checkpoint { state } => {
+                    let env = json!({"kind": "checkpoint", "uin": uin, "state": {"step_index": idx + 1, "state": state}});
+                    let buf = ama_core::encode_envelope(wire, &env).expect("encode");
+                    send_encoded(&writer, &buf);
                     drain_acks(&inbox);
-                    send(
-                        &writer,
-                        &json!({
+                }
+                Step::Send { to, body } => {
+                    let env = json!({"kind": "send", "uin": uin, "to": to, "body": body});
+                    let buf = ama_core::encode_envelope(wire, &env).expect("encode");
+                    send_encoded(&writer, &buf);
+                    drain_acks(&inbox);
+                }
+                Step::Relay { timeout_ms, next } => {
+                    // this step is an I/O wait: declare it BLOCKED so the
+                    // progress watchdog does not read it as a reasoning loop
+                    phase.store(1, Ordering::SeqCst);
+                    // wait for a bundle frame (the kernel hands custody here)
+                    let deadline = std::time::Instant::now() + Duration::from_millis(*timeout_ms);
+                    let mut bundle: Option<Value> = None;
+                    while std::time::Instant::now() < deadline {
+                        let got = inbox.lock().unwrap().pop_front();
+                        if let Some(v) = got {
+                            if v.get("kind").and_then(Value::as_str) == Some("bundle") {
+                                bundle = Some(v);
+                                break;
+                            }
+                            continue;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    if let Some(b) = bundle {
+                        let bundle_id = b.get("bundle_id").and_then(Value::as_u64).unwrap_or(0);
+                        let hops = b.get("hops").and_then(Value::as_u64).unwrap_or(0);
+                        // a fragment is its own custody unit: the ack names
+                        // the index so the kernel releases exactly it
+                        let frag_index = b
+                            .get("frag")
+                            .and_then(|f| f.get("index"))
+                            .and_then(Value::as_u64);
+                        // custody transfer: the relay owns it now, the kernel
+                        // drops its copy when it sees this ack
+                        let ack = json!({"kind": "custody_ack", "uin": uin,
+                            "bundle_id": bundle_id, "frag_index": frag_index});
+                        let ack_buf = ama_core::encode_envelope(wire, &ack).expect("encode");
+                        send_encoded(&writer, &ack_buf);
+                        drain_acks(&inbox);
+                        let rel = json!({
                             "kind": "relay",
                             "uin": uin,
                             "bundle_id": bundle_id,
@@ -460,52 +483,64 @@ fn main() {
                             "next": next.clone(),
                             "frag": b.get("frag").cloned().unwrap_or(Value::Null),
                             "body": b.get("body").cloned().unwrap_or(Value::Null),
-                        }),
-                    );
+                        });
+                        let rel_buf = ama_core::encode_envelope(wire, &rel).expect("encode");
+                        send_encoded(&writer, &rel_buf);
+                        drain_acks(&inbox);
+                    }
+                    phase.store(0, Ordering::SeqCst);
+                }
+                Step::Note { msg } => {
+                    let env = json!({"kind": "note", "uin": uin, "text": msg});
+                    let buf = ama_core::encode_envelope(wire, &env).expect("encode");
+                    send_encoded(&writer, &buf);
                     drain_acks(&inbox);
                 }
-                phase.store(0, Ordering::SeqCst);
-            }
-            Step::Note { msg } => {
-                send(&writer, &json!({"kind": "note", "uin": uin, "text": msg}));
-                drain_acks(&inbox);
-            }
-            Step::Wait => {
-                phase.store(1, Ordering::SeqCst);
-                loop {
-                    let got = inbox.lock().unwrap().pop_front();
-                    if let Some(v) = got {
-                        if v.get("kind").and_then(Value::as_str) == Some("msg") {
-                            break;
+                Step::Wait => {
+                    phase.store(1, Ordering::SeqCst);
+                    loop {
+                        let got = inbox.lock().unwrap().pop_front();
+                        if let Some(v) = got {
+                            if v.get("kind").and_then(Value::as_str) == Some("msg") {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
+                        std::thread::sleep(Duration::from_millis(20));
                     }
-                    std::thread::sleep(Duration::from_millis(20));
+                    phase.store(0, Ordering::SeqCst);
                 }
-                phase.store(0, Ordering::SeqCst);
-            }
-            Step::Crash => {
-                eprintln!("[agentd {}] CRASH injected at step {}", task.name, idx);
-                std::process::exit(1);
-            }
-            Step::Loop { ms } => {
-                // an infinite reasoning loop: heartbeat keeps flowing but the
-                // step NEVER advances — the kernel's progress watchdog fires
-                let deadline = std::time::Instant::now() + Duration::from_millis(*ms);
-                while std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(50));
+                Step::Crash => {
+                    eprintln!("[agentd {}] CRASH injected at step {}", task.name, idx);
+                    std::process::exit(1);
+                }
+                Step::Loop { ms } => {
+                    // an infinite reasoning loop: heartbeat keeps flowing but the
+                    // step NEVER advances — the kernel's progress watchdog fires
+                    let deadline = std::time::Instant::now() + Duration::from_millis(*ms);
+                    while std::time::Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                Step::Sleep { ms } => {
+                    phase.store(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(*ms));
+                    phase.store(0, Ordering::SeqCst);
                 }
             }
-            Step::Sleep { ms } => {
-                phase.store(1, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(*ms));
-                phase.store(0, Ordering::SeqCst);
-            }
+            idx += 1;
         }
-        idx += 1;
+        // reached the end of the steps
+        if task.repeat {
+            idx = 0; // loop back to step 0 for sustained load
+            continue;
+        }
+        break; // run-to-completion: exit the loop
     }
     eprintln!("[agentd {}] task complete", task.name);
-    send(&writer, &json!({"kind": "done", "uin": uin}));
+    let done_env = json!({"kind": "done", "uin": uin});
+    let done_buf = ama_core::encode_envelope(wire, &done_env).expect("encode");
+    send_encoded(&writer, &done_buf);
     std::thread::sleep(Duration::from_millis(200)); // let the ack/EOF settle
     std::process::exit(0);
 }
