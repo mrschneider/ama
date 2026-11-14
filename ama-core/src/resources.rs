@@ -155,16 +155,28 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_budgets() {
-        let l = ResourceLimits { max_connections: 0, ..Default::default() };
+        let l = ResourceLimits {
+            max_connections: 0,
+            ..Default::default()
+        };
         assert!(l.validate().is_err());
 
-        let l = ResourceLimits { max_custody_bytes: 0, ..Default::default() };
+        let l = ResourceLimits {
+            max_custody_bytes: 0,
+            ..Default::default()
+        };
         assert!(l.validate().is_err());
 
-        let l = ResourceLimits { handshake_timeout_ms: 0, ..Default::default() };
+        let l = ResourceLimits {
+            handshake_timeout_ms: 0,
+            ..Default::default()
+        };
         assert!(l.validate().is_err());
 
-        let l = ResourceLimits { idle_timeout_ms: 0, ..Default::default() };
+        let l = ResourceLimits {
+            idle_timeout_ms: 0,
+            ..Default::default()
+        };
         assert!(l.validate().is_err());
     }
 

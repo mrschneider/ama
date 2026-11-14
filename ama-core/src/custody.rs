@@ -68,16 +68,8 @@ impl CustodyStore {
         let size = serde_json::to_vec(&bundle.body)
             .map_err(|e| format!("custody restore: cannot re-encode body: {e}"))?
             .len();
-        let sender = self
-            .sender_bytes
-            .get(&bundle.from)
-            .copied()
-            .unwrap_or(0);
-        let target = self
-            .destination_bytes
-            .get(&bundle.to)
-            .copied()
-            .unwrap_or(0);
+        let sender = self.sender_bytes.get(&bundle.from).copied().unwrap_or(0);
+        let target = self.destination_bytes.get(&bundle.to).copied().unwrap_or(0);
         if size > self.max_bytes.saturating_sub(self.bytes)
             || size > self.max_sender_bytes.saturating_sub(sender)
             || size > self.max_destination_bytes.saturating_sub(target)
@@ -359,11 +351,19 @@ mod tests {
     fn acknowledge_removes_matching_fragments() {
         let mut s = CustodyStore::default();
         let b1 = DtnBundle {
-            frag: Some(FragMeta { id: 200, index: 0, total: 2 }),
+            frag: Some(FragMeta {
+                id: 200,
+                index: 0,
+                total: 2,
+            }),
             ..mk_bundle(1, 2, 200, Some(50))
         };
         let b2 = DtnBundle {
-            frag: Some(FragMeta { id: 200, index: 1, total: 2 }),
+            frag: Some(FragMeta {
+                id: 200,
+                index: 1,
+                total: 2,
+            }),
             ..mk_bundle(1, 2, 200, Some(50))
         };
         s.insert(b1).unwrap();
