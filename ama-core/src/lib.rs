@@ -645,6 +645,10 @@ pub struct Ledger {
     failed: std::sync::atomic::AtomicBool,
     segment_bytes: AtomicU64,
     snapshot_bytes: AtomicU64,
+    /// PERF: in-memory segment length — avoids a per-append fstat for the
+    /// rotation-size check. Updated atomically after every write; reset on
+    /// rotate. Initialized from the on-disk size at open() time.
+    seg_len: AtomicU64,
     pub outbound_budget: Arc<resources::ByteBudget>,
     outbound_agent_limit: AtomicU64,
     agent_outbound_budgets: Mutex<HashMap<u64, std::sync::Weak<resources::ByteBudget>>>,
@@ -820,6 +824,9 @@ impl Ledger {
             Err(e) => return Err(e),
         }
         let seq = AtomicU64::new(sequence);
+        // PERF: initialize the in-memory segment length from disk so the
+        // first append doesn't need a fstat to learn the current size.
+        let seg_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         Ok(Ledger {
             path: path.to_path_buf(),
             seq,
@@ -828,6 +835,7 @@ impl Ledger {
             failed: std::sync::atomic::AtomicBool::new(false),
             segment_bytes: AtomicU64::new(64 << 20),
             snapshot_bytes: AtomicU64::new(snapshot_bytes),
+            seg_len: AtomicU64::new(seg_len),
             outbound_budget: Arc::new(resources::ByteBudget::new(64 << 20)),
             outbound_agent_limit: AtomicU64::new(OUTBOUND_QUEUE_BYTES as u64),
             agent_outbound_budgets: Mutex::new(HashMap::new()),
@@ -889,15 +897,18 @@ impl Ledger {
                 .map(|m| (m.dev(), m.ino()));
             if writer.is_none() || disk != handle {
                 *writer = Some(self.open_handle()?);
+                // Re-sync the in-memory length to the freshly opened file.
+                self.seg_len
+                    .store(writer.as_ref().unwrap().metadata()?.len(), Ordering::Relaxed);
             }
-            let file = writer.as_mut().unwrap();
-            // Single size check: reuse the same metadata read for the
-            // rotation trigger instead of a second metadata() call.
+            // PERF: use the in-memory segment length instead of a per-append
+            // fstat. The value is updated after every successful write and
+            // reset on rotate, so it tracks the file size exactly.
             let limit = self.segment_bytes.load(Ordering::Relaxed);
             if limit > 0
-                && file
-                    .metadata()?
-                    .len()
+                && self
+                    .seg_len
+                    .load(Ordering::Relaxed)
                     .saturating_sub(self.snapshot_bytes.load(Ordering::Relaxed))
                     >= limit
             {
@@ -916,6 +927,9 @@ impl Ledger {
             bytes.push(b'\n');
             let file = writer.as_mut().unwrap();
             file.write_all(&bytes)?;
+            // Update the in-memory length: O(1) atomic add, no syscall.
+            self.seg_len
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             if durable {
                 file.sync_data()?;
                 Self::sync_parent(&self.path)?;
@@ -983,6 +997,9 @@ impl Ledger {
         Self::sync_parent(&self.path)?;
         *writer = Some(self.open_handle()?);
         self.snapshot_bytes
+            .store(bytes.len() as u64, Ordering::Relaxed);
+        // Reset the in-memory segment length: the new file is just the snapshot.
+        self.seg_len
             .store(bytes.len() as u64, Ordering::Relaxed);
         Ok(())
     }
@@ -1101,7 +1118,7 @@ pub struct Kernel {
     pub socket_path: std::path::PathBuf,
     pub ledger: Arc<Ledger>,
     pub agents: Arc<Mutex<HashMap<u64, Arc<Mutex<ProcEntry>>>>>,
-    by_name: Arc<Mutex<HashMap<String, u64>>>,
+    by_name: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     next_uin: AtomicU64,
     pub hb_timeout_ms: u64,
     pub hb_interval_ms: u64,
@@ -1162,7 +1179,7 @@ impl Kernel {
             // the manifest's kernel.ledger_verbose can override it
             ledger_verbose: std::env::var("AMA_LEDGER_VERBOSE").is_ok(),
             agents: Arc::new(Mutex::new(HashMap::new())),
-            by_name: Arc::new(Mutex::new(HashMap::new())),
+            by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
             next_uin: AtomicU64::new(0),
             hb_timeout_ms,
             hb_interval_ms,
@@ -1333,7 +1350,7 @@ impl Kernel {
     /// harnesses register hand-built process-table entries through this —
     /// the by-name map is otherwise reachable only via spawn_agent.
     pub fn bind_name(&self, name: &str, uin: u64) {
-        self.by_name.lock().unwrap().insert(name.into(), uin);
+        self.by_name.write().unwrap().insert(name.into(), uin);
     }
 
     /// Spawn an agent process from a manifest entry. The process is the
@@ -1546,7 +1563,7 @@ impl Kernel {
             }
         }
         self.agents.lock().unwrap().insert(uin, entry);
-        self.by_name.lock().unwrap().insert(name.into(), uin);
+        self.by_name.write().unwrap().insert(name.into(), uin);
         // QoS registration: the sender's token bucket is installed at
         // spawn time so a rate limit applies from the FIRST envelope
         if let Some(q) = qos {
@@ -1613,7 +1630,7 @@ impl Kernel {
         }
         let uin = self
             .by_name
-            .lock()
+            .read()
             .unwrap()
             .get(to)
             .copied()
@@ -2073,7 +2090,7 @@ impl Kernel {
         let next = if allow_routing {
             self.routes
                 .get(to_name)
-                .and_then(|via| self.by_name.lock().unwrap().get(via).copied())
+                .and_then(|via| self.by_name.read().unwrap().get(via).copied())
         } else {
             None
         };
@@ -3339,7 +3356,7 @@ impl Router {
                             .collect()
                     })
                     .unwrap_or_default();
-                let uin = kernel.by_name.lock().unwrap().get(name).copied();
+                let uin = kernel.by_name.read().unwrap().get(name).copied();
                 if let Some(uin) = uin {
                     {
                         let agents = kernel.agents.lock().unwrap();
@@ -3397,7 +3414,7 @@ impl Router {
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let uin = kernel
                     .by_name
-                    .lock()
+                    .read()
                     .unwrap()
                     .get(name)
                     .copied()
@@ -3485,7 +3502,7 @@ impl Router {
                                 .map_err(|e| e.to_string())?;
                             return Err(format!("dtn: hop limit ({}) reached", kernel.max_hops));
                         }
-                        let Some(target) = kernel.by_name.lock().unwrap().get(to_name).copied()
+                        let Some(target) = kernel.by_name.read().unwrap().get(to_name).copied()
                         else {
                             return Err(format!("relay: unknown agent '{to_name}'"));
                         };
@@ -3503,7 +3520,7 @@ impl Router {
                                 return Err("dtn: hop limit reached".to_string());
                             }
                             let Some(next_uin) =
-                                kernel.by_name.lock().unwrap().get(next_name).copied()
+                                kernel.by_name.read().unwrap().get(next_name).copied()
                             else {
                                 return Err(format!("relay: unknown next hop '{next_name}'"));
                             };
@@ -3710,7 +3727,7 @@ impl Router {
             } => {
                 let uin = kernel
                     .by_name
-                    .lock()
+                    .read()
                     .unwrap()
                     .get(&name)
                     .copied()
@@ -4430,7 +4447,7 @@ mod f10_authority_tests {
             .lock()
             .unwrap()
             .insert(uin, Arc::new(Mutex::new(e)));
-        k.by_name.lock().unwrap().insert(name.into(), uin);
+        k.by_name.write().unwrap().insert(name.into(), uin);
     }
 
     /// the ctl socket's DOOR over a REAL socketpair (SO_PEERCRED reports
@@ -5086,7 +5103,7 @@ mod f05_launch_deadline_tests {
             .lock()
             .unwrap()
             .insert(uin, Arc::new(Mutex::new(e)));
-        k.by_name.lock().unwrap().insert("wedged".into(), uin);
+        k.by_name.write().unwrap().insert("wedged".into(), uin);
     }
 
     fn kinds(k: &Kernel) -> Vec<String> {
