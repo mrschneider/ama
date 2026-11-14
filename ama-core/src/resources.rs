@@ -146,3 +146,111 @@ impl Drop for ConnectionReservation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ResourceLimits::validate ──────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_zero_budgets() {
+        let l = ResourceLimits { max_connections: 0, ..Default::default() };
+        assert!(l.validate().is_err());
+
+        let l = ResourceLimits { max_custody_bytes: 0, ..Default::default() };
+        assert!(l.validate().is_err());
+
+        let l = ResourceLimits { handshake_timeout_ms: 0, ..Default::default() };
+        assert!(l.validate().is_err());
+
+        let l = ResourceLimits { idle_timeout_ms: 0, ..Default::default() };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        assert!(ResourceLimits::default().validate().is_ok());
+    }
+
+    // ── ByteBudget ────────────────────────────────────────────────────
+
+    #[test]
+    fn byte_budget_reserve_and_release() {
+        let bb = Arc::new(ByteBudget::new(100));
+        assert_eq!(bb.usage(), (0, 100));
+
+        let r = bb.reserve(60).expect("should fit");
+        assert_eq!(bb.usage(), (60, 100));
+
+        // 60 used + 50 requested > 100 → reject
+        assert!(bb.reserve(50).is_none());
+
+        // 60 used + 40 requested ≤ 100 → ok
+        let r2 = bb.reserve(40).expect("should fit");
+        assert_eq!(bb.usage(), (100, 100));
+
+        // at limit → reject
+        assert!(bb.reserve(1).is_none());
+
+        drop(r);
+        assert_eq!(bb.usage(), (40, 100));
+        drop(r2);
+        assert_eq!(bb.usage(), (0, 100));
+    }
+
+    #[test]
+    fn byte_budget_set_limit() {
+        let bb = Arc::new(ByteBudget::new(100));
+        let _r = bb.reserve(80).unwrap();
+
+        // cannot lower below current usage
+        assert!(bb.set_limit(50).is_err());
+        // cannot set to zero
+        assert!(bb.set_limit(0).is_err());
+        // can raise
+        assert!(bb.set_limit(200).is_ok());
+        assert_eq!(bb.usage(), (80, 200));
+    }
+
+    // ── Connections ───────────────────────────────────────────────────
+
+    #[test]
+    fn connections_per_peer_limit() {
+        let limits = ResourceLimits {
+            max_connections: 10,
+            max_connections_per_peer: 2,
+            ..Default::default()
+        };
+        let c = Arc::new(Connections::new(limits));
+
+        let _a = c.acquire("p1".into()).expect("1st");
+        let _b = c.acquire("p1".into()).expect("2nd");
+        // per-peer limit reached
+        assert!(c.acquire("p1".to_string()).is_none());
+        // other peer still allowed
+        let _c = c.acquire("p2".into()).expect("other peer");
+
+        drop(_a);
+        // one slot freed for p1
+        let _d = c.acquire("p1".into()).expect("after drop");
+
+        drop(_b);
+        drop(_c);
+        drop(_d);
+        assert_eq!(c.stats()["active"], 0);
+    }
+
+    #[test]
+    fn connections_global_limit() {
+        let limits = ResourceLimits {
+            max_connections: 2,
+            max_connections_per_peer: 100,
+            ..Default::default()
+        };
+        let c = Arc::new(Connections::new(limits));
+        let _a = c.acquire("a".into()).unwrap();
+        let _b = c.acquire("b".into()).unwrap();
+        assert!(c.acquire("c".to_string()).is_none());
+    }
+}

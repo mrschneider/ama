@@ -964,7 +964,10 @@ impl DeliverySystem {
             } else {
                 // incomplete: keep the fragments for a later attempt
                 for b in group {
-                    self.bundles.restore(b);
+                    if let Err(_e) = self.bundles.restore(b.clone()) {
+                        // byte budgets no longer have room — journal it
+                        self.expired_report.push(b);
+                    }
                 }
             }
         }
