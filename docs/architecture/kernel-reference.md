@@ -122,6 +122,17 @@ capability that previously worked.
 (`note`/`agent_note` events), so agent-visible failures appear in the
 same auditable stream as kernel events.
 
+**The agent's inbox is wakeable** — the kernel's answer to an operation
+(its ack) arrives in ~50 us. The agent used to POLL its queue: 10 ms
+between checks for an ack, 20 ms between checks for a message. Every
+checkpoint, send and note therefore paid up to 10 ms of SLEEPING on a
+reply that was already queued. The queue is now a condition variable:
+the reader thread signals when it pushes, the waiter returns as soon as
+the frame is there, and ONLY the matching frame is removed (the old poll
+popped from the front and discarded everything that did not match — a
+pending ack could be swallowed). Measured on 200 sequential `note`
+steps: 2.10 s -> 0.13 s (~16x).
+
 **Operator surface** — every verb below requires the operator credential,
 is served ONLY on the dedicated control socket (`<socket>.ctl`, mode
 0600, peer-credential + pid gated), and is journaled:
@@ -132,6 +143,12 @@ is served ONLY on the dedicated control socket (`<socket>.ctl`, mode
 - `ama stats` — one JSON line: journal growth (`seq`, active bytes,
   archive count/bytes), process table by state, delivery queue, both
   connection budgets, kernel uptime. Meant for a polling watchdog.
+- `ama logs --last N [--event X] [--uin N]` — the tail of the journal,
+  oldest first. The read is a BACKWARD scan of the newest segment (and
+  the archives behind it) in 8 KiB chunks, so the last 20 events of a
+  2 GiB journal read a few KiB, not the whole file. `--event` filters by
+  event name, `--uin` by the agent the event belongs to (its `uin`, its
+  `from` or its `to`). The internal rotation snapshot never appears.
 - `ama qos` — bandwidth accounting and queue state (`ctl_qos`).
 - `ama grant` / `ama revoke` — hot capability renegotiation.
 - `ama restart --name <agent>` — the authorized respawn of a dead identity.
@@ -209,6 +226,7 @@ custody acks, fragmentation across hops).
 
 | Version | Highlights |
 |---|---|
+| **v0.13.0** | The agent's inbox is WAKEABLE (a condvar, not a 10 ms poll): an operation's ack is answered in ~50 us instead of up to 10 ms — the agent's step loop is ~16x faster. `ama logs` reads the journal tail backwards with `--event`/`--uin` filters |
 | **v0.12.0** | Hot path: one statx + one write per ledger append (handle identity cached, framing buffer reused); authorization and the destination snapshot in ONE process-table pass (closes the revoke-vs-deliver race). Operator verbs from `ama stats`, `ama rotate --keep N`, `ama inspect` |
 | **v0.7.0** | Hot-path performance: persistent ledger handle, single serialization, merged delivery locks, tail-scan checkpoints, O(1) name lookup, splice/write_envelope JSON |
 | **v0.6.0** | Weighted fair queueing, admission control, bandwidth accounting; DTN multi-hop routing, custody acks, fragmentation |

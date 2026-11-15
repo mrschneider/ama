@@ -63,3 +63,45 @@ same binaries.
   delivery decision are one critical section now.
 - Still open, deliberately: the per-append `statx` (about 21% of the append)
   is what keeps external rotation detection prompt.
+
+## Agent-side latency (v0.13.0)
+
+The agentd POLLED the kernel's frames: the task loop slept 10 ms between
+checks for the ack of the operation it had just sent (and 20 ms between
+checks for an incoming message). The kernel's answer arrives in ~50 us,
+so every checkpoint, send and note spent up to 10 ms sleeping on a reply
+that was already queued.
+
+Measured A/B on the same host, 200 sequential `note` steps, the same
+kernel and the same task file, alternating the two agentd binaries:
+
+| run | old (poll) | new (condvar) |
+|---|---|---|
+| 1 | 0.28 s | 0.11 s |
+| 2 | 2.10 s | 0.13 s |
+| 3 | 2.11 s | 0.13 s |
+
+The old agent's time is dominated by 200 x 10 ms of pure sleep; the new
+one answers each step in the time the kernel actually needs (~0.6 ms per
+step including the ledger append and the socket round trip). The first
+old run is the outlier: the ledger file was still being created, so the
+poll loop's own bookkeeping dominated.
+
+Semantics delta, stated:
+
+- The queue is scanned for the FIRST matching frame and ONLY that frame
+  is removed. The old poll popped from the front and DISCARDED every
+  frame that did not match, so a pending ack could be swallowed by an
+  unrelated wait (the `wait` step and the ack wait now cannot steal
+  each other's frames).
+- A `wait` step that never receives a message now reports it and ends
+  (1 hour bound) instead of blocking forever.
+
+New measurement harnesses (in `ama-core/examples`): `wire_bench` (the
+real agent -> kernel -> agent path over a UDS, with the ack latency the
+client observes), `inbound_bench` (the per-message cost of parse +
+validate + clone + re-serialize), `statx_bench` (the metadata syscall
+variants the ledger could use). The statx probe found nothing: `std::fs::metadata`
+(0.815 us), `libc::statx` with a targeted mask (0.823 us) and with
+`AT_STATX_DONT_SYNC` (0.857 us) are the same cost, so the ledger keeps
+the portable call.

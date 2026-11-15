@@ -594,6 +594,145 @@ fn kernel_stats_report_the_table_the_journal_and_the_budgets() {
     assert!(stats["connections"].get("active").is_some());
 }
 
+/// The journal tail: the newest events, oldest first, filtered.
+#[test]
+fn the_journal_tail_returns_the_newest_events_filtered() {
+    let dir = Temp::new();
+    let path = dir.0.join("ledger");
+    let ledger = Ledger::open(&path).unwrap();
+    for i in 0..50u64 {
+        ledger
+            .append(
+                if i % 5 == 0 {
+                    "checkpoint"
+                } else {
+                    "delivered"
+                },
+                json!({"i": i, "from": 1, "to": 2, "uin": 1}),
+            )
+            .unwrap();
+    }
+    let tail = ledger.tail(10, None, None);
+    assert_eq!(tail.len(), 10);
+    assert!(
+        tail.windows(2).all(|w| w[0].seq < w[1].seq),
+        "the tail is ordered oldest first"
+    );
+    assert_eq!(tail.last().unwrap().seq, 50, "the newest event is last");
+    assert_eq!(tail.first().unwrap().seq, 41);
+
+    let only_checkpoints = ledger.tail(100, Some("checkpoint"), None);
+    assert!(!only_checkpoints.is_empty());
+    assert!(only_checkpoints.iter().all(|e| e.ev == "checkpoint"));
+    assert_eq!(
+        only_checkpoints.len(),
+        10,
+        "50 events, every 5th is a checkpoint"
+    );
+
+    let by_uin = ledger.tail(100, None, Some(1));
+    assert!(!by_uin.is_empty());
+    assert!(by_uin
+        .iter()
+        .all(|e| { e.detail["uin"] == 1 || e.detail["from"] == 1 || e.detail["to"] == 1 }));
+
+    let nothing = ledger.tail(10, Some("no_such_event"), None);
+    assert!(
+        nothing.is_empty(),
+        "a filter that matches nothing returns nothing"
+    );
+}
+
+/// The tail reads ACROSS a rotation: the newest segment plus the archives.
+#[test]
+fn the_journal_tail_spans_the_rotation_boundary() {
+    let dir = Temp::new();
+    let path = dir.0.join("ledger");
+    let ledger = Ledger::open(&path).unwrap();
+    for i in 0..10u64 {
+        ledger.append("tick", json!({"i": i})).unwrap();
+    }
+    ledger.rotate().unwrap();
+    for i in 10..20u64 {
+        ledger.append("tick", json!({"i": i})).unwrap();
+    }
+    let tail = ledger.tail(15, None, None);
+    assert_eq!(tail.len(), 15, "the tail spans both segments");
+    assert!(
+        tail.windows(2).all(|w| w[0].seq < w[1].seq),
+        "the order survives the segment boundary"
+    );
+    assert_eq!(tail.last().unwrap().seq, 20);
+}
+
+/// The wakeable inbox: the waiter is woken by the push, and ONLY the
+/// matching frame is removed.
+#[test]
+fn the_inbox_wakes_the_waiter_and_keeps_the_other_frames() {
+    use crate::inbox::Inbox;
+    let inbox: std::sync::Arc<Inbox<Value>> = std::sync::Arc::new(Inbox::new());
+    // the non-matching frame is queued FIRST: it must survive the wait
+    inbox.push(json!({"kind": "acked"}));
+    let t0 = Instant::now();
+    let producer = {
+        let inbox = inbox.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            inbox.push(json!({"kind": "msg", "body": 1}));
+        })
+    };
+    let got = inbox.pop_matching(Duration::from_secs(5), |v| {
+        v.get("kind").and_then(Value::as_str) == Some("msg")
+    });
+    let waited = t0.elapsed();
+    assert!(got.is_some(), "the waiter was woken by the push");
+    assert!(
+        waited < Duration::from_secs(1),
+        "it waited for the frame, not a timeout"
+    );
+    assert_eq!(inbox.len(), 1, "the non-matching frame stays queued");
+    let ack = inbox.pop_matching(Duration::from_millis(100), |v| {
+        v.get("kind").and_then(Value::as_str) == Some("acked")
+    });
+    assert!(ack.is_some(), "the other frame is still there");
+    producer.join().unwrap();
+}
+
+/// A timeout returns None — it never blocks forever.
+#[test]
+fn the_inbox_times_out_instead_of_blocking_forever() {
+    use crate::inbox::Inbox;
+    let inbox: std::sync::Arc<Inbox<Value>> = std::sync::Arc::new(Inbox::new());
+    let t0 = Instant::now();
+    let got = inbox.pop_matching(Duration::from_millis(80), |v| {
+        v.get("kind").and_then(Value::as_str) == Some("never")
+    });
+    assert!(got.is_none());
+    assert!(
+        t0.elapsed() >= Duration::from_millis(70),
+        "it waited the timeout"
+    );
+}
+
+/// The agentd's inbox must not lose a pending ack: the old poll popped
+/// from the front and DISCARDED everything that did not match.
+#[test]
+fn the_inbox_never_discards_a_frame_that_did_not_match() {
+    use crate::inbox::Inbox;
+    let inbox: std::sync::Arc<Inbox<Value>> = std::sync::Arc::new(Inbox::new());
+    inbox.push(json!({"kind": "acked", "seq": 1}));
+    inbox.push(json!({"kind": "msg", "body": "x"}));
+    let msg = inbox.pop_matching(Duration::from_millis(50), |v| {
+        v.get("kind").and_then(Value::as_str) == Some("msg")
+    });
+    assert!(msg.is_some());
+    assert_eq!(inbox.len(), 1, "the ack survived the msg wait");
+    let ack = inbox.pop_matching(Duration::from_millis(50), |v| {
+        v.get("kind").and_then(Value::as_str) == Some("acked")
+    });
+    assert!(ack.is_some(), "the ack is still there");
+}
+
 #[test]
 fn reconnects_share_agent_budget_until_last_reservation_drops() {
     let dir = Temp::new();

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod custody;
+pub mod inbox;
 pub mod proto;
 pub mod qos;
 pub mod resources;
@@ -1150,6 +1151,133 @@ impl Ledger {
             );
         }
         Ok(removed)
+    }
+
+    /// The TAIL of the journal: the newest events that match the filter,
+    /// oldest first. The files are walked NEWEST FIRST (the active
+    /// segment, then the archives in reverse), and each file is read
+    /// BACKWARDS in 8 KiB chunks — so asking for the last 20 events of a
+    /// 2 GiB journal reads a few KiB, not the whole file.
+    pub fn tail(&self, limit: usize, event: Option<&str>, uin: Option<u64>) -> Vec<LedgerEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut files = self.archive_paths();
+        files.push(self.path.clone());
+        files.reverse(); // newest first
+                         // one chunk per file, newest file first; the chunks are stitched
+                         // back together OLDEST first at the end
+        let mut chunks: Vec<Vec<LedgerEvent>> = Vec::new();
+        let mut total = 0usize;
+        for path in files {
+            let remaining = limit.saturating_sub(total);
+            if remaining == 0 {
+                break;
+            }
+            let mut found = self.tail_file(&path, remaining, event, uin);
+            if found.is_empty() {
+                continue;
+            }
+            found.reverse(); // the scan is newest-first
+            total += found.len();
+            chunks.push(found);
+        }
+        let mut out: Vec<LedgerEvent> = Vec::new();
+        for chunk in chunks.iter().rev() {
+            out.extend(chunk.iter().cloned());
+        }
+        out.truncate(limit);
+        out
+    }
+
+    /// Does this event match the operator's filter?
+    fn matches(ev: &LedgerEvent, event: Option<&str>, uin: Option<u64>) -> bool {
+        if let Some(name) = event {
+            if ev.ev != name {
+                return false;
+            }
+        }
+        if let Some(u) = uin {
+            let d = &ev.detail;
+            let hit = d.get("uin").and_then(Value::as_u64) == Some(u)
+                || d.get("from").and_then(Value::as_u64) == Some(u)
+                || d.get("to").and_then(Value::as_u64) == Some(u);
+            if !hit {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The newest matching events of ONE file, newest first.
+    fn tail_file(
+        &self,
+        path: &std::path::Path,
+        limit: usize,
+        event: Option<&str>,
+        uin: Option<u64>,
+    ) -> Vec<LedgerEvent> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut out = Vec::new();
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return out,
+        };
+        let len = match f.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => return out,
+        };
+        if len == 0 {
+            return out;
+        }
+        let mut chunk = vec![0u8; 8192];
+        // the trailing partial line is handled by the same scan: the
+        // bytes before the first '\n' of the LAST chunk are the oldest
+        // record and may be incomplete — only COMPLETE lines are parsed
+        let mut pos = len;
+        let mut carry: Vec<u8> = Vec::new();
+        while pos > 0 && out.len() < limit {
+            let take = (chunk.len() as u64).min(pos) as usize;
+            pos -= take as u64;
+            if f.seek(SeekFrom::Start(pos)).is_err() {
+                break;
+            }
+            if f.read_exact(&mut chunk[..take]).is_err() {
+                break;
+            }
+            let mut block = chunk[..take].to_vec();
+            block.extend_from_slice(&carry);
+            // split into complete lines, newest last
+            let mut lines: Vec<&[u8]> = Vec::new();
+            let mut start = 0usize;
+            for (i, b) in block.iter().enumerate() {
+                if *b == b'\n' {
+                    lines.push(&block[start..i]);
+                    start = i + 1;
+                }
+            }
+            carry = block[start..].to_vec();
+            for line in lines.iter().rev() {
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(ev) = serde_json::from_slice::<LedgerEvent>(line) {
+                    // the rotation snapshot is INTERNAL (its seq
+                    // duplicates the last archived event) — the journal
+                    // the operator reads never shows it
+                    if ev.ev == "ledger_snapshot" {
+                        continue;
+                    }
+                    if Self::matches(&ev, event, uin) {
+                        out.push(ev);
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub fn read_all(&self) -> Vec<LedgerEvent> {
@@ -3630,6 +3758,22 @@ impl Router {
                     .ok();
                 kernel.restart_authorized(uin)?;
                 out.send(&json!({"kind": "restarted", "name": name}))
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            "ctl_logs" => {
+                // The journal tail: the newest events, filtered. The read
+                // is a BACKWARD scan of the newest segment(s) — asking
+                // for 20 events of a 2 GiB journal reads a few KiB.
+                let limit = v
+                    .get("last")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 1000) as usize;
+                let event = v.get("event").and_then(Value::as_str);
+                let uin = v.get("uin").and_then(Value::as_u64);
+                let events = kernel.ledger.tail(limit, event, uin);
+                out.send(&json!({"kind": "logs", "events": events}))
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }

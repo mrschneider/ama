@@ -156,6 +156,47 @@ missing_out, missing_rc = cli("inspect", "--socket", SOCK, "--name", "nobody")
 ok("inspect: an unknown agent is an error, not an empty success",
    missing_rc != 0, f"rc={missing_rc} out={missing_out[:120]}")
 
+# ---- 3. the journal tail (ama logs) ----------------------------------
+out, rc = cli("logs", "--socket", SOCK, "--last", "5")
+ok("logs: the verb succeeds", rc == 0, out)
+try:
+    lg = json.loads(out)
+except Exception:
+    lg = {}
+ok("logs: the reply carries the events", lg.get("kind") == "logs" and lg.get("events"), out[:200])
+ok("logs: the tail is bounded by --last",
+   isinstance(lg.get("events"), list) and len(lg["events"]) <= 5, str(len(lg.get("events", []))))
+ok("logs: the tail is ordered oldest first",
+   all(lg["events"][i]["seq"] < lg["events"][i + 1]["seq"]
+       for i in range(len(lg["events"]) - 1)),
+   str([e["seq"] for e in lg.get("events", [])]))
+out, rc = cli("logs", "--socket", SOCK, "--last", "50", "--event", "registered")
+try:
+    filt = json.loads(out)
+except Exception:
+    filt = {}
+ok("logs: the event filter works",
+   bool(filt.get("events")) and all(e["ev"] == "registered" for e in filt["events"]),
+   out[:200])
+out, rc = cli("logs", "--socket", SOCK, "--last", "50", "--uin", "0")
+try:
+    byuin = json.loads(out)
+except Exception:
+    byuin = {}
+ok("logs: the uin filter works",
+   bool(byuin.get("events"))
+   and all(
+       e["detail"].get("uin") == 0
+       or e["detail"].get("from") == 0
+       or e["detail"].get("to") == 0
+       for e in byuin["events"]
+   ),
+   out[:200])
+# the journal tail must not leak the INTERNAL rotation snapshot
+allkinds = {e["ev"] for e in lg.get("events", [])}
+ok("logs: the internal rotation snapshot is not shown",
+   "ledger_snapshot" not in allkinds, str(allkinds))
+
 # ---- 3. rotate + retention ------------------------------------------
 before = len(events())
 out, rc = cli("rotate", "--socket", SOCK, "--keep", "2")
@@ -220,6 +261,12 @@ archives_after = [f for f in os.listdir("/tmp/ama_exp11") if ".segment-" in f]
 ok("rotate: exactly ONE archive is retained", len(archives_after) == 1, str(archives_after))
 ok("rotate: the ACTIVE journal was not deleted",
    os.path.exists(LEDGER), LEDGER)
+
+# the internal rotation snapshot never shows up in the operator's tail
+after = json.loads(cli("logs", "--socket", SOCK, "--last", "50")[0])
+ok("logs: the internal rotation snapshot is not shown",
+   all(e["ev"] != "ledger_snapshot" for e in after.get("events", [])),
+   str([e["ev"] for e in after.get("events", [])]))
 
 # the retention is journaled — in the journal that SURVIVED the retention
 evs = events()

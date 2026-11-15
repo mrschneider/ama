@@ -45,6 +45,12 @@ fn main() {
     let mut name = String::new();
     let mut caps = String::new();
     let mut keep: u64 = 0;
+    let mut last: u64 = 20;
+    let mut event = String::new();
+    // Option, not u64: UIN 0 is a LEGITIMATE agent (the first one
+    // registered) — a `--uin 0` filter must reach the kernel, not be
+    // swallowed as "unset".
+    let mut uin: Option<u64> = None;
     let mut strict = false;
     let mut userns = false;
     let mut rest: Vec<String> = Vec::new();
@@ -66,6 +72,9 @@ fn main() {
             "--name" => name = args.next().unwrap_or_default(),
             "--caps" => caps = args.next().unwrap_or_default(),
             "--keep" => keep = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--last" => last = args.next().and_then(|v| v.parse().ok()).unwrap_or(20),
+            "--event" => event = args.next().unwrap_or_default(),
+            "--uin" => uin = args.next().and_then(|v| v.parse().ok()),
             "--strict" => strict = true,
             "--userns" => userns = true,
             other => {
@@ -84,6 +93,16 @@ fn main() {
         "ps" => ps(&ctl_socket),
         "inspect" => inspect(&ctl_socket, &name),
         "stats" => ctl_roundtrip(&ctl_socket, serde_json::json!({"kind": "ctl_stats"})),
+        "logs" => {
+            let mut req = serde_json::json!({"kind": "ctl_logs", "last": last});
+            if !event.is_empty() {
+                req["event"] = serde_json::json!(event);
+            }
+            if let Some(u) = uin {
+                req["uin"] = serde_json::json!(u);
+            }
+            ctl_roundtrip(&ctl_socket, req)
+        }
         "rotate" => {
             let mut req = serde_json::json!({"kind": "ctl_rotate"});
             if keep > 0 {
@@ -118,7 +137,9 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: ama serve|ps|inspect|stats|rotate|qos|grant|revoke|restart|jail");
+            eprintln!(
+                "usage: ama serve|ps|inspect|stats|logs|rotate|qos|grant|revoke|restart|jail"
+            );
             exit(2);
         }
     }

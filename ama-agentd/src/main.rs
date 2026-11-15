@@ -7,10 +7,10 @@
 //! EITHER transport (UDS default, `--tcp host:port` for network-remote)
 //! in EITHER wire format (JSON lines default, `--wire msgpack` binary).
 
+use ama_core::inbox::Inbox;
 use ama_core::{read_msgpack_frame, read_proto_frame, write_envelope, Peer, Wire};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -156,8 +156,15 @@ fn main() {
     let writer: Arc<Mutex<Peer>> = Arc::new(Mutex::new(peer));
 
     // reader thread: kernel pushes (welcome/msg/error) into a queue —
-    // parsed per wire format
-    let inbox: Arc<Mutex<VecDeque<Value>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // parsed per wire format.
+    //
+    // F12: the queue is WAKEABLE. The agent used to POLL it: the task
+    // loop slept 10 ms between checks for the ack of the operation it had
+    // just sent (and 20 ms between checks for an incoming message). The
+    // kernel's answer arrives in ~50 us — so every checkpoint, send and
+    // note spent up to 10 ms SLEEPING on an answer that was already
+    // queued. A condvar turns the poll into a wakeup.
+    let inbox: Arc<Inbox<Value>> = Arc::new(Inbox::new());
     let last_step: Arc<AtomicU64> = Arc::new(AtomicU64::new(0)); // current step index for heartbeats
                                                                  // 0 = executing (watchdog counts stuck sweeps), 1 = blocked on IO/wait
     let phase: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -179,7 +186,7 @@ fn main() {
                             Err(_) => break,
                         }
                         if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
-                            inbox.lock().unwrap().push_back(v);
+                            inbox.push(v);
                         }
                     }
                     alive.store(false, Ordering::SeqCst);
@@ -194,7 +201,7 @@ fn main() {
                             break;
                         }
                         match read_msgpack_frame(&mut r) {
-                            Ok(v) => inbox.lock().unwrap().push_back(v),
+                            Ok(v) => inbox.push(v),
                             Err(_) => break,
                         }
                     }
@@ -206,7 +213,7 @@ fn main() {
                             break;
                         }
                         match read_proto_frame(&mut r) {
-                            Ok(v) => inbox.lock().unwrap().push_back(v),
+                            Ok(v) => inbox.push(v),
                             Err(_) => break,
                         }
                     }
@@ -216,10 +223,7 @@ fn main() {
             // loop terminates instead of hanging forever (all three wire
             // arms converge here)
             alive.store(false, Ordering::SeqCst);
-            inbox
-                .lock()
-                .unwrap()
-                .push_back(json!({"kind": "__disconnected"}));
+            inbox.push(json!({"kind": "__disconnected"}));
         });
     }
 
@@ -296,50 +300,20 @@ fn main() {
     eprintln!("[agentd {}] register sent", task.name);
 
     // process welcome (and any recover state) first
-    let mut uin: u64 = 0;
-    let mut recovered_from: Option<Value> = None;
+    let uin: u64;
+    let recovered_from: Option<Value>;
     // DTN flush delivers the backlog BEFORE the welcome is read: the
     // welcome loop must skip anything that is not a welcome WITHOUT
     // losing it (a backlog message consumed as the welcome would give
-    // the agent a garbage UIN — experiment 006). Non-welcome frames are
-    // collected and pushed back IN ORDER once the welcome is found —
-    // pushing back as we go would cycle the backlog forever and the
-    // welcome at the tail would never be reached.
-    let welcome = {
-        let mut deferred: Vec<Value> = Vec::new();
-        let mut polls: u64 = 0;
-        let w = loop {
-            // pop into a local: the guard drops at the end of THIS
-            // statement, never during the sleep below (holding it across
-            // the sleep starved the reader thread — see header comment)
-            let got = inbox.lock().unwrap().pop_front();
-            match got {
-                Some(v) => {
-                    if v.get("kind").and_then(Value::as_str) == Some("welcome") {
-                        break v;
-                    }
-                    deferred.push(v);
-                }
-                None => {
-                    polls += 1;
-                    if polls.is_multiple_of(1000) {
-                        eprintln!(
-                            "[agentd {}] still waiting for welcome ({} polls)",
-                            task.name, polls
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-        };
-        if !deferred.is_empty() {
-            let mut q = inbox.lock().unwrap();
-            for v in deferred {
-                q.push_back(v);
-            }
-        }
-        Some(w)
-    };
+    // the agent a garbage UIN — experiment 006).
+    //
+    // F12: the queue is scanned for the FIRST welcome and ONLY that
+    // frame is removed — the backlog stays queued, in order. The old
+    // loop popped from the front and pushed the skipped frames back
+    // afterwards, which reordered the backlog and polled every 5 ms.
+    let welcome = inbox.pop_matching(Duration::from_secs(30), |v| {
+        v.get("kind").and_then(Value::as_str) == Some("welcome")
+    });
     if let Some(wl) = welcome {
         eprintln!(
             "[agentd {}] welcome at {:?}",
@@ -352,6 +326,9 @@ fn main() {
             Some(v) if v.is_object() => Some(v.clone()),
             _ => None,
         };
+    } else {
+        eprintln!("[agentd {}] no welcome from the kernel", task.name);
+        std::process::exit(3);
     }
 
     // resume from checkpoint: skip already-completed steps (at-least-once)
@@ -371,25 +348,22 @@ fn main() {
     // ALL as completion, so a rejected operation silently ADVANCED the
     // task). A timeout bounds every wait; a poisoned inbox (disconnect)
     // ends the process — the kernel's watchdog owns what happens next.
+    //
+    // F12: the wait is a WAKEUP, not a poll. The old loop slept 10 ms
+    // between checks, so a reply that arrived in 50 us was still waited
+    // for up to 10 ms. The reply frame is removed from the queue; every
+    // other frame (an incoming `msg`, a bundle) STAYS queued.
     const REPLY_TIMEOUT_MS: u64 = 10_000;
-    let await_reply = |inbox: &Arc<Mutex<VecDeque<Value>>>| -> Result<Value, String> {
-        let deadline = std::time::Instant::now() + Duration::from_millis(REPLY_TIMEOUT_MS);
-        loop {
-            if std::time::Instant::now() > deadline {
-                return Err("reply timeout".to_string());
-            }
-            let mut q = inbox.lock().unwrap();
-            let mut reply: Option<Value> = None;
-            q.retain(|v| {
-                let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
-                if reply.is_none() && matches!(kind, "sent" | "acked" | "error") {
-                    reply = Some(v.clone());
-                    return false; // consumed
-                }
-                true
-            });
-            drop(q);
-            if let Some(r) = reply {
+    let await_reply = |inbox: &Arc<Inbox<Value>>| -> Result<Value, String> {
+        let reply = inbox.pop_matching(Duration::from_millis(REPLY_TIMEOUT_MS), |v| {
+            matches!(
+                v.get("kind").and_then(Value::as_str),
+                Some("sent") | Some("acked") | Some("error")
+            )
+        });
+        match reply {
+            None => Err("reply timeout".to_string()),
+            Some(r) => {
                 if r.get("kind").and_then(Value::as_str) == Some("error") {
                     return Err(r
                         .get("reason")
@@ -397,16 +371,15 @@ fn main() {
                         .unwrap_or("error")
                         .to_string());
                 }
-                return Ok(r);
+                Ok(r)
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
     };
     // explicit outcome policy: a failed operation is LOGGED LOUDLY (the
     // step still advances — the historical scripted-task contract — but
     // the failure is visible on stderr and the journal instead of being
     // conflated with success)
-    let drain_acks = |inbox: &Arc<Mutex<VecDeque<Value>>>| match await_reply(inbox) {
+    let drain_acks = |inbox: &Arc<Inbox<Value>>| match await_reply(inbox) {
         Ok(_) => {}
         Err(reason) => {
             eprintln!("[agentd {}] OPERATION FAILED: {reason}", task.name);
@@ -444,19 +417,12 @@ fn main() {
                     // progress watchdog does not read it as a reasoning loop
                     phase.store(1, Ordering::SeqCst);
                     // wait for a bundle frame (the kernel hands custody here)
-                    let deadline = std::time::Instant::now() + Duration::from_millis(*timeout_ms);
-                    let mut bundle: Option<Value> = None;
-                    while std::time::Instant::now() < deadline {
-                        let got = inbox.lock().unwrap().pop_front();
-                        if let Some(v) = got {
-                            if v.get("kind").and_then(Value::as_str) == Some("bundle") {
-                                bundle = Some(v);
-                                break;
-                            }
-                            continue;
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
+                    // F12: a WAKEUP, not a 20 ms poll — and only the bundle
+                    // frame is removed; an ack or a message that arrived
+                    // meanwhile stays queued for the step that needs it.
+                    let bundle = inbox.pop_matching(Duration::from_millis(*timeout_ms), |v| {
+                        v.get("kind").and_then(Value::as_str) == Some("bundle")
+                    });
                     if let Some(b) = bundle {
                         let bundle_id = b.get("bundle_id").and_then(Value::as_u64).unwrap_or(0);
                         let hops = b.get("hops").and_then(Value::as_u64).unwrap_or(0);
@@ -498,15 +464,15 @@ fn main() {
                 }
                 Step::Wait => {
                     phase.store(1, Ordering::SeqCst);
-                    loop {
-                        let got = inbox.lock().unwrap().pop_front();
-                        if let Some(v) = got {
-                            if v.get("kind").and_then(Value::as_str) == Some("msg") {
-                                break;
-                            }
-                            continue;
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
+                    // F12: wait for a `msg` frame by WAKEUP. The old loop
+                    // polled every 20 ms AND DISCARDED every frame that was
+                    // not a `msg` — a pending ack could be swallowed here.
+                    // Now only the matching frame is removed.
+                    let got = inbox.pop_matching(Duration::from_secs(3600), |v| {
+                        v.get("kind").and_then(Value::as_str) == Some("msg")
+                    });
+                    if got.is_none() {
+                        eprintln!("[agentd {}] wait timed out", task.name);
                     }
                     phase.store(0, Ordering::SeqCst);
                 }
