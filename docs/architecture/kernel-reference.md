@@ -228,6 +228,10 @@ custody acks, fragmentation across hops).
 |---|---|
 | **v0.13.0** | The agent's inbox is WAKEABLE (a condvar, not a 10 ms poll): an operation's ack is answered in ~50 us instead of up to 10 ms — the agent's step loop is ~16x faster. `ama logs` reads the journal tail backwards with `--event`/`--uin` filters |
 | **v0.12.0** | Hot path: one statx + one write per ledger append (handle identity cached, framing buffer reused); authorization and the destination snapshot in ONE process-table pass (closes the revoke-vs-deliver race). Operator verbs from `ama stats`, `ama rotate --keep N`, `ama inspect` |
+| **v0.11.0** | Custody restore enforces the byte budgets and returns a `Result`; the ledger's segment length became a plain atomic |
+| **v0.10.0** | The agentd encodes an envelope OFF the writer lock (the heartbeat and the task step no longer serialize on one mutex); `repeat: true` tasks for sustained load; the per-append `fstat` and the shared-read `by_name` lock are gone |
+| **v0.9.0** | Bounded resources (`kernel.resources`: connections, timeouts, outbound and custody bytes, journal segments) and the hardened delivery/checkpoint-recovery probes behind experiment 010 |
+| **v0.8.4** | Buffered msgpack/proto wire reads, a `waitpid(WNOHANG)` reaper, the compact delivery audit (payload only with `AMA_LEDGER_VERBOSE`) and the `JsonPeer` scratch-buffer scan |
 | **v0.7.0** | Hot-path performance: persistent ledger handle, single serialization, merged delivery locks, tail-scan checkpoints, O(1) name lookup, splice/write_envelope JSON |
 | **v0.6.0** | Weighted fair queueing, admission control, bandwidth accounting; DTN multi-hop routing, custody acks, fragmentation |
 | v0.5.0 | Per-sender QoS (token bucket + priority) and DTN store-and-forward custody |
