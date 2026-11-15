@@ -1,0 +1,8 @@
+{
+  "name": "a",
+  "caps": ["send:b"],
+  "steps": [
+    { "op": "checkpoint", "state": { "n": 0 } },
+    { "op": "sleep", "ms": 9000 }
+  ]
+}

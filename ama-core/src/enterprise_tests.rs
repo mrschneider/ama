@@ -68,6 +68,44 @@ fn entry(k: &Kernel, uin: u64, name: &str) -> (Arc<Outbound>, UnixStream) {
     (out, rx)
 }
 
+/// Register a SENDER: an entry that holds the `send` capability. The
+/// kernel authorizes a send inside the process table (F11), so a test
+/// that drives `route_send` directly must give the SENDER an entry too.
+fn sender(k: &Kernel, uin: u64, name: &str) {
+    let (tx, _rx) = UnixStream::pair().unwrap();
+    let out = spawn_writer(k.ledger.clone(), Peer::Unix(tx), Wire::Json);
+    let process = ProcEntry {
+        uin,
+        name: name.into(),
+        pid: 0,
+        caps: vec!["send".into()],
+        manifest_caps: None,
+        auth_token: None,
+        tcp_addr: None,
+        spawned_at: Instant::now(),
+        granted: vec![],
+        revoked: vec![],
+        state: ProcState::Running,
+        last_hb: Instant::now(),
+        last_step: String::new(),
+        last_phase: "executing".into(),
+        stuck_sweeps: 0,
+        respawns: 0,
+        last_checkpoint: None,
+        task_path: "/dev/null".into(),
+        out: Some(out),
+        wire: Wire::Json,
+        isolation: None,
+        priority: 5,
+        dtn: false,
+    };
+    k.agents
+        .lock()
+        .unwrap()
+        .insert(uin, Arc::new(Mutex::new(process)));
+    k.bind_name(name, uin);
+}
+
 #[test]
 fn binary_lengths_are_rejected_before_reading_any_body_on_every_frame() {
     struct HeaderOnly {
@@ -186,6 +224,7 @@ fn contended_kernel_send_charges_byte_rate_only_once() {
     let dir = Temp::new();
     let k = kernel(&dir);
     let (out, _rx) = entry(&k, 2, "dest");
+    sender(&k, 1, "src");
     let body = json!({"payload": "x".repeat(580)});
     let bytes = serde_json::to_vec(&body).unwrap().len();
     {
@@ -229,6 +268,7 @@ fn dedicated_scheduler_delivers_without_a_watchdog_sweep() {
     let dir = Temp::new();
     let k = Arc::new(kernel(&dir));
     let (out, rx) = entry(&k, 2, "dest");
+    sender(&k, 1, "src");
     {
         let mut d = k.delivery.lock().unwrap();
         d.link_bytes_per_tick = Some(10000);
@@ -376,6 +416,182 @@ fn externally_replaced_ledger_is_detected_on_the_next_append() {
         .unwrap();
     assert_eq!(ledger.read_all().len(), 1);
     assert_eq!(ledger.read_all()[0].ev, "checkpoint");
+}
+
+/// F11: the send path authorizes INSIDE the process table, so a sender
+/// without the capability is refused and the refusal is journaled — the
+/// denial must never be silent.
+#[test]
+fn a_send_without_the_capability_is_refused_and_journaled() {
+    let dir = Temp::new();
+    let k = kernel(&dir);
+    let (_out, _rx) = entry(&k, 2, "dest");
+    // the sender holds NO capability at all
+    let (tx, _rx2) = UnixStream::pair().unwrap();
+    let out = spawn_writer(k.ledger.clone(), Peer::Unix(tx), Wire::Json);
+    k.agents.lock().unwrap().insert(
+        1,
+        Arc::new(Mutex::new(ProcEntry {
+            uin: 1,
+            name: "src".into(),
+            pid: 0,
+            caps: vec![],
+            manifest_caps: None,
+            auth_token: None,
+            tcp_addr: None,
+            spawned_at: Instant::now(),
+            granted: vec![],
+            revoked: vec![],
+            state: ProcState::Running,
+            last_hb: Instant::now(),
+            last_step: String::new(),
+            last_phase: "executing".into(),
+            stuck_sweeps: 0,
+            respawns: 0,
+            last_checkpoint: None,
+            task_path: "/dev/null".into(),
+            out: Some(out),
+            wire: Wire::Json,
+            isolation: None,
+            priority: 5,
+            dtn: false,
+        })),
+    );
+    k.bind_name("src", 1);
+    let err = k
+        .route_send(1, "dest", &json!({"work": 1}))
+        .expect_err("a sender without the capability must be refused");
+    assert!(err.contains("not granted"), "{err}");
+    let denials: Vec<_> = k
+        .ledger
+        .read_all()
+        .into_iter()
+        .filter(|e| e.ev == "cap_denied")
+        .collect();
+    assert_eq!(denials.len(), 1, "the refusal is journaled exactly once");
+    assert_eq!(denials[0].detail["needed"], "send:dest");
+}
+
+/// The capability verdict must be the FIRST question: an unauthorized
+/// sender learns nothing about whether the target exists.
+#[test]
+fn an_unauthorized_sender_does_not_learn_whether_the_target_exists() {
+    let dir = Temp::new();
+    let k = kernel(&dir);
+    let (tx, _rx) = UnixStream::pair().unwrap();
+    let out = spawn_writer(k.ledger.clone(), Peer::Unix(tx), Wire::Json);
+    k.agents.lock().unwrap().insert(
+        1,
+        Arc::new(Mutex::new(ProcEntry {
+            uin: 1,
+            name: "src".into(),
+            pid: 0,
+            caps: vec![],
+            manifest_caps: None,
+            auth_token: None,
+            tcp_addr: None,
+            spawned_at: Instant::now(),
+            granted: vec![],
+            revoked: vec![],
+            state: ProcState::Running,
+            last_hb: Instant::now(),
+            last_step: String::new(),
+            last_phase: "executing".into(),
+            stuck_sweeps: 0,
+            respawns: 0,
+            last_checkpoint: None,
+            task_path: "/dev/null".into(),
+            out: Some(out),
+            wire: Wire::Json,
+            isolation: None,
+            priority: 5,
+            dtn: false,
+        })),
+    );
+    k.bind_name("src", 1);
+    // "ghost" is NOT in the table
+    let err = k
+        .route_send(1, "ghost", &json!({}))
+        .expect_err("an unauthorized sender is refused");
+    assert!(
+        err.contains("not granted"),
+        "the capability verdict comes first, not the target lookup: {err}"
+    );
+}
+
+/// The ledger frames a record (payload + newline) in ONE write, so a
+/// record is always exactly one line — even when the payload carries
+/// newlines.
+#[test]
+fn every_record_is_exactly_one_line_even_with_newlines_in_the_payload() {
+    let dir = Temp::new();
+    let path = dir.0.join("ledger.jsonl");
+    let ledger = Ledger::open(&path).unwrap();
+    for i in 0..50 {
+        ledger
+            .append("tick", json!({"i": i, "text": "a\nb\nc"}))
+            .unwrap();
+    }
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        raw.lines().count(),
+        50,
+        "one line per record — no split by an embedded newline"
+    );
+    assert!(raw.ends_with('\n'), "the last record is terminated");
+    let parsed: Vec<LedgerEvent> = raw
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every line parses"))
+        .collect();
+    assert_eq!(parsed.len(), 50);
+    assert_eq!(parsed[7].detail["text"], "a\nb\nc");
+}
+
+/// Retention: the archives are counted, and pruning keeps the NEWEST N.
+#[test]
+fn ledger_stats_count_archives_and_pruning_keeps_the_newest() {
+    let dir = Temp::new();
+    let path = dir.0.join("ledger");
+    let ledger = Ledger::open(&path).unwrap();
+    for n in 0..3 {
+        ledger
+            .append("checkpoint", json!({"uin": 1, "state": {"n": n}}))
+            .unwrap();
+        ledger.rotate().unwrap();
+    }
+    let stats = ledger.stats();
+    assert_eq!(stats["archives"], 3);
+    assert_eq!(stats["healthy"], true);
+    assert!(stats["total_bytes"].as_u64().unwrap() > 0);
+    let removed = ledger.prune_archives(1).unwrap();
+    assert_eq!(removed.len(), 2);
+    assert_eq!(ledger.stats()["archives"], 1);
+    // the ACTIVE file and the newest archive survive: recovery still works
+    assert_eq!(ledger.last_checkpoint(1).unwrap()["n"], 2);
+    let all = ledger.read_all();
+    assert!(
+        all.iter()
+            .any(|e| e.ev == "checkpoint" && e.detail["state"]["n"] == 2),
+        "the surviving archive still carries the latest checkpoint"
+    );
+}
+
+/// The kernel snapshot the `ama stats` verb serves: process table by
+/// state, journal growth and the connection budgets.
+#[test]
+fn kernel_stats_report_the_table_the_journal_and_the_budgets() {
+    let dir = Temp::new();
+    let k = kernel(&dir);
+    let (_out, _rx) = entry(&k, 2, "dest");
+    sender(&k, 1, "src");
+    k.ledger.append("tick", json!({})).unwrap();
+    let stats = k.stats();
+    assert_eq!(stats["agents"]["total"], 2);
+    assert_eq!(stats["agents"]["by_state"]["running"], 2);
+    assert_eq!(stats["ledger"]["healthy"], true);
+    assert_eq!(stats["ledger"]["seq"], 1);
+    assert!(stats["uptime_ms"].as_u64().is_some());
+    assert!(stats["connections"].get("active").is_some());
 }
 
 #[test]

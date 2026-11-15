@@ -44,6 +44,7 @@ fn main() {
     let mut cgroups = false;
     let mut name = String::new();
     let mut caps = String::new();
+    let mut keep: u64 = 0;
     let mut strict = false;
     let mut userns = false;
     let mut rest: Vec<String> = Vec::new();
@@ -64,6 +65,7 @@ fn main() {
             "--cgroups" => cgroups = true,
             "--name" => name = args.next().unwrap_or_default(),
             "--caps" => caps = args.next().unwrap_or_default(),
+            "--keep" => keep = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--strict" => strict = true,
             "--userns" => userns = true,
             other => {
@@ -80,6 +82,15 @@ fn main() {
     match cmd.as_str() {
         "serve" => serve(&socket, &manifest, &agentd, cgroups),
         "ps" => ps(&ctl_socket),
+        "inspect" => inspect(&ctl_socket, &name),
+        "stats" => ctl_roundtrip(&ctl_socket, serde_json::json!({"kind": "ctl_stats"})),
+        "rotate" => {
+            let mut req = serde_json::json!({"kind": "ctl_rotate"});
+            if keep > 0 {
+                req["keep"] = serde_json::json!(keep);
+            }
+            ctl_roundtrip(&ctl_socket, req)
+        }
         "qos" => ctl_qos(&ctl_socket),
         "grant" => ctl_caps(&ctl_socket, "ctl_grant", &name, &caps),
         "revoke" => ctl_caps(&ctl_socket, "ctl_revoke", &name, &caps),
@@ -107,7 +118,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: ama serve|ps|qos|grant|revoke|jail");
+            eprintln!("usage: ama serve|ps|inspect|stats|rotate|qos|grant|revoke|restart|jail");
             exit(2);
         }
     }
@@ -253,4 +264,50 @@ fn ps(socket: &str) {
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).expect("reply");
     println!("{}", line.trim());
+}
+
+/// One control round trip: inject the operator credential, print the
+/// kernel's reply verbatim (the verbs whose reply is already JSON shaped
+/// for consumption: `stats`, `rotate`).
+fn ctl_roundtrip(socket: &str, mut req: serde_json::Value) {
+    req["token"] = serde_json::json!(operator_token());
+    let mut s = UnixStream::connect(socket).expect("connect");
+    s.write_all(format!("{req}\n").as_bytes()).expect("ctl");
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).expect("reply");
+    println!("{}", line.trim());
+}
+
+/// `ama inspect --name <agent>`: the ps reply filtered to one entry. There
+/// is no separate inspect verb — ps_dump is the same snapshot, so a local
+/// filter cannot disagree with `ama ps`.
+fn inspect(socket: &str, name: &str) {
+    if name.is_empty() {
+        eprintln!("inspect requires: ama inspect --socket <path> --name <agent>");
+        exit(2);
+    }
+    let mut s = UnixStream::connect(socket).expect("connect");
+    let msg = format!(
+        "{}\n",
+        serde_json::json!({"kind": "ctl_ps", "token": operator_token()})
+    );
+    s.write_all(msg.as_bytes()).expect("ctl");
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).expect("reply");
+    let reply: serde_json::Value = serde_json::from_str(line.trim()).expect("reply json");
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let agents = reply
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
+    match agents
+        .iter()
+        .find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some(name))
+    {
+        Some(entry) => println!("{entry}"),
+        None => {
+            eprintln!("ama: no agent named '{name}'");
+            exit(1);
+        }
+    }
 }

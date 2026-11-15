@@ -1,0 +1,21 @@
+{
+  "kernel": {
+    "socket": "/tmp/ama_exp11.sock",
+    "ledger": "/tmp/ama_exp11/ledger.jsonl",
+    "hb_interval_ms": 150,
+    "hb_timeout_ms": 5000,
+    "max_respawns": 0
+  },
+  "agents": [
+    {
+      "name": "a",
+      "task": "experiments/tasks_011/a.json",
+      "caps": ["send:b"]
+    },
+    {
+      "name": "b",
+      "task": "experiments/tasks_011/b.json",
+      "caps": ["send:a"]
+    }
+  ]
+}

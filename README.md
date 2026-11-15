@@ -35,7 +35,10 @@ operating-system boundary instead of a framework's trust.
 - **Three wires, one kernel** — JSON lines, msgpack (`0xFF`), Protobuf
   (`0x0A`), over UDS **and** TCP, translated at the target.
 - **Observability for free** — agent notes land in the same append-only
-  ledger as kernel events: one auditable stream.
+  ledger as kernel events: one auditable stream. **Operators** poll it
+  without touching agents: `ama ps` (table), `ama inspect --name m` (one
+  entry), `ama stats` (journal growth + table + queue + budgets,
+  one JSON line) and `ama rotate --keep N` (roll and retain the journal).
 
 ## Quick start
 
@@ -101,6 +104,7 @@ ledger.
 | `007_qos_suite` | WFQ weights under contention, admission control, accounting |
 | `008_dtn_routing` | multi-hop relays, custody acks, fragmentation |
 | `009_authority` | NEGATIVE tests: session identity (no cross-agent impersonation), registration tokens, task caps do not become grants, operator socket separation, revocations survive re-registration, custody ownership |
+| `011_operator_surface` | The operator verbs: `ama stats` (journal growth + table by state + budgets), `ama inspect` (the same entry `ps` shows), `ama rotate --keep N` (roll + retention, journaled), and the credential gate on the new verbs |
 
 Sample: `EXPERIMENT_001: PASS` — 13 assertions in 14 s across 5 distinct
 OS processes. Full transcripts: [kernel reference](docs/architecture/kernel-reference.md);

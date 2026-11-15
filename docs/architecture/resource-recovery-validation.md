@@ -35,3 +35,31 @@ as errors, experiments 001–004 and 006–010, and
 `python3 tests/validators_fail_closed.py`. Experiment 010 is a deterministic
 Rust failure-probe gate, rather than an evidence-ledger Python validator.
 Experiment 005 requires KVM; no microVM implementation was changed.
+
+## Hot-path follow-up (v0.12.0)
+
+Measured on the same development host (Intel N100, 4 cores, no turbo
+headroom, production services resident), best-of-7 alternating runs of the
+same binaries.
+
+- `ledger.append`: 3.45 -> 3.26 microseconds per call (min 3.39 -> 3.17),
+  about 5.6%. Each append now performs TWO syscalls instead of three:
+  `strace -c` over 500,000 appends reports 500,001 `write` plus 500,007
+  `statx` (1,000,092 total) where the previous build reported 1,500,092. The
+  removed call was a per-append `fstat` that re-derived the identity of an
+  inode an open handle cannot change. The identity is cached at (re)open
+  time instead, and the path statx stays per append, so an external rename is
+  still detected on the very next append. The record is framed in a reused
+  per-thread buffer, which also removes one heap allocation and its growth
+  reallocs per event.
+- `route_send` at 64 bytes, 4 concurrent senders, 80,000 messages: about
+  144,000 -> 150,000 messages per second aggregate (about 4%; the noise floor
+  of that harness on this host is plus or minus 4%, and single-sender runs are
+  inside it). The capability check and the destination snapshot now share one
+  process-table pass instead of two, and the outbound queue handle is taken
+  from that pass instead of a third lookup.
+- Semantics delta, stated: a revoke that lands while a send is in flight can no
+  longer pass the capability check and still be delivered. The check and the
+  delivery decision are one critical section now.
+- Still open, deliberately: the per-append `statx` (about 21% of the append)
+  is what keeps external rotation detection prompt.

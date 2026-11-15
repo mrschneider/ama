@@ -25,7 +25,7 @@ fn fake_entry(uin: u64, name: &str, out: UnixStream, ledger: Arc<Ledger>) -> Arc
         uin,
         name: name.into(),
         pid: 0,
-        caps: vec![],
+        caps: vec!["send:perf-b".into()],
         manifest_caps: None,
         auth_token: None,
         tcp_addr: None,
@@ -109,7 +109,12 @@ fn main() {
 
     for payload in [64usize, 256, 1024] {
         let body = json!({"op": "work", "payload": "y".repeat(payload)});
-        let n = 5000;
+        let n = 20_000;
+        // warm the path: the first payload measured used to include the
+        // cold queue/anonymous-page setup and look slower than larger ones
+        for _ in 0..1_000 {
+            let _ = k.route_send(1, "perf-b", &body);
+        }
         let t0 = Instant::now();
         let mut ok = 0usize;
         let mut err = String::new();
@@ -137,7 +142,7 @@ fn main() {
     let ledger = Ledger::open(&tmp.join("l.jsonl")).unwrap();
     for payload in [64usize, 256, 1024] {
         let body = json!({"op": "work", "payload": "y".repeat(payload)});
-        let n = 5000;
+        let n = 20_000;
         let t0 = Instant::now();
         for i in 0..n {
             ledger

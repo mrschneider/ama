@@ -629,6 +629,16 @@ pub struct LedgerEvent {
     pub detail: Value,
 }
 
+/// The persistent append handle: the open file plus the identity of the
+/// inode it was opened on. An fd can never change inode, so the identity is
+/// captured ONCE here — the external-rotation check then costs a single
+/// statx on the path instead of a statx *plus* an fstat on every append.
+struct SegmentFile {
+    file: std::fs::File,
+    dev: u64,
+    ino: u64,
+}
+
 pub struct Ledger {
     path: std::path::PathBuf,
     seq: AtomicU64,
@@ -638,20 +648,79 @@ pub struct Ledger {
     /// per event and was roughly HALF the route_send hot-path cost
     /// (perf_bench measured it). Reopened on demand when the file or its
     /// parent dir vanish mid-flight.
-    writer: Mutex<Option<std::fs::File>>,
+    writer: Mutex<Option<SegmentFile>>,
     /// Complete recovery index, populated from the active snapshot + WAL tail.
     cp_index: Mutex<HashMap<u64, Value>>,
     /// Poisoned on I/O failure; recovery must repair any partial append.
     failed: std::sync::atomic::AtomicBool,
     segment_bytes: AtomicU64,
     snapshot_bytes: AtomicU64,
-    /// PERF: in-memory segment length — avoids a per-append fstat for the
-    /// rotation-size check. Updated atomically after every write; reset on
-    /// rotate. Initialized from the on-disk size at open() time.
-    seg_len: AtomicU64,
     pub outbound_budget: Arc<resources::ByteBudget>,
     outbound_agent_limit: AtomicU64,
     agent_outbound_budgets: Mutex<HashMap<u64, std::sync::Weak<resources::ByteBudget>>>,
+}
+
+/// Bytes of framing scratch kept on the stack per appending thread. A record
+/// (envelope + newline) below this never allocates; above it, the bytes spill
+/// into a Vec that the same thread reuses for the next oversized record.
+const INLINE_RECORD_BYTES: usize = 2048;
+
+/// Reusable record buffer: the old append path serialized into a FRESH `Vec`
+/// on every event, so each append paid a malloc plus several growth reallocs
+/// for a payload it then threw away.
+struct RecordBuf {
+    inline: [u8; INLINE_RECORD_BYTES],
+    len: usize,
+    spill: Vec<u8>,
+}
+
+impl RecordBuf {
+    fn new() -> Self {
+        RecordBuf {
+            inline: [0u8; INLINE_RECORD_BYTES],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+    fn reset(&mut self) {
+        self.len = 0;
+        self.spill.clear();
+    }
+    fn push(&mut self, b: u8) {
+        let _ = self.write(&[b]);
+    }
+    fn as_slice(&self) -> &[u8] {
+        if self.spill.is_empty() {
+            &self.inline[..self.len]
+        } else {
+            &self.spill
+        }
+    }
+}
+
+impl io::Write for RecordBuf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.spill.is_empty() && self.len + buf.len() <= INLINE_RECORD_BYTES {
+            self.inline[self.len..self.len + buf.len()].copy_from_slice(buf);
+            self.len += buf.len();
+        } else {
+            if self.spill.is_empty() {
+                self.spill.extend_from_slice(&self.inline[..self.len]);
+            }
+            self.spill.extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+thread_local! {
+    /// One buffer per appending connection thread: no sharing, no lock, no
+    /// per-append allocation for the common (sub-2 KiB) record.
+    static RECORD_BUF: std::cell::RefCell<RecordBuf> =
+        std::cell::RefCell::new(RecordBuf::new());
 }
 
 impl Ledger {
@@ -670,11 +739,13 @@ impl Ledger {
 
     /// F10(item 4): repair a crash-torn tail at EXACT byte boundaries.
     ///
-    /// Records are newline-terminated by `append` (one write for the
-    /// line, then one for the newline), so the legal endings are:
+    /// `append` writes the record and its terminator together, so a
+    /// well-formed file ends with `<complete record>\n`. The repair still
+    /// handles the defensive endings a torn or externally-edited file can
+    /// have:
     ///   * `<complete record>\n`                       — validate it and stop;
-    ///   * `<complete record>` with the newline missing  — crash between
-    ///     the two writes: RECOVER it by appending the newline;
+    ///   * `<complete record>` with the newline missing  — a record that
+    ///     lost its terminator: RECOVER it by appending the newline;
     ///   * anything else after the last `\n`             — a partial
     ///     write: cut EXACTLY at that boundary.
     ///
@@ -824,9 +895,6 @@ impl Ledger {
             Err(e) => return Err(e),
         }
         let seq = AtomicU64::new(sequence);
-        // PERF: initialize the in-memory segment length from disk so the
-        // first append doesn't need a fstat to learn the current size.
-        let seg_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         Ok(Ledger {
             path: path.to_path_buf(),
             seq,
@@ -835,21 +903,28 @@ impl Ledger {
             failed: std::sync::atomic::AtomicBool::new(false),
             segment_bytes: AtomicU64::new(64 << 20),
             snapshot_bytes: AtomicU64::new(snapshot_bytes),
-            seg_len: AtomicU64::new(seg_len),
             outbound_budget: Arc::new(resources::ByteBudget::new(64 << 20)),
             outbound_agent_limit: AtomicU64::new(OUTBOUND_QUEUE_BYTES as u64),
             agent_outbound_budgets: Mutex::new(HashMap::new()),
         })
     }
 
-    fn open_handle(&self) -> io::Result<std::fs::File> {
+    fn open_handle(&self) -> io::Result<SegmentFile> {
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)
+            .open(&self.path)?;
+        // ONE fstat per (re)open — the identity is then cached for the life
+        // of the handle instead of being recomputed on every append.
+        let md = file.metadata()?;
+        Ok(SegmentFile {
+            file,
+            dev: md.dev(),
+            ino: md.ino(),
+        })
     }
 
     fn suffixed(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
@@ -885,34 +960,31 @@ impl Ledger {
             return Err(io::Error::other("ledger writer failed; recovery required"));
         }
         let result = (|| {
-            // External-rotation detection: compare the live path against the
-            // handle we hold. A stale fd still fstats to the old inode, so the
-            // path statx is the only thing that catches external renames.
+            // External-rotation detection: the PATH is the authority. A stale
+            // fd keeps pointing at the old inode, so the path statx is the
+            // only thing that catches an external rename. The fd's own
+            // identity cannot change, so it is compared against the identity
+            // cached at open time instead of being re-fstat'ed here: ONE
+            // metadata syscall per append instead of two.
             let disk = std::fs::metadata(&self.path)
                 .ok()
-                .map(|m| (m.dev(), m.ino()));
-            let handle = writer
-                .as_ref()
-                .and_then(|f| f.metadata().ok())
-                .map(|m| (m.dev(), m.ino()));
-            if writer.is_none() || disk != handle {
+                .map(|m| (m.dev(), m.ino(), m.len()));
+            let current = match (writer.as_ref(), disk) {
+                (Some(handle), Some((dev, ino, _))) => (handle.dev, handle.ino) == (dev, ino),
+                _ => false,
+            };
+            if !current {
                 *writer = Some(self.open_handle()?);
-                // Re-sync the in-memory length to the freshly opened file.
-                self.seg_len.store(
-                    writer.as_ref().unwrap().metadata()?.len(),
-                    Ordering::Relaxed,
-                );
             }
-            // PERF: use the in-memory segment length instead of a per-append
-            // fstat. The value is updated after every successful write and
-            // reset on rotate, so it tracks the file size exactly.
+            // The size comes from the SAME statx: no second call and no
+            // in-memory counter to re-sync after an external append.
+            let segment_len = match disk {
+                Some((_, _, len)) => len,
+                None => 0,
+            };
             let limit = self.segment_bytes.load(Ordering::Relaxed);
             if limit > 0
-                && self
-                    .seg_len
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(self.snapshot_bytes.load(Ordering::Relaxed))
-                    >= limit
+                && segment_len.saturating_sub(self.snapshot_bytes.load(Ordering::Relaxed)) >= limit
             {
                 self.rotate_locked(&mut writer)?;
             }
@@ -925,13 +997,19 @@ impl Ledger {
                 ev: ev.into(),
                 detail,
             };
-            let mut bytes = serde_json::to_vec(&event).map_err(io::Error::other)?;
-            bytes.push(b'\n');
-            let file = writer.as_mut().unwrap();
-            file.write_all(&bytes)?;
-            // Update the in-memory length: O(1) atomic add, no syscall.
-            self.seg_len
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            // ONE write per record: the record and its newline are framed
+            // in a reused buffer (no fresh Vec, no growth reallocs). The
+            // buffer is filled by serde_json directly, so the bytes that
+            // reach the file are the bytes that were serialized — no
+            // intermediate copy.
+            let file = &mut writer.as_mut().unwrap().file;
+            RECORD_BUF.with(|buf| -> io::Result<()> {
+                let mut buf = buf.borrow_mut();
+                buf.reset();
+                serde_json::to_writer(&mut *buf, &event).map_err(io::Error::other)?;
+                buf.push(b'\n');
+                file.write_all(buf.as_slice())
+            })?;
             if durable {
                 file.sync_data()?;
                 Self::sync_parent(&self.path)?;
@@ -951,7 +1029,6 @@ impl Ledger {
         }
         result
     }
-
     /// Coordinate a durable checkpoint snapshot and an archived WAL segment.
     /// Archives are retained; deletion/retention is an operator policy.
     pub fn rotate(&self) -> io::Result<()> {
@@ -965,7 +1042,7 @@ impl Ledger {
         }
         result
     }
-    fn rotate_locked(&self, writer: &mut Option<std::fs::File>) -> io::Result<()> {
+    fn rotate_locked(&self, writer: &mut Option<SegmentFile>) -> io::Result<()> {
         let sequence = self.seq.load(Ordering::Acquire);
         if sequence == 0 || !self.path.try_exists()? {
             return Ok(());
@@ -977,7 +1054,7 @@ impl Ledger {
         if writer.is_none() {
             *writer = Some(self.open_handle()?);
         }
-        writer.as_ref().unwrap().sync_data()?;
+        writer.as_ref().unwrap().file.sync_data()?;
         let snapshot = LedgerEvent {
             seq: sequence,
             ts_ms: 0,
@@ -1000,12 +1077,13 @@ impl Ledger {
         *writer = Some(self.open_handle()?);
         self.snapshot_bytes
             .store(bytes.len() as u64, Ordering::Relaxed);
-        // Reset the in-memory segment length: the new file is just the snapshot.
-        self.seg_len.store(bytes.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
-    pub fn read_all(&self) -> Vec<LedgerEvent> {
+    /// The archived segments that precede the active file, oldest first.
+    /// (Names carry a 20-digit zero-padded sequence, so lexical order IS
+    /// sequence order.)
+    fn archive_paths(&self) -> Vec<std::path::PathBuf> {
         let parent = self
             .path
             .parent()
@@ -1019,10 +1097,63 @@ impl Ledger {
             .into_iter()
             .flatten()
             .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
             .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with(&prefix))
+                    .unwrap_or(false)
+            })
             .collect();
         files.sort();
+        files
+    }
+
+    /// Operator snapshot of the journal (read-only, no writer lock held
+    /// beyond the single statx of the active file).
+    pub fn stats(&self) -> Value {
+        let archives = self.archive_paths();
+        let archive_bytes: u64 = archives
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+        let active_bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        json!({
+            "seq": self.seq.load(Ordering::Acquire),
+            "active_bytes": active_bytes,
+            "archives": archives.len(),
+            "archive_bytes": archive_bytes,
+            "total_bytes": active_bytes + archive_bytes,
+            "segment_bytes": self.segment_bytes.load(Ordering::Relaxed),
+            "healthy": self.is_healthy(),
+            "path": self.path.to_string_lossy(),
+        })
+    }
+
+    /// Retention: delete all but the NEWEST `keep` archived segments. The
+    /// active file and a pending rotation snapshot are never candidates.
+    /// Returns the removed file names (the caller journals them).
+    pub fn prune_archives(&self, keep: usize) -> io::Result<Vec<String>> {
+        let mut files = self.archive_paths();
+        if files.len() <= keep {
+            return Ok(Vec::new());
+        }
+        let excess = files.len() - keep;
+        let mut removed = Vec::with_capacity(excess);
+        for path in files.drain(..excess) {
+            std::fs::remove_file(&path)?;
+            removed.push(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        Ok(removed)
+    }
+
+    pub fn read_all(&self) -> Vec<LedgerEvent> {
+        let mut files = self.archive_paths();
         files.push(self.path.clone());
         files
             .into_iter()
@@ -1061,6 +1192,20 @@ pub enum ProcState {
     Completed,
     Killed(String),
     Dead,
+}
+
+impl ProcState {
+    /// the wire name of the state (ps/stats share one spelling)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProcState::Starting => "starting",
+            ProcState::Registered => "registered",
+            ProcState::Running => "running",
+            ProcState::Completed => "completed",
+            ProcState::Killed(_) => "killed",
+            ProcState::Dead => "dead",
+        }
+    }
 }
 
 pub struct ProcEntry {
@@ -1115,6 +1260,22 @@ pub struct ProcEntry {
     pub dtn: bool,
 }
 
+impl ProcEntry {
+    /// F01: the capability test, allocation-free on the hot path (the
+    /// `format!("{verb}:{target}")` string is built only on the RARE deny
+    /// path, for the audit record). A verb-level grant (`relay`) covers
+    /// every target of that verb; a target-level grant (`send:b`) is exact.
+    fn allows(&self, verb: &str, target: &str) -> bool {
+        self.caps.iter().any(|c| {
+            c == verb
+                || (c.len() == verb.len() + target.len() + 1
+                    && c.starts_with(verb)
+                    && c.as_bytes()[verb.len()] == b':'
+                    && &c[verb.len() + 1..] == target)
+        })
+    }
+}
+
 pub struct Kernel {
     pub socket_path: std::path::PathBuf,
     pub ledger: Arc<Ledger>,
@@ -1147,6 +1308,8 @@ pub struct Kernel {
     /// QoS (per-sender token buckets) + DTN (store-and-forward custody
     /// store) — see qos.rs
     pub delivery: Mutex<qos::DeliverySystem>,
+    /// boot time, for the `ama stats` uptime
+    started: Instant,
     /// DTN routing table: destination name -> relay name (next hop)
     pub routes: std::collections::HashMap<String, String>,
     /// hop budget for a routed bundle
@@ -1179,6 +1342,7 @@ impl Kernel {
             // delivery audit detail — off by default (see the field docs);
             // the manifest's kernel.ledger_verbose can override it
             ledger_verbose: std::env::var("AMA_LEDGER_VERBOSE").is_ok(),
+            started: Instant::now(),
             agents: Arc::new(Mutex::new(HashMap::new())),
             by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
             next_uin: AtomicU64::new(0),
@@ -1590,18 +1754,7 @@ impl Kernel {
     pub fn check_cap(&self, uin: u64, verb: &str, target: &str) -> Result<(), String> {
         let agents = self.agents.lock().unwrap();
         let entry = agents.get(&uin).ok_or("unknown uin")?;
-        // a VERB-level grant (`relay`) covers every target of that verb; a
-        // TARGET-level grant (`send:b`) stays target-scoped. P3: the
-        // grant test is allocation-free — `format!("{verb}:{target}")` used
-        // to heap-allocate on EVERY send; the string is now built only on
-        // the (rare) deny path, for the audit record.
-        let granted = entry.lock().unwrap().caps.iter().any(|c| {
-            c == verb
-                || (c.len() == verb.len() + target.len() + 1
-                    && c.starts_with(verb)
-                    && c.as_bytes()[verb.len()] == b':'
-                    && &c[verb.len() + 1..] == target)
-        });
+        let granted = entry.lock().unwrap().allows(verb, target);
         if granted {
             Ok(())
         } else {
@@ -1629,6 +1782,29 @@ impl Kernel {
         if !self.ledger.is_healthy() {
             return Err("audit ledger unavailable; recovery required".into());
         }
+        // F11: AUTHORIZATION FIRST. The old path called check_cap() (one
+        // table + entry pass) and then route_send() (a second pass), with a
+        // TOCTOU window between them: a revoke landing in that window still
+        // let the message through. It also leaked target existence — the
+        // name lookup answered "unknown agent" to a sender that was never
+        // allowed to address that name in the first place.
+        let allowed = {
+            let agents = self.agents.lock().unwrap();
+            let Some(sender) = agents.get(&from) else {
+                return Err("unknown uin".into());
+            };
+            // the temporary guard is dropped at the end of this block, so a
+            // self-send (from == destination) cannot re-lock the entry
+            let ok = sender.lock().unwrap().allows("send", to);
+            ok
+        };
+        if !allowed {
+            let need = format!("send:{to}");
+            self.ledger
+                .append("cap_denied", json!({"uin": from, "needed": need}))
+                .map_err(|e| e.to_string())?;
+            return Err(format!("capability '{need}' not granted"));
+        }
         let uin = self
             .by_name
             .read()
@@ -1645,14 +1821,20 @@ impl Kernel {
         let body_encoded = serde_json::to_vec(body).unwrap_or_default();
         let bytes = body_encoded.len();
 
-        let (_wire, dest_priority, dest_dtn, deliverable): (Wire, u8, bool, bool) = {
+        let (dest_priority, dest_dtn, dest_out) = {
             let agents = self.agents.lock().unwrap();
             let entry = agents.get(&uin).ok_or("no process table entry")?;
             let e = entry.lock().unwrap();
             let deliverable =
                 matches!(e.state, ProcState::Running | ProcState::Registered) && e.out.is_some();
-            (e.wire, e.priority, e.dtn, deliverable)
+            // PERF: the queue handle is cloned HERE, in the snapshot the
+            // admission decision already needs — resolve_out used to take
+            // the table and the entry lock a THIRD time, only to read the
+            // same field.
+            let out = if deliverable { e.out.clone() } else { None };
+            (e.priority, e.dtn, out)
         };
+        let deliverable = dest_out.is_some();
 
         // P5: ADMISSION + QoS + SCHEDULING in ONE locked pass. The
         // delivery mutex used to be taken three times on the fast path
@@ -1790,7 +1972,10 @@ impl Kernel {
         // touches the socket, so a reply, the QoS pump and this routing
         // path can never interleave, and nothing here can block on a
         // peer that stopped reading.
-        let out = self.resolve_out(uin)?;
+        // PERF: the handle came from the snapshot above — no second
+        // table pass, and no window between the admission decision and
+        // the write in which the destination could disconnect.
+        let out = dest_out.ok_or_else(|| "no connection".to_string())?;
         // JSON fast path: splice the envelope around the
         // ALREADY-ENCODED body — no second serialization, no
         // envelope-Value clone. Binary wires encode whole (msgpack
@@ -2292,14 +2477,7 @@ impl Kernel {
                 let e = e.lock().unwrap();
                 json!({
                     "uin": e.uin, "name": e.name, "pid": e.pid,
-                    "state": match &e.state {
-                        ProcState::Starting => "starting",
-                        ProcState::Registered => "registered",
-                        ProcState::Running => "running",
-                        ProcState::Completed => "completed",
-                        ProcState::Killed(_) => "killed",
-                        ProcState::Dead => "dead",
-                    },
+                    "state": e.state.as_str(),
                     "killed_reason": if let ProcState::Killed(r) = &e.state { json!(r) } else { Value::Null },
                     "respawns": e.respawns,
                     "isolation": e.isolation.clone().unwrap_or_else(|| "process".into()),
@@ -2313,6 +2491,32 @@ impl Kernel {
                 })
             })
             .collect()
+    }
+
+    /// Operator snapshot of the whole kernel — journal growth, process
+    /// table by state, delivery queue and connection budgets. Read-only;
+    /// the `ama stats` verb serves it so a watchdog (or a human) can
+    /// poll liveness without parsing the ledger.
+    pub fn stats(&self) -> Value {
+        let mut by_state: HashMap<&'static str, u64> = HashMap::new();
+        let mut total = 0u64;
+        {
+            let agents = self.agents.lock().unwrap();
+            for entry in agents.values() {
+                let e = entry.lock().unwrap();
+                total += 1;
+                *by_state.entry(e.state.as_str()).or_insert(0) += 1;
+            }
+        }
+        let delivery = self.delivery.lock().unwrap().stats();
+        json!({
+            "uptime_ms": self.started.elapsed().as_millis() as u64,
+            "agents": { "total": total, "by_state": by_state },
+            "ledger": self.ledger.stats(),
+            "delivery": delivery,
+            "connections": self.connections.stats(),
+            "control_connections": self.control_connections.stats(),
+        })
     }
 
     /// Kill + journal. The process disappears; its ephemeral memory
@@ -3429,6 +3633,36 @@ impl Router {
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
+            "ctl_stats" => {
+                out.send(&json!({"kind": "stats", "stats": kernel.stats()}))
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            // journal retention: rotate the active segment NOW and, when
+            // `keep` is present, prune the archives to the newest N. Both
+            // halves are journaled, so retention is auditable like every
+            // other operator action.
+            "ctl_rotate" => {
+                let keep = v.get("keep").and_then(Value::as_u64).map(|k| k as usize);
+                kernel.ledger.rotate().map_err(|e| format!("rotate: {e}"))?;
+                let removed = match keep {
+                    Some(k) => kernel
+                        .ledger
+                        .prune_archives(k)
+                        .map_err(|e| format!("prune: {e}"))?,
+                    None => Vec::new(),
+                };
+                kernel
+                    .ledger
+                    .append(
+                        "ledger_rotated",
+                        json!({"by": "operator", "keep": keep, "pruned": removed}),
+                    )
+                    .map_err(|e| e.to_string())?;
+                out.send(&json!({"kind": "rotated", "keep": keep, "pruned": removed}))
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
             _ => Err(format!("ctl: unknown control verb '{kind}'")),
         }
     }
@@ -3854,7 +4088,10 @@ impl Router {
                 Ok(())
             }
             Envelope::Send { uin, to, body } => {
-                kernel.check_cap(uin, "send", &to)?;
+                // F11: route_send authorizes the send in the same table
+                // pass that snapshots the destination — calling check_cap
+                // here as well would be a second pass, and the gap between
+                // the two was a revoke that did not land.
                 kernel.route_send(uin, &to, &body)?;
                 out.send(&json!({"kind": "sent", "to": to}))
                     .map_err(|e| e.to_string())?;

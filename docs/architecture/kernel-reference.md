@@ -122,6 +122,28 @@ capability that previously worked.
 (`note`/`agent_note` events), so agent-visible failures appear in the
 same auditable stream as kernel events.
 
+**Operator surface** — every verb below requires the operator credential,
+is served ONLY on the dedicated control socket (`<socket>.ctl`, mode
+0600, peer-credential + pid gated), and is journaled:
+
+- `ama ps` — the process table (UIN, pid, state, respawns, caps, wire).
+- `ama inspect --name m` — one process-table entry (the same snapshot,
+  filtered client-side, so it can never disagree with `ps`).
+- `ama stats` — one JSON line: journal growth (`seq`, active bytes,
+  archive count/bytes), process table by state, delivery queue, both
+  connection budgets, kernel uptime. Meant for a polling watchdog.
+- `ama qos` — bandwidth accounting and queue state (`ctl_qos`).
+- `ama grant` / `ama revoke` — hot capability renegotiation.
+- `ama restart --name <agent>` — the authorized respawn of a dead identity.
+- `ama rotate --keep N` — roll the active journal segment NOW and retain
+  the newest N archives (`ledger_segment_bytes` still does this on its own
+  threshold). Both halves are journaled as `ledger_rotated`, so retention
+  is as auditable as the writes it deletes.
+
+Authorization on the send path is checked in the same process-table pass
+that snapshots the destination: a revocation can never land between the
+check and the delivery of one message.
+
 ## Verified results (experiments 001 + 002)
 
 `experiments/experiment_001_isolation.sh` (14 s end-to-end, 5 real
@@ -187,6 +209,7 @@ custody acks, fragmentation across hops).
 
 | Version | Highlights |
 |---|---|
+| **v0.12.0** | Hot path: one statx + one write per ledger append (handle identity cached, framing buffer reused); authorization and the destination snapshot in ONE process-table pass (closes the revoke-vs-deliver race). Operator verbs from `ama stats`, `ama rotate --keep N`, `ama inspect` |
 | **v0.7.0** | Hot-path performance: persistent ledger handle, single serialization, merged delivery locks, tail-scan checkpoints, O(1) name lookup, splice/write_envelope JSON |
 | **v0.6.0** | Weighted fair queueing, admission control, bandwidth accounting; DTN multi-hop routing, custody acks, fragmentation |
 | v0.5.0 | Per-sender QoS (token bucket + priority) and DTN store-and-forward custody |
@@ -210,7 +233,9 @@ bash experiments/experiment_004_wires.sh       # protobuf wire: 3 wires on ONE k
 bash experiments/experiment_005_microvm.sh     # Firecracker microVM tier (needs /dev/kvm + ufw allow 172.16.0.0/12)
 bash experiments/experiment_006_qos_dtn.sh     # per-sender rate limits + DTN custody for an offline agent
 bash experiments/experiment_007_qos_suite.sh   # WFQ weights + admission control + bandwidth accounting
-bash experiments/experiment_008_dtn_routing.sh # multi-hop relays + custody acks + fragmentation
+bash experiments/experiment_008_dtn_routing.sh   # multi-hop relays + custody acks + fragmentation
+bash experiments/experiment_009_authority.sh    # NEGATIVE: identity, tokens, operator authority
+bash experiments/experiment_011_operator_surface.sh # ama stats / inspect / rotate + retention
 ```
 ## Resource admission and recovery limits
 
@@ -268,7 +293,9 @@ the snapshot and syncs the parent directory. Startup finishes an interrupted
 rotation when the active file is absent and the temporary snapshot is valid.
 Sequence numbers continue across rotations; history reads include archived
 segments and omit internal snapshot records. **Archives are retained:** operators
-must define their own backup and retention policy. Checkpoint snapshots grow
+must define their own backup and retention policy — `ama rotate --keep N` is
+the tool for it (roll the segment now, keep the newest N archives, journal the
+deletion). Checkpoint snapshots grow
 with the number and size of retained checkpoint states. Durability ultimately
 depends on filesystem and storage sync guarantees; tests simulate failure and
 restart rather than physical power loss.
