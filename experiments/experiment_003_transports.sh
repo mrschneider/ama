@@ -45,8 +45,8 @@ if JAIL_OUTPUT=$(timeout 5 ./target/debug/ama jail --userns -- /bin/sh -c 'id -u
     exit 1
   fi
   echo "PASS: userns: isolated uid 0 with mapped host identity"
-elif printf '%s' "$JAIL_OUTPUT" | grep -Eqi 'unshare.*(Operation not permitted|Permission denied|EPERM)'; then
-  echo "SKIP (host policy): unprivileged user namespaces are denied by the runner"
+elif [ "${GITHUB_ACTIONS:-}" = "true" ] && printf '%s' "$JAIL_OUTPUT" | grep -Eqi '(unshare.*(Operation not permitted|Permission denied|EPERM)|userns setgroups deny failed: Permission denied)'; then
+  echo "SKIP (GitHub runner policy): user namespace setup denied by host; production jail still fails closed"
 else
   echo "FAIL: userns initialization failed: $JAIL_OUTPUT" >&2
   exit 1
