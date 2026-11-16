@@ -170,9 +170,12 @@ pub fn enter_userns() -> Result<(), String> {
     // map uid/gid 0 (inside) -> current uid/gid (outside)
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    let _ = fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"));
-    let _ = fs::write("/proc/self/setgroups", "deny\n");
-    let _ = fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"));
+    fs::write("/proc/self/setgroups", "deny\n")
+        .map_err(|e| format!("userns setgroups deny failed: {e}"))?;
+    fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
+        .map_err(|e| format!("userns uid_map failed: {e}"))?;
+    fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
+        .map_err(|e| format!("userns gid_map failed: {e}"))?;
     Ok(())
 }
 
