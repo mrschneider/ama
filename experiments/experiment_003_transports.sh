@@ -35,9 +35,22 @@ done
 
 echo "== user-namespace tier (MicroVM frontier): the jailed tool owns nothing =="
 HOST_UID=$(id -u)
-JAIL_UID=$(timeout 5 ./target/debug/ama jail --userns -- /bin/sh -c 'id -u' 2>&1 | tail -1)
-echo "host uid: $HOST_UID | jailed uid: $JAIL_UID"
-[ "$JAIL_UID" = "0" ] && echo "PASS: userns: the jailed tool runs as uid 0 INSIDE a fresh user+mount namespace (host ownership unchanged)" || echo "SKIP (host policy): userns tier implemented but this host forbids unprivileged user namespaces (jailed uid seen: $JAIL_UID)"
+# Capture failures without set -e/pipefail aborting the rest of the E2E suite.
+# Only an explicit host-policy EPERM may be skipped; mapping errors must fail.
+if JAIL_OUTPUT=$(timeout 5 ./target/debug/ama jail --userns -- /bin/sh -c 'id -u' 2>&1); then
+  JAIL_UID=$(printf '%s\n' "$JAIL_OUTPUT" | tail -1)
+  echo "host uid: $HOST_UID | jailed uid: $JAIL_UID"
+  if [ "$JAIL_UID" != "0" ]; then
+    echo "FAIL: userns succeeded without expected inside UID 0: $JAIL_OUTPUT" >&2
+    exit 1
+  fi
+  echo "PASS: userns: isolated uid 0 with mapped host identity"
+elif printf '%s' "$JAIL_OUTPUT" | grep -Eqi 'unshare.*(Operation not permitted|Permission denied|EPERM)'; then
+  echo "SKIP (host policy): unprivileged user namespaces are denied by the runner"
+else
+  echo "FAIL: userns initialization failed: $JAIL_OUTPUT" >&2
+  exit 1
+fi
 
 export AMA_DEBUG=1
 timeout 40 ./target/debug/ama serve \
