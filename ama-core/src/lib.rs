@@ -8,7 +8,7 @@
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -1398,6 +1398,7 @@ pub struct Kernel {
     pub agents: Arc<Mutex<HashMap<u64, Arc<Mutex<ProcEntry>>>>>,
     by_name: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     next_uin: AtomicU64,
+    expected_agents: usize,
     pub hb_timeout_ms: u64,
     pub hb_interval_ms: u64,
     pub max_respawns: u32,
@@ -1462,6 +1463,7 @@ impl Kernel {
             agents: Arc::new(Mutex::new(HashMap::new())),
             by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
             next_uin: AtomicU64::new(0),
+            expected_agents: 0,
             hb_timeout_ms,
             hb_interval_ms,
             max_respawns,
@@ -2609,6 +2611,28 @@ impl Kernel {
             .collect()
     }
 
+    /// Only consult in-memory state so probes do not scan journal archives.
+    fn health(&self) -> Value {
+        let healthy = self.ledger.is_healthy();
+        let agents = self.agents.lock().unwrap();
+        let available_agents = agents
+            .values()
+            .filter(|entry| {
+                matches!(
+                    entry.lock().unwrap().state,
+                    ProcState::Running | ProcState::Completed
+                )
+            })
+            .count();
+        json!({
+            "kind": "health",
+            "healthy": healthy,
+            "ready": healthy && agents.len() >= self.expected_agents && available_agents == agents.len(),
+            "expected_agents": self.expected_agents,
+            "available_agents": available_agents,
+        })
+    }
+
     /// Operator snapshot of the whole kernel — journal growth, process
     /// table by state, delivery queue and connection budgets. Read-only;
     /// the `ama stats` verb serves it so a watchdog (or a human) can
@@ -3037,6 +3061,15 @@ impl Router {
                 kernel.operator_token
             );
         }
+        // Bind before starting workers or launching agents. A requested TCP
+        // listener is part of startup, so bind failures must reach the caller.
+        let tcp_listener = kernel
+            .tcp_addr
+            .as_deref()
+            .map(std::net::TcpListener::bind)
+            .transpose()?;
+        let mut kernel = kernel;
+        kernel.expected_agents = agents.len();
         let kernel = Arc::new(kernel);
         Kernel::start_delivery_scheduler(&kernel);
         let _ = std::fs::remove_file(&kernel.socket_path);
@@ -3088,23 +3121,6 @@ impl Router {
                 std::thread::sleep(Duration::from_millis(10));
             });
         }
-        // network-remote listener: SAME envelope contract over TCP (§3)
-        if let Some(addr) = kernel.tcp_addr.clone() {
-            let k = kernel.clone();
-            std::thread::spawn(move || match std::net::TcpListener::bind(&addr) {
-                Ok(tcp) => {
-                    eprintln!("[ama] tcp listener up on {addr}");
-                    for conn in tcp.incoming().flatten() {
-                        let stream = conn;
-                        let k = k.clone();
-                        let _ = stream.set_nodelay(true);
-                        let _ = stream.set_read_timeout(None);
-                        Router::spawn_connection(k, Peer::Tcp(stream), false);
-                    }
-                }
-                Err(e) => eprintln!("[ama] tcp listener {addr}: {e}"),
-            });
-        }
         // F02: dedicated OPERATOR control socket — restrictive file mode
         // (0600) and a Unix peer-credential check (the peer must run as the
         // same uid as the kernel). Control verbs are NEVER served on the
@@ -3138,6 +3154,20 @@ impl Router {
             ) {
                 eprintln!("[ama] spawn {name}: {e}");
             }
+        }
+        // network-remote listener: SAME envelope contract over TCP (§3)
+        if let Some(tcp) = tcp_listener {
+            let k = kernel.clone();
+            if let Ok(address) = tcp.local_addr() {
+                eprintln!("[ama] tcp listener up on {address}");
+            }
+            std::thread::spawn(move || {
+                for stream in tcp.incoming().flatten() {
+                    let _ = stream.set_nodelay(true);
+                    let _ = stream.set_read_timeout(None);
+                    Router::spawn_connection(k.clone(), Peer::Tcp(stream), false);
+                }
+            });
         }
         let handle = std::thread::spawn(move || {
             for conn in listener.incoming() {
@@ -3765,6 +3795,7 @@ impl Router {
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
+            "ctl_health" => out.send(&kernel.health()).map_err(|e| e.to_string()),
             "ctl_stats" => {
                 out.send(&json!({"kind": "stats", "stats": kernel.stats()}))
                     .map_err(|e| e.to_string())?;
@@ -4507,6 +4538,82 @@ impl JsonPeer {
 pub struct Manifest {
     pub kernel: KernelConfig,
     pub agents: Vec<AgentSpec>,
+}
+
+impl Manifest {
+    /// Validate deployment settings without opening sockets, the journal or
+    /// task files. Pass the same socket override that serve will use.
+    pub fn validate(&self, socket: &str) -> Result<(), String> {
+        use std::path::Path;
+
+        let config = &self.kernel;
+        config.resources.validate()?;
+        if socket.trim().is_empty() || config.ledger.trim().is_empty() {
+            return Err("kernel.socket and kernel.ledger must be nonempty".into());
+        }
+        let socket = Path::new(socket);
+        let ledger = Path::new(&config.ledger);
+        if ledger == socket || ledger == control_socket_path(socket) {
+            return Err("kernel.ledger must differ from the agent and control sockets".into());
+        }
+        if config.hb_interval_ms == 0 || config.hb_timeout_ms <= config.hb_interval_ms {
+            return Err("heartbeat timeout must exceed a positive heartbeat interval".into());
+        }
+        if config.tcp_bind.is_some() && config.tcp_port.is_none() {
+            return Err("kernel.tcp_bind requires kernel.tcp_port".into());
+        }
+        if config.tcp_port == Some(0) && !self.agents.is_empty() {
+            return Err("kernel.tcp_port must be nonzero when launching agents".into());
+        }
+
+        let mut names = HashSet::new();
+        for agent in &self.agents {
+            if agent.name.trim().is_empty() || agent.task.trim().is_empty() {
+                return Err("each agent requires a nonempty name and task".into());
+            }
+            if !names.insert(agent.name.as_str()) {
+                return Err(format!("duplicate agent name '{}'", agent.name));
+            }
+            let invalid = |reason: &str| format!("agent '{}': {reason}", agent.name);
+            if !matches!(
+                agent.wire.as_deref(),
+                None | Some("json" | "msgpack" | "proto")
+            ) {
+                return Err(invalid("wire must be json, msgpack or proto"));
+            }
+            if !matches!(agent.transport.as_deref(), None | Some("tcp")) {
+                return Err(invalid("transport must be tcp when specified"));
+            }
+            if !matches!(agent.isolation.as_deref(), None | Some("microvm")) {
+                return Err(invalid("isolation must be microvm when specified"));
+            }
+            let microvm = agent.isolation.as_deref() == Some("microvm");
+            if (agent.transport.is_some() || microvm) && config.tcp_port.is_none() {
+                return Err(invalid("TCP agents require a nonzero kernel.tcp_port"));
+            }
+            if microvm
+                && !config
+                    .vm_boot
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty())
+            {
+                return Err(invalid("microvm requires kernel.vm_boot"));
+            }
+        }
+        let mut destinations = HashSet::new();
+        for route in &config.routes {
+            if !destinations.insert(route.dest.as_str()) {
+                return Err(format!("duplicate route destination '{}'", route.dest));
+            }
+            if route.dest.trim().is_empty() || !names.contains(route.via.as_str()) {
+                return Err(format!(
+                    "route to '{}' requires a destination and a declared relay",
+                    route.dest
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Clone)]

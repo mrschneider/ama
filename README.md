@@ -69,6 +69,24 @@ of steps (`checkpoint`, `send`, `wait`, `note`, `sleep`, `loop`, `crash`,
 the experiments use — the kernel is the product, and any process that
 speaks the envelope protocol can be an agent.
 
+## Deployment checks
+
+Run `ama validate --manifest manifest.json` before rollout. It checks the
+manifest schema, socket and journal path settings, heartbeat intervals,
+resource budgets, duplicate agent names, and transport, wire and relay
+configuration. Pass the same `--socket` override you use with `serve`.
+Preflight requires no running kernel and does not access task files, bind
+ports, or open the journal. `serve` runs the same checks before startup.
+
+Run `ama health --socket /path/to/ama.sock` for liveness and
+`ama ready --socket /path/to/ama.sock` for workload readiness. Both use the
+local control socket and require `AMA_OPERATOR_TOKEN`. They return JSON
+on a valid reply and exit with status 1 when their check fails or the
+kernel cannot be reached. Liveness requires a responding kernel with a
+healthy journal. Readiness also requires every configured agent to be
+running or to have completed successfully. Agents that are starting,
+restarting, or failed keep readiness false.
+
 ## How it works
 
 - **Minimal Executive** — the kernel holds a process table (UIN, PID,

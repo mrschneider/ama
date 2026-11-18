@@ -594,6 +594,46 @@ fn kernel_stats_report_the_table_the_journal_and_the_budgets() {
     assert!(stats["connections"].get("active").is_some());
 }
 
+#[test]
+fn occupied_tcp_port_fails_before_exposing_the_unix_sockets() {
+    let dir = Temp::new();
+    let mut k = kernel(&dir);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    k.tcp_addr = Some(listener.local_addr().unwrap().to_string());
+    let socket = k.socket_path.clone();
+
+    let error = Router::serve_full(k, &[]).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::AddrInUse);
+    assert!(!socket.exists());
+    assert!(!control_socket_path(&socket).exists());
+}
+
+#[test]
+fn readiness_requires_the_manifest_agents_and_a_healthy_journal() {
+    let dir = Temp::new();
+    let mut k = kernel(&dir);
+    k.expected_agents = 2;
+    let _first = entry(&k, 1, "first");
+    assert_eq!(k.health()["healthy"], true);
+    assert_eq!(k.health()["ready"], false, "one launch is missing");
+    let _second = entry(&k, 2, "second");
+    let process = k.agents.lock().unwrap()[&2].clone();
+
+    for (state, ready) in [
+        (ProcState::Starting, false),
+        (ProcState::Running, true),
+        (ProcState::Dead, false),
+        (ProcState::Completed, true),
+    ] {
+        process.lock().unwrap().state = state;
+        assert_eq!(k.health()["ready"], ready);
+    }
+
+    k.ledger.failed.store(true, Ordering::Release);
+    assert_eq!(k.health()["healthy"], false);
+    assert_eq!(k.health()["ready"], false);
+}
+
 /// The journal tail: the newest events, oldest first, filtered.
 #[test]
 fn the_journal_tail_returns_the_newest_events_filtered() {

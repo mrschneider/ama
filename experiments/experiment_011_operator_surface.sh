@@ -17,6 +17,7 @@
 #      the rotate is still recoverable afterwards.
 #   5. A CONTROL verb without the operator credential is refused — the
 #      new verbs are not a way around F10.
+#   6. Preflight and authenticated health/readiness work through the CLI.
 set -euo pipefail
 # F10: operator authority is a CREDENTIAL — the kernel and this
 # operator CLI must share it; agents are stripped of it at spawn
@@ -306,6 +307,38 @@ except Exception as e:
     reply2 = f"error: {e}"
 ok("authority: ctl_rotate is refused on the AGENT socket",
    "error" in reply2 and "operator socket" in reply2, reply2[:200])
+
+# ---- 6. deployment preflight and probes ------------------------------
+manifest = "experiments/manifest_011.json"
+out, rc = cli("validate", "--manifest", manifest, "--socket", "/tmp/preflight-override.sock")
+ok("preflight: validates the effective socket override",
+   rc == 0 and json.loads(out) == {"valid": True, "socket": "/tmp/preflight-override.sock"}, out)
+
+with open(manifest) as f:
+    invalid_manifest = json.load(f)
+invalid_manifest["agents"].append(invalid_manifest["agents"][0])
+invalid_ledger = "/tmp/ama_exp11/invalid.jsonl"
+invalid_manifest["kernel"]["ledger"] = invalid_ledger
+invalid_path = "/tmp/ama_exp11/invalid-manifest.json"
+with open(invalid_path, "w") as f:
+    json.dump(invalid_manifest, f)
+for verb, extra in (("validate", []), ("serve", ["--agentd", "./target/debug/ama-agentd"])):
+    result = subprocess.run([CLI, verb, "--manifest", invalid_path, *extra],
+                            capture_output=True, text=True, timeout=5)
+    ok(f"preflight: {verb} rejects duplicate agents before opening the journal",
+       result.returncode == 2 and "duplicate agent name" in result.stderr
+       and not os.path.exists(invalid_ledger), result.stderr)
+
+for verb, field in (("health", "healthy"), ("ready", "ready")):
+    out, rc = cli(verb, "--socket", SOCK)
+    ok(f"probe: {verb} reports success for a healthy completed workload",
+       rc == 0 and json.loads(out).get(field) is True, out)
+
+wrong_token = subprocess.run([CLI, "health", "--socket", SOCK], capture_output=True,
+                             text=True, timeout=5,
+                             env={**os.environ, "AMA_OPERATOR_TOKEN": "wrong-probe-token"})
+ok("probe: a rejected credential returns a failing exit status",
+   wrong_token.returncode == 1 and "operator token required" in wrong_token.stderr)
 
 print(f"\nledger: {len(events())} events")
 all_pass = all(results)

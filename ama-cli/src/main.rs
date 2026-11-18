@@ -11,9 +11,10 @@
 //! agents — before reading a byte. Agents cannot control the kernel.
 
 use ama_core::AgentSpecTuple;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::exit;
+use std::time::Duration;
 
 /// F10: the operator credential. Read from AMA_OPERATOR_TOKEN — the SAME
 /// value the kernel holds. Refusing to run without it is deliberate: a
@@ -90,6 +91,25 @@ fn main() {
     let ctl_socket = format!("{socket}.ctl");
     match cmd.as_str() {
         "serve" => serve(&socket, &manifest, &agentd, cgroups),
+        "validate" => {
+            let (_, socket) = load_manifest(&manifest, &socket);
+            println!("{}", serde_json::json!({"valid": true, "socket": socket}));
+        }
+        "health" | "ready" => {
+            if socket.is_empty() {
+                eprintln!("usage: ama {cmd} --socket <path>");
+                exit(2);
+            }
+            let reply = query_health(&ctl_socket).unwrap_or_else(|error| {
+                eprintln!("ama {cmd}: {error}");
+                exit(1);
+            });
+            let field = if cmd == "ready" { "ready" } else { "healthy" };
+            println!("{reply}");
+            if reply[field].as_bool() != Some(true) {
+                exit(1);
+            }
+        }
         "ps" => ps(&ctl_socket),
         "inspect" => inspect(&ctl_socket, &name),
         "stats" => ctl_roundtrip(&ctl_socket, serde_json::json!({"kind": "ctl_stats"})),
@@ -138,7 +158,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: ama serve|ps|inspect|stats|logs|rotate|qos|grant|revoke|restart|jail"
+                "usage: ama serve|validate|health|ready|ps|inspect|stats|logs|rotate|qos|grant|revoke|restart|jail"
             );
             exit(2);
         }
@@ -195,18 +215,58 @@ fn ctl_restart(socket: &str, name: &str) {
     println!("{}", line.trim());
 }
 
+fn load_manifest(path: &str, socket_override: &str) -> (ama_core::Manifest, String) {
+    if path.is_empty() {
+        eprintln!("--manifest <file> is required");
+        exit(2);
+    }
+    let result = (|| {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let manifest: ama_core::Manifest =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let socket = if socket_override.is_empty() {
+            manifest.kernel.socket.clone()
+        } else {
+            socket_override.to_owned()
+        };
+        manifest.validate(&socket)?;
+        Ok::<_, String>((manifest, socket))
+    })();
+    result.unwrap_or_else(|error| {
+        eprintln!("ama: manifest {path}: {error}");
+        exit(2);
+    })
+}
+
+fn query_health(socket: &str) -> std::io::Result<serde_json::Value> {
+    use std::io::Error;
+
+    let request = serde_json::json!({"kind": "ctl_health", "token": operator_token()});
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    writeln!(stream, "{request}")?;
+    let mut line = String::new();
+    BufReader::new(stream.take(4096)).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        return Err(Error::other("incomplete health response"));
+    }
+    let reply: serde_json::Value = serde_json::from_str(&line)?;
+    if reply["kind"] != "health" || !reply["healthy"].is_boolean() || !reply["ready"].is_boolean() {
+        let reason = reply["reason"]
+            .as_str()
+            .unwrap_or("invalid health response");
+        return Err(Error::other(reason));
+    }
+    Ok(reply)
+}
+
 fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
-    if manifest.is_empty() || agentd.is_empty() {
+    if agentd.is_empty() {
         eprintln!("serve requires --manifest <file> --agentd <path>");
         exit(2);
     }
-    let m: ama_core::Manifest = serde_json::from_slice(&std::fs::read(manifest).expect("manifest"))
-        .expect("manifest schema");
-    let socket = if socket.is_empty() {
-        m.kernel.socket.clone()
-    } else {
-        socket.to_string()
-    };
+    let (m, socket) = load_manifest(manifest, socket);
     let kernel = ama_core::Kernel::new(
         std::path::Path::new(&socket),
         std::path::Path::new(&m.kernel.ledger),
@@ -270,7 +330,10 @@ fn serve(socket: &str, manifest: &str, agentd: &str, cgroups: bool) {
     // BIND FIRST, spawn after: agent processes connect at startup — spawning
     // before the socket exists kills them (this exact failure appeared in
     // experiment 001 and is now part of the router's contract)
-    let handle = ama_core::Router::serve_full(kernel, &agents).expect("router");
+    let handle = ama_core::Router::serve_full(kernel, &agents).unwrap_or_else(|error| {
+        eprintln!("ama: listener startup failed: {error}");
+        exit(1);
+    });
     eprintln!("[ama] kernel up on {socket}");
     handle.join().ok();
 }
