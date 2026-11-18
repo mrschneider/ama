@@ -4,7 +4,8 @@
 //!   1. route_send fast path — end-to-end through the kernel into a real
 //!      Unix socket, at three payload sizes
 //!   2. Ledger::append alone — the journal's share of the send-path cost
-//!   3. Ledger::last_checkpoint — cost as the ledger grows (O(file)?)
+//!   3. Ledger::last_checkpoint — cost as the ledger grows
+//!   4. Ledger::tail — recent records and a full scan on a filter miss
 //!
 //! Run: cargo run --release -p ama-core --example perf_bench
 //!
@@ -174,6 +175,30 @@ fn main() {
         println!(
             "last_checkpoint over {size} events: {:.2} ms",
             t0.elapsed().as_micros() as f64 / 1000.0
+        );
+    }
+
+    // ---- 4. Journal tail with records that can straddle chunks -------------
+    let ledger = Ledger::open(&tmp.join("tail.jsonl")).unwrap();
+    let payload = "x".repeat(4096);
+    for i in 0..2_000 {
+        ledger
+            .append("note", json!({"i": i, "payload": &payload}))
+            .unwrap();
+    }
+    for (label, limit, filter, runs, expected) in [
+        ("latest", 100, None, 100, 100),
+        ("filter miss", 10, Some("missing"), 20, 0),
+    ] {
+        let start = Instant::now();
+        for _ in 0..runs {
+            let events = ledger.tail(limit, filter, None);
+            assert_eq!(events.len(), expected);
+            std::hint::black_box(events);
+        }
+        println!(
+            "ledger.tail {label}: {:.1} us/query",
+            start.elapsed().as_secs_f64() * 1e6 / f64::from(runs)
         );
     }
 

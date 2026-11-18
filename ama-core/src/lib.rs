@@ -1164,29 +1164,14 @@ impl Ledger {
         }
         let mut files = self.archive_paths();
         files.push(self.path.clone());
-        files.reverse(); // newest first
-                         // one chunk per file, newest file first; the chunks are stitched
-                         // back together OLDEST first at the end
-        let mut chunks: Vec<Vec<LedgerEvent>> = Vec::new();
-        let mut total = 0usize;
-        for path in files {
-            let remaining = limit.saturating_sub(total);
-            if remaining == 0 {
+        let mut out = Vec::new();
+        for path in files.into_iter().rev() {
+            self.tail_file(&path, limit, event, uin, &mut out);
+            if out.len() == limit {
                 break;
             }
-            let mut found = self.tail_file(&path, remaining, event, uin);
-            if found.is_empty() {
-                continue;
-            }
-            found.reverse(); // the scan is newest-first
-            total += found.len();
-            chunks.push(found);
         }
-        let mut out: Vec<LedgerEvent> = Vec::new();
-        for chunk in chunks.iter().rev() {
-            out.extend(chunk.iter().cloned());
-        }
-        out.truncate(limit);
+        out.reverse();
         out
     }
 
@@ -1209,75 +1194,78 @@ impl Ledger {
         true
     }
 
-    /// The newest matching events of ONE file, newest first.
+    /// Append matching events from one segment, newest first.
     fn tail_file(
         &self,
         path: &std::path::Path,
         limit: usize,
         event: Option<&str>,
         uin: Option<u64>,
-    ) -> Vec<LedgerEvent> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut out = Vec::new();
-        let mut f = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => return out,
+        out: &mut Vec<LedgerEvent>,
+    ) {
+        use std::os::unix::fs::FileExt;
+
+        let Ok(file) = std::fs::File::open(path) else {
+            return;
         };
-        let len = match f.metadata() {
-            Ok(m) => m.len(),
-            Err(_) => return out,
+        let Ok(metadata) = file.metadata() else {
+            return;
         };
-        if len == 0 {
-            return out;
-        }
-        let mut chunk = vec![0u8; 8192];
-        // the trailing partial line is handled by the same scan: the
-        // bytes before the first '\n' of the LAST chunk are the oldest
-        // record and may be incomplete — only COMPLETE lines are parsed
-        let mut pos = len;
-        let mut carry: Vec<u8> = Vec::new();
-        while pos > 0 && out.len() < limit {
+        let mut chunk = [0u8; 8192];
+        let mut pos = metadata.len();
+        // Until the first newline, the bytes at EOF are an incomplete record.
+        let mut terminated = false;
+        // Store spanning records in reverse byte order so each chunk can be
+        // appended, then reverse the record once when its start is found.
+        let mut carry = Vec::new();
+        let mut push_match = |line: &[u8]| {
+            if let Ok(ev) = serde_json::from_slice::<LedgerEvent>(line) {
+                // Rotation snapshots duplicate the last archived sequence
+                // and are internal to recovery.
+                if ev.ev != "ledger_snapshot" && Self::matches(&ev, event, uin) {
+                    out.push(ev);
+                }
+            }
+            out.len() == limit
+        };
+
+        while pos > 0 {
             let take = (chunk.len() as u64).min(pos) as usize;
             pos -= take as u64;
-            if f.seek(SeekFrom::Start(pos)).is_err() {
-                break;
+            let block = &mut chunk[..take];
+            if file.read_exact_at(block, pos).is_err() {
+                return;
             }
-            if f.read_exact(&mut chunk[..take]).is_err() {
-                break;
-            }
-            let mut block = chunk[..take].to_vec();
-            block.extend_from_slice(&carry);
-            // split into complete lines, newest last
-            let mut lines: Vec<&[u8]> = Vec::new();
-            let mut start = 0usize;
-            for (i, b) in block.iter().enumerate() {
-                if *b == b'\n' {
-                    lines.push(&block[start..i]);
-                    start = i + 1;
-                }
-            }
-            carry = block[start..].to_vec();
-            for line in lines.iter().rev() {
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(ev) = serde_json::from_slice::<LedgerEvent>(line) {
-                    // the rotation snapshot is INTERNAL (its seq
-                    // duplicates the last archived event) — the journal
-                    // the operator reads never shows it
-                    if ev.ev == "ledger_snapshot" {
-                        continue;
-                    }
-                    if Self::matches(&ev, event, uin) {
-                        out.push(ev);
-                        if out.len() >= limit {
-                            break;
+
+            let mut end = take;
+            for newline in memchr::memrchr_iter(b'\n', block) {
+                if terminated {
+                    let line = &block[newline + 1..end];
+                    if carry.is_empty() {
+                        if push_match(line) {
+                            return;
                         }
+                    } else {
+                        carry.extend(line.iter().rev());
+                        carry.reverse();
+                        if push_match(&carry) {
+                            return;
+                        }
+                        carry.clear();
                     }
                 }
+                terminated = true;
+                end = newline;
+            }
+            if terminated {
+                carry.extend(block[..end].iter().rev());
             }
         }
-        out
+
+        if terminated && !carry.is_empty() {
+            carry.reverse();
+            push_match(&carry);
+        }
     }
 
     pub fn read_all(&self) -> Vec<LedgerEvent> {

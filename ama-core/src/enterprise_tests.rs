@@ -665,6 +665,44 @@ fn the_journal_tail_spans_the_rotation_boundary() {
     assert_eq!(tail.last().unwrap().seq, 20);
 }
 
+#[test]
+fn journal_tail_keeps_chunk_spanning_records_and_ignores_an_unfinished_append() {
+    let dir = Temp::new();
+    let path = dir.0.join("ledger");
+    let ledger = Ledger::open(&path).unwrap();
+    let payload = "α".repeat(13_000);
+
+    ledger
+        .append("note", json!({"from": 1, "payload": &payload}))
+        .unwrap();
+    ledger.append("note", json!({"from": 2})).unwrap();
+    ledger.rotate().unwrap();
+    ledger
+        .append("note", json!({"from": 1, "payload": &payload}))
+        .unwrap();
+    ledger.append("note", json!({"from": 1})).unwrap();
+
+    // Simulate observing the active file during an incomplete append.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    let unfinished = json!({
+        "seq": 5, "ts_ms": 0, "ev": "note",
+        "detail": {"from": 1, "payload": &payload},
+    });
+    std::io::Write::write_all(&mut file, unfinished.to_string().as_bytes()).unwrap();
+
+    let events = ledger.tail(10, Some("note"), Some(1));
+    assert_eq!(
+        events.iter().map(|ev| ev.seq).collect::<Vec<_>>(),
+        [1, 3, 4]
+    );
+    assert_eq!(events[0].detail["payload"], payload);
+    assert_eq!(events[1].detail["payload"], payload);
+    assert_eq!(ledger.tail(1, None, None)[0].seq, 4);
+}
+
 /// The wakeable inbox: the waiter is woken by the push, and ONLY the
 /// matching frame is removed.
 #[test]
