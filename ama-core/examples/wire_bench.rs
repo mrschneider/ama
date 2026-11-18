@@ -11,10 +11,11 @@
 //! just the routing call.
 //!
 //! It also reports the LATENCY the client observes per message: the ack
-//! arrives on the same connection, so this is the real agent-visible
-//! round trip.
+//! arrives on the same connection. The default batch size of one measures
+//! round-trip latency. Larger batches measure pipelined throughput.
 //!
 //! Run: cargo run --release -p ama-core --example wire_bench
+//! Pass `-- 25` to send 25 frames before reading their acknowledgements.
 
 use ama_core::{Kernel, ProcEntry, ProcState, Wire};
 use serde_json::json;
@@ -30,7 +31,7 @@ fn plant_entry(k: &Kernel, uin: u64, name: &str, token: &str, caps: &[&str]) {
         name: name.into(),
         pid: 0,
         caps: caps.iter().map(|c| c.to_string()).collect(),
-        manifest_caps: None,
+        manifest_caps: Some(caps.iter().map(|cap| (*cap).into()).collect()),
         auth_token: Some(token.into()),
         tcp_addr: None,
         spawned_at: Instant::now(),
@@ -58,6 +59,11 @@ fn plant_entry(k: &Kernel, uin: u64, name: &str, token: &str, caps: &[&str]) {
 }
 
 fn main() {
+    let batch_size: usize = std::env::args()
+        .nth(1)
+        .map(|arg| arg.parse().expect("batch size must be an integer"))
+        .unwrap_or(1);
+    assert!((1..=50).contains(&batch_size), "batch size must be 1–50");
     let tmp = std::env::temp_dir().join(format!("ama-wire-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
@@ -115,7 +121,8 @@ fn main() {
         dest.write_all(b"\n").unwrap();
         let mut r = BufReader::new(dest.try_clone().unwrap());
         let mut l = String::new();
-        let _ = r.read_line(&mut l); // welcome
+        r.read_line(&mut l).unwrap();
+        assert!(l.contains("welcome"), "destination register reply: {l}");
         let stop = stop.clone();
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 1 << 16];
@@ -132,31 +139,33 @@ fn main() {
     for payload in [64usize, 256, 1024] {
         let body = json!({"op": "work", "payload": "y".repeat(payload)});
         let env = json!({"kind": "send", "uin": 1, "to": "dest", "body": body});
-        let bytes = env.to_string();
-        let n = 2_000usize;
-        // warm the path (socket buffers, page cache, the writer thread)
-        for _ in 0..50 {
-            client.write_all(bytes.as_bytes()).unwrap();
-            client.write_all(b"\n").unwrap();
-            let mut l = String::new();
-            let _ = reader.read_line(&mut l);
+        let frame = format!("{env}\n");
+        let batch = frame.repeat(batch_size);
+        let n = 2_000;
+        let mut exchange = |count| {
+            client
+                .write_all(&batch.as_bytes()[..count * frame.len()])
+                .unwrap();
+            for _ in 0..count {
+                line.clear();
+                assert!(
+                    reader.read_line(&mut line).unwrap() > 0,
+                    "missing send reply"
+                );
+                assert!(line.contains("\"kind\":\"sent\""), "send failed: {line}");
+            }
+        };
+        exchange(batch_size);
+
+        let start = Instant::now();
+        for offset in (0..n).step_by(batch_size) {
+            exchange(batch_size.min(n - offset));
         }
-        let t0 = Instant::now();
-        let mut lat = Duration::ZERO;
-        for _ in 0..n {
-            let s = Instant::now();
-            client.write_all(bytes.as_bytes()).unwrap();
-            client.write_all(b"\n").unwrap();
-            let mut l = String::new();
-            reader.read_line(&mut l).unwrap();
-            lat += s.elapsed();
-        }
-        let dt = t0.elapsed();
+        let elapsed = start.elapsed().as_secs_f64();
         println!(
-            "wire payload={payload:>4}B: {n} msgs in {:.1?} => {:.0} msgs/s | ack latency {:.1} us/msg",
-            dt,
-            n as f64 / dt.as_secs_f64(),
-            lat.as_micros() as f64 / n as f64
+            "wire payload={payload:>4}B batch={batch_size}: {n} msgs, {:.0} msgs/s, {:.1} us/msg",
+            n as f64 / elapsed,
+            elapsed * 1e6 / n as f64,
         );
     }
     stop.store(true, Ordering::Relaxed);

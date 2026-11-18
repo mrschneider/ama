@@ -8,6 +8,7 @@ readme.workspace = true
 
 [dependencies]
 libc.workspace = true
+memchr = "2"
 rmp-serde.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }

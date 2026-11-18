@@ -26,6 +26,7 @@ name = "ama-core"
 version = "0.13.2"
 dependencies = [
  "libc",
+ "memchr",
  "rmp-serde",
  "serde",
  "serde_json",

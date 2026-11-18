@@ -4377,7 +4377,10 @@ impl DeadlineRead for Peer {
 }
 impl DeadlineRead for BufReader<Peer> {
     fn deadline_timeout(&self, timeout: Duration) -> io::Result<()> {
-        self.get_ref().set_read_timeout(Some(timeout))
+        if self.buffer().is_empty() {
+            self.get_ref().set_read_timeout(Some(timeout))?;
+        }
+        Ok(())
     }
 }
 struct PeerDeadline<'a, R: DeadlineRead> {
@@ -4485,14 +4488,16 @@ impl JsonPeer {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::TimedOut, "json frame deadline exceeded")
                 })?;
-            self.peer.get_ref().set_read_timeout(Some(remaining))?;
+            // A buffered read cannot block. Set the socket timeout only
+            // when fill_buf may need to read from the socket.
+            self.peer.deadline_timeout(remaining)?;
             let available = self.peer.fill_buf()?;
             if available.is_empty() {
                 self.done = true;
                 line.push_str(&String::from_utf8_lossy(buf));
                 return Ok(!line.is_empty());
             }
-            let newline = available.iter().position(|b| *b == b'\n');
+            let newline = memchr::memchr(b'\n', available);
             let count = newline.unwrap_or(available.len());
             if line.len() + buf.len() + count > MAX_LINE {
                 return Err(io::Error::new(

@@ -159,14 +159,16 @@ best-of-7 alternating runs of the same binaries. Reproduce with
 | `ledger.append` | 3.45 µs | **3.26 µs** | 3 syscalls per append → **2** (`strace`: 1.50 M → 1.00 M over 500k appends): the handle's inode identity is cached at open time instead of re-derived per append, and the record is framed in a reused buffer |
 | `route_send` (4 senders) | 144k msg/s | **150k msg/s** | the capability check, the destination snapshot and the queue handle are now **one** process-table pass (were three) |
 | **agent step loop** (200 notes) | 2.10 s | **0.13 s** | **~16x**: the agent's inbox is a condvar, not a 10 ms poll — the ack was already queued long before the poll woke up |
-| wire path (agent→kernel→agent) | — | 20–37k msg/s, **27–50 µs** ack latency | measured end to end by `wire_bench` |
 
-The four harnesses that produced these numbers live in
-`ama-core/examples`: `perf_bench` (the routing path), `wire_bench` (the
-real socket path, with the ack latency a client observes),
-`inbound_bench` (the per-message parse/validate/clone/re-serialize
-chain) and `statx_bench` (the metadata syscall variants — all three
-measured the same, so the ledger keeps the portable call).
+To measure the current build, run these release benchmarks:
+
+- `cargo run --release -p ama-core --example perf_bench` measures routing,
+  ledger appends, checkpoint lookup and journal tail queries.
+- `cargo run --release -p ama-core --example wire_bench` measures JSON
+  send acknowledgement round trips over a Unix socket. Add `-- 25` to
+  measure pipelined throughput. Both modes verify every send reply.
+- `inbound_bench` measures the parse, validate, clone and serialize chain.
+  `statx_bench` compares metadata syscall variants.
 
 ## Proven results
 
